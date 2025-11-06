@@ -1,0 +1,171 @@
+/*
+ * @Author: kamalyes 501893067@qq.com
+ * @Date: 2025-11-06 21:15:15
+ * @LastEditors: kamalyes 501893067@qq.com
+ * @LastEditTime: 2025-11-06 21:35:36
+ * @FilePath: \go-cachex\expiring.go
+ * @Description:
+ *
+ * Copyright (c) 2025 by kamalyes, All Rights Reserved.
+ */
+package cachex
+
+import (
+	"sync"
+	"time"
+)
+
+// ExpiringHandler 是一个简单的基于 map 的线程安全内存缓存，支持 TTL 和后台清理
+// 它实现了 Handler 接口
+type ExpiringHandler struct {
+    mu      sync.RWMutex
+    items   map[string]expItem
+    ticker  *time.Ticker
+    stop    chan struct{}
+    closed  bool
+    wg      sync.WaitGroup
+}
+
+type expItem struct {
+    val    []byte
+    expiry time.Time // zero = no expiry
+}
+
+// NewExpiringHandler 创建一个新的 ExpiringHandler，cleanupInterval 控制后台清理频率（为0则使用1s）
+func NewExpiringHandler(cleanupInterval time.Duration) *ExpiringHandler {
+    if cleanupInterval <= 0 {
+        cleanupInterval = time.Second
+    }
+    h := &ExpiringHandler{
+        items:  make(map[string]expItem),
+        ticker: time.NewTicker(cleanupInterval),
+        stop:   make(chan struct{}),
+    }
+    h.wg.Add(1)
+    go h.cleanupLoop()
+    return h
+}
+
+func (h *ExpiringHandler) cleanupLoop() {
+    defer h.wg.Done()
+    for {
+        select {
+        case <-h.ticker.C:
+            h.mu.Lock()
+            now := time.Now()
+            for k, it := range h.items {
+                if !it.expiry.IsZero() && now.After(it.expiry) {
+                    delete(h.items, k)
+                }
+            }
+            h.mu.Unlock()
+        case <-h.stop:
+            // stop requested, exit goroutine
+            return
+        }
+    }
+}
+
+func copyB(b []byte) []byte {
+    if b == nil {
+        return nil
+    }
+    nb := make([]byte, len(b))
+    copy(nb, b)
+    return nb
+}
+
+// Set 将值写入缓存（无 TTL）
+func (h *ExpiringHandler) Set(key, value []byte) error {
+    return h.SetWithTTL(key, value, 0)
+}
+
+// SetWithTTL 写入值并设置 TTL（ttl<=0 表示不过期）
+func (h *ExpiringHandler) SetWithTTL(key, value []byte, ttl time.Duration) error {
+    if err := ValidateWriteWithTTLOp(key, value, ttl, true, h.closed); err != nil {
+        return err
+    }
+
+    h.mu.Lock()
+    defer h.mu.Unlock()
+    sk := string(key)
+    it := expItem{val: copyB(value)}
+    if ttl > 0 {
+        it.expiry = time.Now().Add(ttl)
+    }
+    h.items[sk] = it
+    return nil
+}
+
+// Get 读取值，如果不存在或已过期返回 ErrNotFound
+func (h *ExpiringHandler) Get(key []byte) ([]byte, error) {
+    if err := ValidateBasicOp(key, true, h.closed); err != nil {
+        return nil, err
+    }
+
+    h.mu.RLock()
+    it, ok := h.items[string(key)]
+    h.mu.RUnlock()
+    if !ok {
+        return nil, ErrNotFound
+    }
+    if !it.expiry.IsZero() && time.Now().After(it.expiry) {
+        // lazy delete
+        h.mu.Lock()
+        // re-check and delete
+        if cur, ok2 := h.items[string(key)]; ok2 {
+            if !cur.expiry.IsZero() && time.Now().After(cur.expiry) {
+                delete(h.items, string(key))
+            }
+        }
+        h.mu.Unlock()
+        return nil, ErrNotFound
+    }
+    return copyB(it.val), nil
+}
+
+// GetTTL 返回剩余 TTL（0 表示无 TTL），找不到返回 ErrNotFound
+func (h *ExpiringHandler) GetTTL(key []byte) (time.Duration, error) {
+    if err := ValidateBasicOp(key, true, h.closed); err != nil {
+        return 0, err
+    }
+
+    h.mu.RLock()
+    it, ok := h.items[string(key)]
+    h.mu.RUnlock()
+    if !ok {
+        return 0, ErrNotFound
+    }
+    if it.expiry.IsZero() {
+        return 0, nil
+    }
+    return time.Until(it.expiry), nil
+}
+
+// Del 删除键
+func (h *ExpiringHandler) Del(key []byte) error {
+    if err := ValidateBasicOp(key, true, h.closed); err != nil {
+        return err
+    }
+
+    h.mu.Lock()
+    defer h.mu.Unlock()
+    delete(h.items, string(key))
+    return nil
+}
+
+// Close 停止后台清理并释放资源
+func (h *ExpiringHandler) Close() error {
+    h.mu.Lock()
+    if h.closed {
+        h.mu.Unlock()
+        return nil
+    }
+    h.closed = true
+    // signal goroutine to stop and stop the ticker
+    close(h.stop)
+    h.ticker.Stop()
+    h.mu.Unlock()
+    h.wg.Wait()
+    return nil
+}
