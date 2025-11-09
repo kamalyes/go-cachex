@@ -13,6 +13,7 @@
 package cachex
 
 import (
+	"fmt"
 	"hash/fnv"
 	"time"
 )
@@ -66,6 +67,78 @@ func (h *ShardedHandler) GetTTL(key []byte) (time.Duration, error) {
 // Del 转发
 func (h *ShardedHandler) Del(key []byte) error {
     return h.shardFor(key).Del(key)
+}
+
+// BatchGet 批量获取多个键的值
+func (h *ShardedHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	results := make([][]byte, len(keys))
+	errors := make([]error, len(keys))
+	
+	// 按分片分组键
+	shardGroups := make(map[int][]int)
+	for i, key := range keys {
+		hasher := fnv.New32a()
+		hasher.Write(key)
+		shardIdx := int(hasher.Sum32() % uint32(h.n))
+		shardGroups[shardIdx] = append(shardGroups[shardIdx], i)
+	}
+	
+	// 并发处理各个分片
+	type shardResult struct {
+		shardIdx int
+		results  [][]byte
+		errors   []error
+		indices  []int
+	}
+	
+	resultChan := make(chan shardResult, len(shardGroups))
+	
+	for shardIdx, indices := range shardGroups {
+		go func(sIdx int, idxs []int) {
+			shardKeys := make([][]byte, len(idxs))
+			for i, idx := range idxs {
+				shardKeys[i] = keys[idx]
+			}
+			
+			shardResults, shardErrors := h.shards[sIdx].BatchGet(shardKeys)
+			resultChan <- shardResult{
+				shardIdx: sIdx,
+				results:  shardResults,
+				errors:   shardErrors,
+				indices:  idxs,
+			}
+		}(shardIdx, indices)
+	}
+	
+	// 收集结果
+	for range shardGroups {
+		result := <-resultChan
+		for i, idx := range result.indices {
+			results[idx] = result.results[i]
+			errors[idx] = result.errors[i]
+		}
+	}
+	
+	return results, errors
+}
+
+// Stats 返回所有分片的统计信息
+func (h *ShardedHandler) Stats() map[string]interface{} {
+	allStats := make(map[string]interface{})
+	
+	for i, shard := range h.shards {
+		shardStats := shard.Stats()
+		allStats[fmt.Sprintf("shard_%d", i)] = shardStats
+	}
+	
+	allStats["total_shards"] = len(h.shards)
+	allStats["cache_type"] = "sharded"
+	
+	return allStats
 }
 
 // Close 关闭所有 shard

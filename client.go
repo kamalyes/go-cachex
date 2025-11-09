@@ -147,6 +147,52 @@ func (c *Client) GetOrCompute(ctx context.Context, key []byte, ttl time.Duration
 	return c.ctxCache.GetOrCompute(ctx, key, ttl, loader)
 }
 
+// BatchGet 批量获取多个键的值
+func (c *Client) BatchGet(ctx context.Context, keys [][]byte) ([][]byte, []error) {
+	select {
+	case <-ctx.Done():
+		errors := make([]error, len(keys))
+		for i := range errors {
+			errors[i] = ctx.Err()
+		}
+		return make([][]byte, len(keys)), errors
+	default:
+	}
+
+	if c.ctxCache == nil {
+		errors := make([]error, len(keys))
+		for i := range errors {
+			errors[i] = ErrNotInitialized
+		}
+		return make([][]byte, len(keys)), errors
+	}
+
+	return c.ctxCache.BatchGet(keys)
+}
+
+// Stats 返回缓存统计信息
+func (c *Client) Stats(ctx context.Context) map[string]interface{} {
+	select {
+	case <-ctx.Done():
+		return map[string]interface{}{
+			"error": ctx.Err().Error(),
+		}
+	default:
+	}
+
+	if c.ctxCache == nil {
+		return map[string]interface{}{
+			"error": ErrNotInitialized.Error(),
+		}
+	}
+
+	stats := c.ctxCache.Stats()
+	// 添加客户端级别的信息
+	stats["client_type"] = string(c.config.Type)
+	stats["client_capacity"] = c.config.Capacity
+	return stats
+}
+
 // Close 关闭客户端
 func (c *Client) Close() error {
 	if c.ctxCache != nil {

@@ -92,6 +92,66 @@ func (h *TwoLevelHandler) Del(key []byte) error {
     return h.L2.Del(key)
 }
 
+// BatchGet 批量获取多个键的值
+func (h *TwoLevelHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	results := make([][]byte, len(keys))
+	errors := make([]error, len(keys))
+	needL2 := make([]int, 0, len(keys))
+	l2Keys := make([][]byte, 0, len(keys))
+
+	// 先从L1缓存批量获取
+	l1Results, l1Errors := h.L1.BatchGet(keys)
+	
+	// 找出L1未命中的项
+	for i, err := range l1Errors {
+		if err == nil {
+			results[i] = l1Results[i]
+		} else {
+			needL2 = append(needL2, i)
+			l2Keys = append(l2Keys, keys[i])
+		}
+	}
+
+	// 如果有L1未命中的项，从L2获取
+	if len(l2Keys) > 0 {
+		l2Results, l2Errors := h.L2.BatchGet(l2Keys)
+		
+		for j, idx := range needL2 {
+			if l2Errors[j] == nil {
+				// L2命中，数据同时提升到L1
+				value := l2Results[j]
+				results[idx] = value
+				errors[idx] = nil
+				
+				// 异步提升到L1，避免阻塞
+				go func(k, v []byte) {
+					h.L1.Set(k, v)
+				}(keys[idx], value)
+			} else {
+				errors[idx] = l2Errors[j]
+			}
+		}
+	}
+
+	return results, errors
+}
+
+// Stats 返回两级缓存的统计信息
+func (h *TwoLevelHandler) Stats() map[string]interface{} {
+	l1Stats := h.L1.Stats()
+	l2Stats := h.L2.Stats()
+	
+	return map[string]interface{}{
+		"l1_cache": l1Stats,
+		"l2_cache": l2Stats,
+		"cache_type": "two_level",
+	}
+}
+
 func (h *TwoLevelHandler) Close() error {
     var lastErr error
     if err := h.L1.Close(); err != nil {

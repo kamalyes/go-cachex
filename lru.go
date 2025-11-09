@@ -203,6 +203,87 @@ func (h *LRUHandler) Del(key []byte) error {
     return nil
 }
 
+// BatchGet 批量获取多个键的值
+func (h *LRUHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	results := make([][]byte, len(keys))
+	errors := make([]error, len(keys))
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.closed {
+		for i := range errors {
+			errors[i] = ErrClosed
+		}
+		return results, errors
+	}
+
+	for i, key := range keys {
+		if len(key) == 0 {
+			errors[i] = ErrInvalidKey
+			continue
+		}
+
+		sk := string(key)
+		if ele, hit := h.cache[sk]; hit {
+			entry := ele.Value.(*lruEntry)
+			// 检查TTL
+			if !entry.expiry.IsZero() && time.Now().After(entry.expiry) {
+				// 过期，删除并返回未找到
+				h.ll.Remove(ele)
+				delete(h.cache, sk)
+				errors[i] = ErrNotFound
+			} else {
+				// 移动到前面（最近访问）
+				h.ll.MoveToFront(ele)
+				// 复制数据避免外部修改
+				valueCopy := make([]byte, len(entry.value))
+				copy(valueCopy, entry.value)
+				results[i] = valueCopy
+			}
+		} else {
+			errors[i] = ErrNotFound
+		}
+	}
+
+	return results, errors
+}
+
+// Stats 返回缓存统计信息
+func (h *LRUHandler) Stats() map[string]interface{} {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.closed {
+		return map[string]interface{}{
+			"closed":   true,
+			"entries":  0,
+			"capacity": h.maxEntries,
+		}
+	}
+
+	// 计算过期项
+	expiredCount := 0
+	now := time.Now()
+	for _, ele := range h.cache {
+		entry := ele.Value.(*lruEntry)
+		if !entry.expiry.IsZero() && now.After(entry.expiry) {
+			expiredCount++
+		}
+	}
+
+	return map[string]interface{}{
+		"entries":       h.ll.Len(),
+		"capacity":      h.maxEntries,
+		"expired_items": expiredCount,
+		"closed":        h.closed,
+	}
+}
+
 // Close 实现 Handler.Close
 func (h *LRUHandler) Close() error {
     h.mu.Lock()

@@ -153,6 +153,37 @@ func (c *CtxCache) GetOrCompute(ctx context.Context, key []byte, ttl time.Durati
     return nil, ErrNotFound
 }
 
+// BatchGet 批量获取多个键的值
+func (c *CtxCache) BatchGet(keys [][]byte) ([][]byte, []error) {
+	if c.handler == nil {
+		errors := make([]error, len(keys))
+		for i := range errors {
+			errors[i] = ErrNotInitialized
+		}
+		return make([][]byte, len(keys)), errors
+	}
+	
+	return c.handler.BatchGet(keys)
+}
+
+// Stats 返回缓存统计信息
+func (c *CtxCache) Stats() map[string]interface{} {
+	if c.handler == nil {
+		return map[string]interface{}{
+			"error": ErrNotInitialized.Error(),
+		}
+	}
+	
+	stats := c.handler.Stats()
+	stats["context_enabled"] = true
+	return stats
+}
+
+// GetTTL 获取键的剩余生存时间
+func (c *CtxCache) GetTTL(ctx context.Context, key []byte) (time.Duration, error) {
+	return c.handler.GetTTL(key)
+}
+
 // --- 简易 singleflight 实现 -------------------------------------------------
 type call struct {
     done chan struct{}

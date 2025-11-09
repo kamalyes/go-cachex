@@ -160,6 +160,81 @@ func (h *ExpiringHandler) Del(key []byte) error {
     return nil
 }
 
+// BatchGet 批量获取多个键的值
+func (h *ExpiringHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	results := make([][]byte, len(keys))
+	errors := make([]error, len(keys))
+
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if h.closed {
+		for i := range errors {
+			errors[i] = ErrClosed
+		}
+		return results, errors
+	}
+
+	now := time.Now()
+	for i, key := range keys {
+		if len(key) == 0 {
+			errors[i] = ErrInvalidKey
+			continue
+		}
+
+		sk := string(key)
+		if item, found := h.items[sk]; found {
+			if !item.expiry.IsZero() && now.After(item.expiry) {
+				// 已过期但还在map中，视为未找到
+				errors[i] = ErrNotFound
+			} else {
+				// 复制数据避免外部修改
+				valueCopy := make([]byte, len(item.val))
+				copy(valueCopy, item.val)
+				results[i] = valueCopy
+			}
+		} else {
+			errors[i] = ErrNotFound
+		}
+	}
+
+	return results, errors
+}
+
+// Stats 返回缓存统计信息
+func (h *ExpiringHandler) Stats() map[string]interface{} {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if h.closed {
+		return map[string]interface{}{
+			"closed":   true,
+			"entries":  0,
+			"expired_items": 0,
+		}
+	}
+
+	// 计算过期项
+	expiredCount := 0
+	now := time.Now()
+	for _, item := range h.items {
+		if !item.expiry.IsZero() && now.After(item.expiry) {
+			expiredCount++
+		}
+	}
+
+	return map[string]interface{}{
+		"entries":       len(h.items),
+		"expired_items": expiredCount,
+		"closed":        h.closed,
+		"cache_type":    "expiring",
+	}
+}
+
 // Close 停止后台清理并释放资源
 func (h *ExpiringHandler) Close() error {
     h.mu.Lock()

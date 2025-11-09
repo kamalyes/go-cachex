@@ -155,6 +155,99 @@ func (h *RedisHandler) Del(k []byte) error {
     return nil
 }
 
+// BatchGet 批量获取多个键的值
+func (h *RedisHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	results := make([][]byte, len(keys))
+	errors := make([]error, len(keys))
+
+	ctx := h.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// 转换为字符串键
+	strKeys := make([]string, len(keys))
+	for i, key := range keys {
+		if len(key) == 0 {
+			errors[i] = ErrInvalidKey
+			continue
+		}
+		strKeys[i] = string(key)
+	}
+
+	// 使用Redis MGET命令批量获取
+	result := h.redis.MGet(ctx, strKeys...)
+	vals, err := result.Result()
+	
+	if err != nil {
+		// 如果整个批量操作失败，所有键都返回错误
+		for i := range errors {
+			if errors[i] == nil { // 只覆盖非invalid key的错误
+				errors[i] = err
+			}
+		}
+		return results, errors
+	}
+
+	// 处理结果
+	for i, val := range vals {
+		if errors[i] != nil {
+			continue // 跳过invalid key
+		}
+		
+		if val == nil {
+			errors[i] = ErrNotFound
+		} else {
+			if strVal, ok := val.(string); ok {
+				results[i] = []byte(strVal)
+			} else {
+				errors[i] = ErrDataRead
+			}
+		}
+	}
+
+	return results, errors
+}
+
+// Stats 返回Redis缓存统计信息
+func (h *RedisHandler) Stats() map[string]interface{} {
+	ctx := h.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	stats := make(map[string]interface{})
+	stats["cache_type"] = "redis"
+
+	// 获取Redis信息
+	infoResult := h.redis.Info(ctx, "stats", "memory", "keyspace")
+	if info, err := infoResult.Result(); err == nil {
+		stats["redis_info"] = info
+	} else {
+		stats["redis_info_error"] = err.Error()
+	}
+
+	// 获取数据库大小
+	dbSizeResult := h.redis.DBSize(ctx)
+	if dbSize, err := dbSizeResult.Result(); err == nil {
+		stats["db_size"] = dbSize
+	} else {
+		stats["db_size_error"] = err.Error()
+	}
+
+	// 获取内存使用情况
+	memResult := h.redis.MemoryUsage(ctx, "nonexistent") // 这个命令在Redis 4.0+可用
+	if mem, err := memResult.Result(); err == nil {
+		stats["memory_usage"] = mem
+	}
+
+	return stats
+}
+
 // Close 实现 Handler 接口的 Close 方法
 func (h *RedisHandler) Close() error {
 	return h.redis.Close()

@@ -49,6 +49,39 @@ Handler (Concrete Cache Implementations: LRU/Redis/Ristretto/Expiring)
 
 ### 💾 Multiple Cache Backends
 - **LRU Cache**: In-memory LRU cache with capacity limits and TTL support
+- **LRU Optimized**: Ultra-high performance LRU with sharding architecture (500%+ performance boost)
+- **Ristretto Cache**: Concurrent cache with frequency-based eviction, based on Caffeine/Go-Ristretto  
+- **Redis Cache**: Distributed cache backend supporting Redis with failover
+- **TwoLevel Cache**: Intelligent tiered caching with L1 fast cache and L2 storage cache
+- **Sharded Cache**: Distributed load across multiple cache instances to reduce lock contention
+- **Expiring Cache**: Simple TTL-based cache with background cleanup
+
+### 🔧 Unified Handler Interface
+All cache implementations support the same core interface:
+- **Basic Operations**: `Set`, `SetWithTTL`, `Get`, `GetTTL`, `Del`
+- **Batch Operations**: `BatchGet` for efficient bulk retrieval
+- **Statistics**: `Stats` for monitoring cache performance and status
+- **Lifecycle**: `Close` for proper resource cleanup
+
+### 📊 Advanced Batch Operations
+```go
+// All handlers support efficient batch operations
+keys := [][]byte{[]byte("key1"), []byte("key2"), []byte("key3")}
+results, errors := handler.BatchGet(keys)
+
+for i, key := range keys {
+    if errors[i] == nil {
+        fmt.Printf("%s: %s\n", string(key), string(results[i]))
+    }
+}
+```
+
+### 📈 Rich Statistics & Monitoring
+Each cache implementation provides detailed statistics:
+- **Performance Metrics**: Hit rate, operation counts, latency statistics
+- **Capacity Info**: Current entries, maximum capacity, memory usage
+- **Architecture Details**: Shard count, eviction statistics, backend status
+- **Health Status**: Connection status, error rates, expiration counts
 - **LRU Optimized**: High-performance LRU with read-write locks, object pooling, and batch operations
 - **Expiring Cache**: Map-based in-memory cache with automatic expired key cleanup
 - **Redis Cache**: Distributed cache supporting single node and cluster modes

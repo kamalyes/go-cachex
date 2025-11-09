@@ -247,6 +247,67 @@ func (h *RistrettoHandler) Del(k []byte) error {
 	return nil
 }
 
+// BatchGet 批量获取多个键的值
+func (h *RistrettoHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	results := make([][]byte, len(keys))
+	errors := make([]error, len(keys))
+
+	if h.cache == nil {
+		for i := range errors {
+			errors[i] = ErrNotInitialized
+		}
+		return results, errors
+	}
+
+	for i, key := range keys {
+		if len(key) == 0 {
+			errors[i] = ErrInvalidKey
+			continue
+		}
+
+		if value, found := h.cache.Get(key); found {
+			// 复制数据避免外部修改
+			valueCopy := make([]byte, len(value))
+			copy(valueCopy, value)
+			results[i] = valueCopy
+		} else {
+			errors[i] = ErrNotFound
+		}
+	}
+
+	return results, errors
+}
+
+// Stats 返回缓存统计信息
+func (h *RistrettoHandler) Stats() map[string]interface{} {
+	if h.cache == nil {
+		return map[string]interface{}{
+			"initialized": false,
+		}
+	}
+
+	metrics := h.cache.Metrics
+	return map[string]interface{}{
+		"hits":         metrics.Hits(),
+		"misses":       metrics.Misses(),
+		"keys_added":   metrics.KeysAdded(),
+		"keys_updated": metrics.KeysUpdated(),
+		"keys_evicted": metrics.KeysEvicted(),
+		"cost_added":   metrics.CostAdded(),
+		"cost_evicted": metrics.CostEvicted(),
+		"sets_dropped": metrics.SetsDropped(),
+		"sets_rejected": metrics.SetsRejected(),
+		"gets_dropped": metrics.GetsDropped(),
+		"gets_kept":    metrics.GetsKept(),
+		"hit_rate":     metrics.Ratio(),
+		"initialized":  true,
+	}
+}
+
 // Close 实现 Handler 接口的 Close 方法
 func (h *RistrettoHandler) Close() error {
 	if h.cache == nil {

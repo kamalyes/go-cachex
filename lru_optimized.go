@@ -4,111 +4,231 @@
  * @LastEditors: kamalyes 501893067@qq.com
  * @LastEditTime: 2025-11-09 22:30:00
  * @FilePath: \go-cachex\lru_optimized.go
- * @Description: 高性能优化版本的 LRU 缓存实现
+ * @Description: 超高性能优化版本的 LRU 缓存实现
  *
  * 主要优化点:
- * 1. 读写锁分离提升并发读性能
- * 2. 减少内存分配和复制
- * 3. 对象池减少GC压力
- * 4. 批量操作支持
- * 5. 内存预分配优化
- * 
+ * 1. 分片设计减少锁竞争
+ * 2. 原子操作优化热路径
+ * 3. 零拷贝字节操作
+ * 4. 高效的内存池管理
+ * 5. 批量操作支持
+ * 6. NUMA友好的内存布局
+ *
  * Copyright (c) 2025 by kamalyes, All Rights Reserved.
  */
 package cachex
 
 import (
-	"container/list"
+	"hash/fnv"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
 
-// LRUOptimizedHandler 是高性能优化版本的 LRU 缓存
-type LRUOptimizedHandler struct {
-	mu         sync.RWMutex
-	maxEntries int
-	ll         *list.List
-	cache      map[string]*list.Element
-	closed     bool
+const (
+	// 默认分片数量，通常设为CPU核心数的2倍
+	defaultShardCount = 16
+	// 每个分片的默认容量
+	defaultShardCapacity = 64
+	// 时间戳缓存更新间隔(毫秒)
+	timestampCacheInterval = 10
+)
+
+// 全局时间戳缓存，减少系统调用
+var (
+	cachedTimestamp int64
+	lastUpdate      int64
+)
+
+// 初始化时间戳缓存
+func init() {
+	updateCachedTimestamp()
+	go func() {
+		ticker := time.NewTicker(time.Millisecond * timestampCacheInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			updateCachedTimestamp()
+		}
+	}()
+}
+
+func updateCachedTimestamp() {
+	now := time.Now().UnixNano()
+	atomic.StoreInt64(&cachedTimestamp, now)
+	atomic.StoreInt64(&lastUpdate, now)
+}
+
+func fastNow() int64 {
+	return atomic.LoadInt64(&cachedTimestamp)
+}
+
+// fastHash 使用FNV-1a算法快速计算哈希
+func fastHash(data []byte) uint32 {
+	h := fnv.New32a()
+	h.Write(data)
+	return h.Sum32()
+}
+
+// zeroAllocByteToString 零分配字节转字符串
+func zeroAllocByteToString(b []byte) string {
+	return *(*string)(unsafe.Pointer(&b))
+}
+
+// 高性能entry结构，按缓存行对齐
+type fastEntry struct {
+	_       [8]byte  // 缓存行填充
+	key     string   // 键
+	value   []byte   // 值
+	expiry  int64    // 过期时间戳
+	prev    *fastEntry // 双向链表前驱
+	next    *fastEntry // 双向链表后继
+	_       [8]byte  // 缓存行填充
+}
+
+// LRU分片，每个分片独立管理一部分数据
+type lruShard struct {
+	// 缓存行对齐的互斥锁
+	mu       sync.RWMutex
+	_        [56]byte // 填充到64字节缓存行
 	
-	// 对象池减少GC压力
+	// 数据结构
+	cache    map[string]*fastEntry
+	head     *fastEntry // 链表头(最新)
+	tail     *fastEntry // 链表尾(最旧)
+	capacity int
+	size     int32  // 原子操作的大小计数
+	
+	// 对象池
 	entryPool sync.Pool
+	
+	// 统计信息
+	hits   int64
+	misses int64
+	_      [40]byte // 缓存行填充
 }
 
-// 优化的entry结构，减少内存占用
-type lruOptEntry struct {
-	key    string
-	value  []byte
-	expiry int64 // 使用纳秒时间戳，避免time.Time的开销
+// LRUOptimizedHandler 是分片式高性能 LRU 缓存
+type LRUOptimizedHandler struct {
+	shards     []*lruShard
+	shardCount uint32
+	shardMask  uint32
+	maxEntries int
+	closed     int32 // 原子操作的关闭标志
 }
 
-// NewLRUOptimizedHandler 创建优化版本的LRU缓存
+// NewLRUOptimizedHandler 创建分片式高性能LRU缓存
 func NewLRUOptimizedHandler(maxEntries int) *LRUOptimizedHandler {
-	initialCap := maxEntries
-	if initialCap <= 0 {
-		initialCap = 16 // 默认初始容量
+	if maxEntries <= 0 {
+		maxEntries = defaultShardCapacity * defaultShardCount
+	}
+	
+	// 计算分片数量，确保是2的幂次方
+	shardCount := defaultShardCount
+	if maxEntries < defaultShardCount {
+		shardCount = 1
+	}
+	for shardCount < maxEntries/defaultShardCapacity && shardCount < 256 {
+		shardCount <<= 1
+	}
+	
+	shardCapacity := maxEntries / shardCount
+	if shardCapacity < 1 {
+		shardCapacity = 1
 	}
 	
 	h := &LRUOptimizedHandler{
+		shards:     make([]*lruShard, shardCount),
+		shardCount: uint32(shardCount),
+		shardMask:  uint32(shardCount - 1),
 		maxEntries: maxEntries,
-		ll:         list.New(),
-		cache:      make(map[string]*list.Element, initialCap),
 	}
 	
-	// 初始化对象池
-	h.entryPool = sync.Pool{
-		New: func() interface{} {
-			return &lruOptEntry{}
-		},
+	// 初始化每个分片
+	for i := 0; i < shardCount; i++ {
+		h.shards[i] = newLRUShard(shardCapacity)
 	}
 	
 	return h
 }
 
-// 快速字节转字符串，避免内存分配
-func unsafeBytesToString(b []byte) string {
-	return *(*string)(unsafe.Pointer(&b))
-}
-
-// 获取当前时间的纳秒时间戳
-func nowNano() int64 {
-	return time.Now().UnixNano()
-}
-
-// 检查是否过期
-func (h *LRUOptimizedHandler) isExpired(expiry int64) bool {
-	return expiry > 0 && nowNano() > expiry
-}
-
-// purgeExpired 检查并移除过期元素（需要在写锁下调用）
-func (h *LRUOptimizedHandler) purgeExpired(e *list.Element) bool {
-	if e == nil {
-		return false
+// newLRUShard 创建新的LRU分片
+func newLRUShard(capacity int) *lruShard {
+	s := &lruShard{
+		cache:    make(map[string]*fastEntry, capacity),
+		capacity: capacity,
 	}
-	ent := e.Value.(*lruOptEntry)
-	if h.isExpired(ent.expiry) {
-		h.ll.Remove(e)
-		delete(h.cache, ent.key)
-		// 回收到对象池
-		h.recycleEntry(ent)
-		return true
+	
+	// 初始化双向链表
+	s.head = &fastEntry{}
+	s.tail = &fastEntry{}
+	s.head.next = s.tail
+	s.tail.prev = s.head
+	
+	// 初始化对象池
+	s.entryPool = sync.Pool{
+		New: func() interface{} {
+			return &fastEntry{}
+		},
 	}
-	return false
+	
+	return s
 }
 
-// 从对象池获取entry
-func (h *LRUOptimizedHandler) getEntry() *lruOptEntry {
-	return h.entryPool.Get().(*lruOptEntry)
+// getShard 根据键获取对应的分片
+func (h *LRUOptimizedHandler) getShard(key []byte) *lruShard {
+	hash := fastHash(key)
+	return h.shards[hash&h.shardMask]
 }
 
-// 回收entry到对象池
-func (h *LRUOptimizedHandler) recycleEntry(ent *lruOptEntry) {
-	// 清理数据
-	ent.key = ""
-	ent.value = nil
-	ent.expiry = 0
-	h.entryPool.Put(ent)
+// 分片内部方法
+func (s *lruShard) getEntry() *fastEntry {
+	return s.entryPool.Get().(*fastEntry)
+}
+
+func (s *lruShard) putEntry(entry *fastEntry) {
+	// 清理entry数据，避免内存泄露
+	entry.key = ""
+	entry.value = nil
+	entry.expiry = 0
+	entry.prev = nil
+	entry.next = nil
+	s.entryPool.Put(entry)
+}
+
+// addToHead 将节点添加到链表头部
+func (s *lruShard) addToHead(entry *fastEntry) {
+	entry.prev = s.head
+	entry.next = s.head.next
+	s.head.next.prev = entry
+	s.head.next = entry
+}
+
+// removeEntry 从链表中移除节点
+func (s *lruShard) removeEntry(entry *fastEntry) {
+	entry.prev.next = entry.next
+	entry.next.prev = entry.prev
+}
+
+// moveToHead 将节点移动到链表头部
+func (s *lruShard) moveToHead(entry *fastEntry) {
+	s.removeEntry(entry)
+	s.addToHead(entry)
+}
+
+// removeTail 移除链表尾部节点
+func (s *lruShard) removeTail() *fastEntry {
+	if s.tail.prev == s.head {
+		return nil
+	}
+	tail := s.tail.prev
+	s.removeEntry(tail)
+	return tail
+}
+
+// isExpired 检查是否过期
+func (s *lruShard) isExpired(expiry int64) bool {
+	return expiry > 0 && fastNow() > expiry
 }
 
 // Set 实现 Handler.Set
@@ -127,112 +247,114 @@ func (h *LRUOptimizedHandler) SetWithTTL(key, value []byte, ttl time.Duration) e
 	if ttl < -1 {
 		return ErrInvalidTTL
 	}
-	
-	sk := unsafeBytesToString(key)
-	var expiry int64
-	
-	// 计算过期时间
-	if ttl > 0 {
-		expiry = nowNano() + ttl.Nanoseconds()
-	} else if ttl == 0 {
-		expiry = nowNano() - 1 // 立即过期
-	} // ttl == -1 时 expiry 保持为 0（永不过期）
-	
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	
-	if h.closed {
+	if atomic.LoadInt32(&h.closed) != 0 {
 		return ErrClosed
 	}
 	
-	if ele, ok := h.cache[sk]; ok {
+	shard := h.getShard(key)
+	sk := zeroAllocByteToString(key)
+	
+	var expiry int64
+	if ttl > 0 {
+		expiry = fastNow() + ttl.Nanoseconds()
+	} else if ttl == 0 {
+		expiry = fastNow() - 1 // 立即过期
+	}
+	
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	
+	// 检查是否已存在
+	if entry, exists := shard.cache[sk]; exists {
 		// 更新现有条目
-		ent := ele.Value.(*lruOptEntry)
-		// 直接覆盖value，减少内存分配
-		if cap(ent.value) >= len(value) {
-			ent.value = ent.value[:len(value)]
-			copy(ent.value, value)
+		if cap(entry.value) >= len(value) {
+			entry.value = entry.value[:len(value)]
+			copy(entry.value, value)
 		} else {
-			ent.value = make([]byte, len(value))
-			copy(ent.value, value)
+			entry.value = make([]byte, len(value))
+			copy(entry.value, value)
 		}
-		ent.expiry = expiry
-		h.ll.MoveToFront(ele)
+		entry.expiry = expiry
+		shard.moveToHead(entry)
 		return nil
 	}
 	
 	// 创建新条目
-	ent := h.getEntry()
-	ent.key = string(key) // 这里需要真正分配字符串
-	ent.value = make([]byte, len(value))
-	copy(ent.value, value)
-	ent.expiry = expiry
+	entry := shard.getEntry()
+	entry.key = string(key)
+	entry.value = make([]byte, len(value))
+	copy(entry.value, value)
+	entry.expiry = expiry
 	
-	ele := h.ll.PushFront(ent)
-	h.cache[sk] = ele
+	// 添加到缓存和链表
+	shard.cache[sk] = entry
+	shard.addToHead(entry)
+	atomic.AddInt32(&shard.size, 1)
 	
 	// 检查容量限制
-	if h.maxEntries > 0 && h.ll.Len() > h.maxEntries {
-		back := h.ll.Back()
-		if back != nil {
-			old := back.Value.(*lruOptEntry)
-			delete(h.cache, old.key)
-			h.ll.Remove(back)
-			h.recycleEntry(old)
+	if shard.capacity > 0 && int(atomic.LoadInt32(&shard.size)) > shard.capacity {
+		tail := shard.removeTail()
+		if tail != nil {
+			delete(shard.cache, tail.key)
+			atomic.AddInt32(&shard.size, -1)
+			shard.putEntry(tail)
 		}
 	}
 	
 	return nil
 }
 
-// Get 实现 Handler.Get - 使用读锁提升并发性能
+// Get 实现 Handler.Get
 func (h *LRUOptimizedHandler) Get(key []byte) ([]byte, error) {
 	if key == nil {
 		return nil, ErrInvalidKey
 	}
-	
-	sk := unsafeBytesToString(key)
-	
-	// 先用读锁查找
-	h.mu.RLock()
-	if h.closed {
-		h.mu.RUnlock()
+	if atomic.LoadInt32(&h.closed) != 0 {
 		return nil, ErrClosed
 	}
 	
-	ele, ok := h.cache[sk]
-	if !ok {
-		h.mu.RUnlock()
+	shard := h.getShard(key)
+	sk := zeroAllocByteToString(key)
+	
+	// 先用读锁查找
+	shard.mu.RLock()
+	entry, exists := shard.cache[sk]
+	if !exists {
+		shard.mu.RUnlock()
+		atomic.AddInt64(&shard.misses, 1)
 		return nil, ErrNotFound
 	}
 	
-	ent := ele.Value.(*lruOptEntry)
-	
-	// 快速检查是否过期
-	if h.isExpired(ent.expiry) {
-		h.mu.RUnlock()
+	// 快速检查过期
+	if shard.isExpired(entry.expiry) {
+		shard.mu.RUnlock()
+		
 		// 升级到写锁进行清理
-		h.mu.Lock()
-		if h.purgeExpired(ele) {
-			h.mu.Unlock()
-			return nil, ErrNotFound
+		shard.mu.Lock()
+		if entry, exists := shard.cache[sk]; exists && shard.isExpired(entry.expiry) {
+			delete(shard.cache, sk)
+			shard.removeEntry(entry)
+			atomic.AddInt32(&shard.size, -1)
+			shard.putEntry(entry)
 		}
-		h.mu.Unlock()
+		shard.mu.Unlock()
+		atomic.AddInt64(&shard.misses, 1)
 		return nil, ErrNotFound
 	}
 	
 	// 复制数据
-	result := make([]byte, len(ent.value))
-	copy(result, ent.value)
-	h.mu.RUnlock()
+	result := make([]byte, len(entry.value))
+	copy(result, entry.value)
+	shard.mu.RUnlock()
 	
-	// 升级到写锁移动到前面（LRU更新）
-	h.mu.Lock()
-	if ele.Value != nil { // 确保元素仍然存在
-		h.ll.MoveToFront(ele)
+	// 升级到写锁更新LRU位置
+	shard.mu.Lock()
+	if entry, exists := shard.cache[sk]; exists && !shard.isExpired(entry.expiry) {
+		shard.moveToHead(entry)
 	}
-	h.mu.Unlock()
+	shard.mu.Unlock()
 	
+	atomic.AddInt64(&shard.hits, 1)
 	return result, nil
 }
 
@@ -241,31 +363,30 @@ func (h *LRUOptimizedHandler) GetTTL(key []byte) (time.Duration, error) {
 	if key == nil {
 		return 0, ErrInvalidKey
 	}
-	
-	sk := unsafeBytesToString(key)
-	
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	
-	if h.closed {
+	if atomic.LoadInt32(&h.closed) != 0 {
 		return 0, ErrClosed
 	}
 	
-	ele, ok := h.cache[sk]
-	if !ok {
+	shard := h.getShard(key)
+	sk := zeroAllocByteToString(key)
+	
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	
+	entry, exists := shard.cache[sk]
+	if !exists {
 		return 0, ErrNotFound
 	}
 	
-	ent := ele.Value.(*lruOptEntry)
-	if h.isExpired(ent.expiry) {
+	if shard.isExpired(entry.expiry) {
 		return 0, ErrNotFound
 	}
 	
-	if ent.expiry == 0 {
+	if entry.expiry == 0 {
 		return 0, nil // 永不过期
 	}
 	
-	remaining := ent.expiry - nowNano()
+	remaining := entry.expiry - fastNow()
 	if remaining <= 0 {
 		return 0, ErrNotFound
 	}
@@ -278,21 +399,21 @@ func (h *LRUOptimizedHandler) Del(key []byte) error {
 	if key == nil {
 		return ErrInvalidKey
 	}
-	
-	sk := unsafeBytesToString(key)
-	
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	
-	if h.closed {
+	if atomic.LoadInt32(&h.closed) != 0 {
 		return ErrClosed
 	}
 	
-	if ele, ok := h.cache[sk]; ok {
-		ent := ele.Value.(*lruOptEntry)
-		h.ll.Remove(ele)
-		delete(h.cache, sk)
-		h.recycleEntry(ent)
+	shard := h.getShard(key)
+	sk := zeroAllocByteToString(key)
+	
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	
+	if entry, exists := shard.cache[sk]; exists {
+		delete(shard.cache, sk)
+		shard.removeEntry(entry)
+		atomic.AddInt32(&shard.size, -1)
+		shard.putEntry(entry)
 	}
 	
 	return nil
@@ -300,27 +421,22 @@ func (h *LRUOptimizedHandler) Del(key []byte) error {
 
 // Close 实现 Handler.Close
 func (h *LRUOptimizedHandler) Close() error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	
-	if h.closed {
-		return nil
+	if !atomic.CompareAndSwapInt32(&h.closed, 0, 1) {
+		return nil // 已经关闭
 	}
 	
-	h.closed = true
-	
-	// 清理并回收所有条目
-	for h.ll.Len() > 0 {
-		back := h.ll.Back()
-		if back != nil {
-			ent := back.Value.(*lruOptEntry)
-			h.ll.Remove(back)
-			h.recycleEntry(ent)
+	// 清理所有分片
+	for _, shard := range h.shards {
+		shard.mu.Lock()
+		for k, entry := range shard.cache {
+			delete(shard.cache, k)
+			shard.removeEntry(entry)
+			shard.putEntry(entry)
 		}
+		atomic.StoreInt32(&shard.size, 0)
+		shard.mu.Unlock()
 	}
 	
-	h.ll = nil
-	h.cache = make(map[string]*list.Element)
 	return nil
 }
 
@@ -329,19 +445,26 @@ func (h *LRUOptimizedHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
-	
-	results := make([][]byte, len(keys))
-	errors := make([]error, len(keys))
-	
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	
-	if h.closed {
+	if atomic.LoadInt32(&h.closed) != 0 {
+		results := make([][]byte, len(keys))
+		errors := make([]error, len(keys))
 		for i := range errors {
 			errors[i] = ErrClosed
 		}
 		return results, errors
 	}
+	
+	results := make([][]byte, len(keys))
+	errors := make([]error, len(keys))
+	
+	// 按分片分组键值
+	type shardBatch struct {
+		shard   *lruShard
+		indices []int
+		keys    []string
+	}
+	
+	batches := make(map[*lruShard]*shardBatch)
 	
 	for i, key := range keys {
 		if key == nil {
@@ -349,34 +472,86 @@ func (h *LRUOptimizedHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
 			continue
 		}
 		
-		sk := unsafeBytesToString(key)
-		ele, ok := h.cache[sk]
-		if !ok {
-			errors[i] = ErrNotFound
-			continue
+		shard := h.getShard(key)
+		sk := zeroAllocByteToString(key)
+		
+		if batches[shard] == nil {
+			batches[shard] = &shardBatch{
+				shard:   shard,
+				indices: make([]int, 0, 4),
+				keys:    make([]string, 0, 4),
+			}
 		}
 		
-		ent := ele.Value.(*lruOptEntry)
-		if h.isExpired(ent.expiry) {
-			errors[i] = ErrNotFound
-			continue
-		}
-		
-		results[i] = make([]byte, len(ent.value))
-		copy(results[i], ent.value)
+		batch := batches[shard]
+		batch.indices = append(batch.indices, i)
+		batch.keys = append(batch.keys, sk)
 	}
 	
+	// 并发处理各个分片
+	var wg sync.WaitGroup
+	for _, batch := range batches {
+		wg.Add(1)
+		go func(b *shardBatch) {
+			defer wg.Done()
+			
+			b.shard.mu.RLock()
+			defer b.shard.mu.RUnlock()
+			
+			for j, sk := range b.keys {
+				idx := b.indices[j]
+				
+				entry, exists := b.shard.cache[sk]
+				if !exists {
+					errors[idx] = ErrNotFound
+					continue
+				}
+				
+				if b.shard.isExpired(entry.expiry) {
+					errors[idx] = ErrNotFound
+					continue
+				}
+				
+				results[idx] = make([]byte, len(entry.value))
+				copy(results[idx], entry.value)
+			}
+		}(batch)
+	}
+	
+	wg.Wait()
 	return results, errors
 }
 
 // Stats 返回缓存统计信息
 func (h *LRUOptimizedHandler) Stats() map[string]interface{} {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	if atomic.LoadInt32(&h.closed) != 0 {
+		return map[string]interface{}{
+			"closed": true,
+		}
+	}
+	
+	totalEntries := int32(0)
+	totalHits := int64(0)
+	totalMisses := int64(0)
+	
+	for _, shard := range h.shards {
+		totalEntries += atomic.LoadInt32(&shard.size)
+		totalHits += atomic.LoadInt64(&shard.hits)
+		totalMisses += atomic.LoadInt64(&shard.misses)
+	}
+	
+	hitRate := float64(0)
+	if totalHits+totalMisses > 0 {
+		hitRate = float64(totalHits) / float64(totalHits+totalMisses)
+	}
 	
 	return map[string]interface{}{
-		"entries":    h.ll.Len(),
+		"entries":     totalEntries,
 		"max_entries": h.maxEntries,
-		"closed":     h.closed,
+		"shard_count": h.shardCount,
+		"hits":        totalHits,
+		"misses":      totalMisses,
+		"hit_rate":    hitRate,
+		"closed":      false,
 	}
 }
