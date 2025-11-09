@@ -308,6 +308,40 @@ func (h *RistrettoHandler) Stats() map[string]interface{} {
 	}
 }
 
+// GetOrCompute 获取缓存值，如果不存在则计算并设置
+func (h *RistrettoHandler) GetOrCompute(key []byte, ttl time.Duration, loader func() ([]byte, error)) ([]byte, error) {
+	if err := ValidateBasicOp(key, h.cache != nil, false); err != nil {
+		return nil, err
+	}
+
+	// 首先尝试获取
+	if value, found := h.cache.Get(key); found {
+		// 复制数据避免外部修改
+		result := make([]byte, len(value))
+		copy(result, value)
+		return result, nil
+	}
+
+	// 缓存未命中，调用loader
+	value, err := loader()
+	if err != nil {
+		return nil, err
+	}
+
+	// 将结果写入缓存
+	if ttl <= 0 {
+		h.cache.Set(key, value, 1)
+	} else {
+		h.cache.SetWithTTL(key, value, 1, ttl)
+	}
+	h.cache.Wait()
+
+	// 返回值的拷贝
+	result := make([]byte, len(value))
+	copy(result, value)
+	return result, nil
+}
+
 // Close 实现 Handler 接口的 Close 方法
 func (h *RistrettoHandler) Close() error {
 	if h.cache == nil {

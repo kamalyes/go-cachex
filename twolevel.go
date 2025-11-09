@@ -152,6 +152,47 @@ func (h *TwoLevelHandler) Stats() map[string]interface{} {
 	}
 }
 
+// GetOrCompute 获取缓存值，如果不存在则计算并设置
+func (h *TwoLevelHandler) GetOrCompute(key []byte, ttl time.Duration, loader func() ([]byte, error)) ([]byte, error) {
+	// 先尝试从L1获取
+	if value, err := h.L1.Get(key); err == nil {
+		return value, nil
+	}
+
+	// 再尝试从L2获取
+	if value, err := h.L2.Get(key); err == nil {
+		// 异步提升到L1
+		go func() {
+			if ttl <= 0 {
+				h.L1.Set(key, value)
+			} else {
+				h.L1.SetWithTTL(key, value, ttl)
+			}
+		}()
+		return value, nil
+	}
+
+	// 两级缓存都未命中，调用loader
+	value, err := loader()
+	if err != nil {
+		return nil, err
+	}
+
+	// 将结果写入两级缓存
+	if ttl <= 0 {
+		h.L1.Set(key, value)
+		h.L2.Set(key, value)
+	} else {
+		h.L1.SetWithTTL(key, value, ttl)
+		h.L2.SetWithTTL(key, value, ttl)
+	}
+
+	// 返回值的拷贝
+	result := make([]byte, len(value))
+	copy(result, value)
+	return result, nil
+}
+
 func (h *TwoLevelHandler) Close() error {
     var lastErr error
     if err := h.L1.Close(); err != nil {

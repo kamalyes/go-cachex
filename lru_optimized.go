@@ -555,3 +555,33 @@ func (h *LRUOptimizedHandler) Stats() map[string]interface{} {
 		"closed":      false,
 	}
 }
+
+// GetOrCompute 获取缓存值，如果不存在则计算并设置 
+func (h *LRUOptimizedHandler) GetOrCompute(key []byte, ttl time.Duration, loader func() ([]byte, error)) ([]byte, error) {
+	if len(key) == 0 {
+		return nil, ErrInvalidKey
+	}
+
+	// 首先尝试获取
+	if value, err := h.Get(key); err == nil {
+		return value, nil
+	}
+
+	// 缓存未命中，调用loader
+	value, err := loader()
+	if err != nil {
+		return nil, err
+	}
+
+	// 将结果写入缓存
+	if ttl <= 0 {
+		h.Set(key, value)
+	} else {
+		h.SetWithTTL(key, value, ttl)
+	}
+
+	// 返回值的拷贝
+	result := make([]byte, len(value))
+	copy(result, value)
+	return result, nil
+}

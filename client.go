@@ -27,6 +27,8 @@ package cachex
 import (
 	"context"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // 确保 Client 实现了 ContextHandler 接口
@@ -48,7 +50,7 @@ type ClientConfig struct {
 	Type             CacheType
 	Capacity         int                 // for lru/expiring/ristretto
 	CleanupInterval  time.Duration       // for expiring cache
-	RedisConfig      *RedisConfig        // for redis
+	RedisConfig      *redis.Options      // for redis
 	RistrettoConfig  *RistrettoConfig    // for ristretto
 }
 
@@ -244,9 +246,9 @@ func NewRistrettoClient(ctx context.Context, config *RistrettoConfig) (*Client, 
 }
 
 // NewRedisClient 创建 Redis 缓存客户端的便利函数
-func NewRedisClient(ctx context.Context, config *RedisConfig) (*Client, error) {
+func NewRedisClient(ctx context.Context, opts *redis.Options) (*Client, error) {
 	return NewClient(ctx, &ClientConfig{
 		Type:        CacheRedis,
-		RedisConfig: config,
+		RedisConfig: opts,
 	})
 }

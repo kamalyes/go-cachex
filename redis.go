@@ -24,33 +24,32 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
-	jsoniter "github.com/json-iterator/go"
 	"github.com/redis/go-redis/v9"
 )
 
-// RedisConfig 是 Redis 的配置结构
-type RedisConfig struct {
-	Host     string
-	Port     int
-	DB       int
-	Username []byte
-	Password []byte
-}
-
-// LoadRedisConfigFromFile 从文件加载 Redis 配置
-func LoadRedisConfigFromFile(configPath string) (*RedisConfig, error) {
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil, err
+// NewRedisOptions 创建推荐的Redis配置
+// 这个函数设置了一些推荐的默认值以避免常见的警告和问题
+func NewRedisOptions(addr, password string, db int) *redis.Options {
+	return &redis.Options{
+		Addr:     addr,
+		Password: password,
+		DB:       db,
+		// 禁用身份设置以避免 MAINT_NOTIFICATIONS 等警告
+		// 特别是在较老的Redis版本中
+		DisableIdentity: true,
+		// 使用RESP2协议以提高兼容性
+		Protocol: 2,
+		// 设置合理的超时值
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+		// 设置连接池参数
+		PoolSize:        10,
+		MinIdleConns:    5,
+		ConnMaxIdleTime: 30 * time.Minute,
 	}
-	c := &RedisConfig{}
-	if err := jsoniter.Unmarshal(data, &c); err != nil {
-		return nil, err
-	}
-	return c, nil
 }
 
 // RedisHandler 是 Redis 缓存的实现
@@ -60,15 +59,22 @@ type RedisHandler struct {
 }
 
 // NewRedisHandler 创建新的 RedisHandler
-func NewRedisHandler(cfg *RedisConfig) (Handler, error) {
-	redis := redis.NewClient(&redis.Options{
-		Addr:     fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-		Username: string(cfg.Username),
-		Password: string(cfg.Password),
-		DB:       cfg.DB,
-	})
-
+func NewRedisHandler(cfg *redis.Options) (Handler, error) {
+	// 如果没有设置 DisableIdentity，建议设置为 true 以避免 MAINT_NOTIFICATIONS 警告
+	if !cfg.DisableIdentity {
+		// 注意：这里只是建议，不强制修改用户配置
+		// 用户可以通过在配置中显式设置 DisableIdentity: false 来启用身份功能
+	}
+	
+	redis := redis.NewClient(cfg)
 	return &RedisHandler{redis: redis, ctx: context.Background()}, nil
+}
+
+// NewRedisHandlerSimple 创建新的 RedisHandler，使用推荐的配置
+// 这是一个便捷函数，使用了优化的默认配置以避免常见问题
+func NewRedisHandlerSimple(addr, password string, db int) (Handler, error) {
+	cfg := NewRedisOptions(addr, password, db)
+	return NewRedisHandler(cfg)
 }
 
 func (h *RedisHandler) WithCtx(ctx context.Context) *RedisHandler {
@@ -246,6 +252,120 @@ func (h *RedisHandler) Stats() map[string]interface{} {
 	}
 
 	return stats
+}
+
+// GetOrCompute 获取缓存值，如果不存在则计算并设置
+func (h *RedisHandler) GetOrCompute(key []byte, ttl time.Duration, loader func() ([]byte, error)) ([]byte, error) {
+	if len(key) == 0 {
+		return nil, ErrInvalidKey
+	}
+
+	ctx := h.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	strKey := string(key)
+
+	// 首先尝试获取
+	if value, err := h.Get(key); err == nil {
+		return value, nil
+	}
+
+	// 使用Redis分布式锁防止重复计算
+	lockKey := strKey + ":lock"
+	lockValue := fmt.Sprintf("%d", time.Now().UnixNano()) // 使用时间戳作为锁值
+	lockTTL := 30 * time.Second // 锁的超时时间
+	
+	// 尝试获取分布式锁
+	acquired := h.redis.SetNX(ctx, lockKey, lockValue, lockTTL).Val()
+	
+	if acquired {
+		// 成功获取锁，执行计算
+		defer func() {
+			// 使用Lua脚本安全释放锁（只有持有锁的实例才能释放）
+			script := `
+				if redis.call("get", KEYS[1]) == ARGV[1] then
+					return redis.call("del", KEYS[1])
+				else
+					return 0
+				end
+			`
+			h.redis.Eval(ctx, script, []string{lockKey}, lockValue)
+		}()
+		
+		// 再次检查缓存（可能在等待锁的过程中其他实例已经计算并设置了）
+		if value, err := h.Get(key); err == nil {
+			return value, nil
+		}
+		
+		// 执行实际的计算
+		value, err := loader()
+		if err != nil {
+			return nil, err
+		}
+		
+		// 将结果写入缓存
+		if ttl <= 0 {
+			h.Set(key, value)
+		} else {
+			h.SetWithTTL(key, value, ttl)
+		}
+		
+		// 返回值的拷贝
+		result := make([]byte, len(value))
+		copy(result, value)
+		return result, nil
+		
+	} else {
+		// 未能获取锁，说明其他实例正在计算
+		// 使用指数退避等待并重试获取缓存值
+		maxRetries := 10
+		baseDelay := 10 * time.Millisecond
+		
+		for i := 0; i < maxRetries; i++ {
+			// 等待一段时间
+			delay := time.Duration(1<<uint(i)) * baseDelay
+			if delay > time.Second {
+				delay = time.Second
+			}
+			
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+			
+			// 重试获取缓存值
+			if value, err := h.Get(key); err == nil {
+				return value, nil
+			}
+			
+			// 检查锁是否还存在
+			if h.redis.Exists(ctx, lockKey).Val() == 0 {
+				// 锁已释放，跳出等待循环，重新尝试获取锁
+				break
+			}
+		}
+		
+		// 如果等待超时，降级为不加锁的直接计算
+		// 这种情况下可能有重复计算，但确保不会无限等待
+		value, err := loader()
+		if err != nil {
+			return nil, err
+		}
+		
+		// 尝试写入缓存（可能会被其他实例覆盖，但没关系）
+		if ttl <= 0 {
+			h.Set(key, value)
+		} else {
+			h.SetWithTTL(key, value, ttl)
+		}
+		
+		result := make([]byte, len(value))
+		copy(result, value)
+		return result, nil
+	}
 }
 
 // Close 实现 Handler 接口的 Close 方法

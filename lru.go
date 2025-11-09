@@ -284,6 +284,54 @@ func (h *LRUHandler) Stats() map[string]interface{} {
 	}
 }
 
+// GetOrCompute 获取缓存值，如果不存在则计算并设置
+func (h *LRUHandler) GetOrCompute(key []byte, ttl time.Duration, loader func() ([]byte, error)) ([]byte, error) {
+	if len(key) == 0 {
+		return nil, ErrInvalidKey
+	}
+
+	sk := string(key)
+
+	// 首先尝试获取
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return nil, ErrClosed
+	}
+
+	if ele, hit := h.cache[sk]; hit {
+		entry := ele.Value.(*lruEntry)
+		// 检查TTL
+		if !entry.expiry.IsZero() && time.Now().After(entry.expiry) {
+			// 过期，删除
+			h.ll.Remove(ele)
+			delete(h.cache, sk)
+		} else {
+			// 移动到前面并返回
+			h.ll.MoveToFront(ele)
+			valueCopy := copyBytes(entry.value)
+			h.mu.Unlock()
+			return valueCopy, nil
+		}
+	}
+	h.mu.Unlock()
+
+	// 缓存未命中，调用loader
+	value, err := loader()
+	if err != nil {
+		return nil, err
+	}
+
+	// 将结果写入缓存
+	if ttl <= 0 {
+		h.Set(key, value)
+	} else {
+		h.SetWithTTL(key, value, ttl)
+	}
+
+	return copyBytes(value), nil
+}
+
 // Close 实现 Handler.Close
 func (h *LRUHandler) Close() error {
     h.mu.Lock()

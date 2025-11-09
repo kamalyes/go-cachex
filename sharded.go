@@ -141,6 +141,40 @@ func (h *ShardedHandler) Stats() map[string]interface{} {
 	return allStats
 }
 
+// GetOrCompute 获取缓存值，如果不存在则计算并设置
+func (h *ShardedHandler) GetOrCompute(key []byte, ttl time.Duration, loader func() ([]byte, error)) ([]byte, error) {
+	shard := h.shardFor(key)
+	
+	// 检查分片是否支持GetOrCompute，否则回退到基本实现
+	type getOrComputer interface {
+		GetOrCompute([]byte, time.Duration, func() ([]byte, error)) ([]byte, error)
+	}
+	
+	if gc, ok := shard.(getOrComputer); ok {
+		return gc.GetOrCompute(key, ttl, loader)
+	}
+	
+	// 回退实现：先尝试获取，未命中则计算并设置
+	if value, err := shard.Get(key); err == nil {
+		return value, nil
+	}
+	
+	value, err := loader()
+	if err != nil {
+		return nil, err
+	}
+	
+	if ttl <= 0 {
+		shard.Set(key, value)
+	} else {
+		shard.SetWithTTL(key, value, ttl)
+	}
+	
+	result := make([]byte, len(value))
+	copy(result, value)
+	return result, nil
+}
+
 // Close 关闭所有 shard
 func (h *ShardedHandler) Close() error {
     var lastErr error
