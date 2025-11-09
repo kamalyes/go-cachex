@@ -1,13 +1,3 @@
-<!--
- * @Author: kamalyes 501893067@qq.com
- * @Date: 2025-11-05 22:37:05
- * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-06 22:51:56
- * @FilePath: \go-cachex\README-ZH.md
- * @Description: 
- * 
- * Copyright (c) 2025 by kamalyes, All Rights Reserved. 
--->
 # Go-Cachex
 
 > Go-Cachex 是一个全面的缓存库，提供多种缓存实现和适配器，支持 TTL、LRU 驱逐、并发安全和上下文感知等特性。
@@ -29,28 +19,60 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/kamalyes/go-cachex?status.svg)](https://pkg.go.dev/github.com/kamalyes/go-cachex?tab=doc)
 [![Sourcegraph](https://sourcegraph.com/github.com/kamalyes/go-cachex/-/badge.svg)](https://sourcegraph.com/github.com/kamalyes/go-cachex?badge)
 
+## 架构设计
+
+Go-Cachex 采用分层架构设计，提供灵活且强大的缓存解决方案：
+
+```
+用户代码
+    ↓
+Client (统一入口 + 配置管理)
+    ↓  
+CtxCache (context 支持 + singleflight 去重)
+    ↓
+Handler (具体缓存实现：LRU/Redis/Ristretto/Expiring)
+```
+
+### 架构层次
+
+- **Client 层**：统一的用户接口，提供配置管理和便利函数
+- **CtxCache 层**：为底层 Handler 添加 context 支持和并发去重功能
+- **Handler 层**：具体的缓存实现，支持多种存储后端
+
 ## 功能特性
 
-- 多种缓存实现：
-  - 支持 TTL 的内存 LRU 缓存
-  - 带自动清理的过期缓存
-  - 基于 Redis 的分布式缓存
-  - 高性能 Ristretto 缓存
-  - 上下文感知缓存包装器
-  - 用于提高并发性能的分片缓存
-  - 用于分层缓存的两级缓存
-- 所有实现的共同特性：
-  - 线程安全操作
-  - TTL（存活时间）支持
-  - 字节切片键值对
-  - 一致的错误处理
-  - 可选的上下文支持
-- 高级特性：
-  - 并发加载去重
-  - 上下文取消支持
-  - 自动过期键清理
-  - LRU/容量驱逐策略
-  - Redis 集群支持
+### 🚀 统一客户端接口
+- 简洁一致的 API，支持所有缓存实现
+- 便利构造函数：`NewLRUClient`、`NewLRUOptimizedClient`、`NewRedisClient`、`NewRistrettoClient` 等
+- 统一的错误处理和参数验证
+
+### 💾 多种缓存后端
+- **LRU Cache**: 内存 LRU 缓存，支持容量限制和 TTL
+- **LRU Optimized**: 高性能 LRU，具有读写锁分离、对象池和批量操作
+- **Expiring Cache**: 基于 map 的内存缓存，自动清理过期键
+- **Redis Cache**: 分布式缓存，支持单节点和集群模式
+- **Ristretto Cache**: 高性能缓存，基于 dgraph-io/ristretto
+- **Sharded Cache**: 分片缓存，提升并发性能
+- **Two-Level Cache**: 两级缓存，优化访问模式
+
+### ⚡ Context 支持
+- **上下文取消**: 所有操作支持 context 传入，可实现超时控制
+- **并发去重**: 内置 singleflight 机制，避免重复计算
+- **GetOrCompute**: 智能加载函数，缓存未命中时自动计算并缓存
+
+### 🔒 高级特性
+- **线程安全**: 所有实现都是并发安全的
+- **TTL 支持**: 灵活的过期时间设置
+- **自动清理**: 过期键自动清理，无需手动干预
+- **容量管理**: LRU 驱逐策略，智能管理内存使用
+- **一致性错误**: 标准化错误类型，便于处理
+
+## 文档链接
+
+- [详细使用指南](./USAGE.md)
+- [API 文档](https://pkg.go.dev/github.com/kamalyes/go-cachex)
+- [示例代码](examples/)
+- [性能测试](docs/benchmarks.md)
 
 ## 开始使用
 
@@ -71,325 +93,6 @@ import "github.com/kamalyes/go-cachex"
 ```sh
 go get -u github.com/kamalyes/go-cachex
 ```
-
-## 使用方法
-
-### 通用接口
-
-所有缓存实现都实现了 `Handler` 接口：
-
-```go
-type Handler interface {
-    // Set 设置键值对
-    Set(key, value []byte) error
-    
-    // Get 获取键对应的值
-    Get(key []byte) ([]byte, error)
-    
-    // Del 删除键
-    Del(key []byte) error
-    
-    // SetWithTTL 设置带 TTL 的键值对
-    SetWithTTL(key, value []byte, ttl time.Duration) error
-    
-    // GetTTL 获取键的剩余 TTL
-    GetTTL(key []byte) (time.Duration, error)
-    
-    // Close 关闭缓存
-    Close() error
-}
-```
-
-### LRU 缓存使用
-
-```go
-// 创建一个容量为 1000 的 LRU 缓存
-cache := cachex.NewLRUHandler(1000)
-defer cache.Close()
-
-// 基本操作
-err := cache.Set([]byte("key"), []byte("value"))
-val, err := cache.Get([]byte("key"))
-err = cache.Del([]byte("key"))
-
-// TTL 操作
-err = cache.SetWithTTL([]byte("key-ttl"), []byte("value"), 5*time.Second)
-ttl, err := cache.GetTTL([]byte("key-ttl"))
-```
-
-### 过期缓存使用
-
-```go
-// 创建一个过期缓存（自动清理过期键）
-cache := cachex.NewExpiringHandler()
-defer cache.Close()
-
-// 基本操作与 TTL
-err := cache.Set([]byte("key"), []byte("value"))
-err = cache.SetWithTTL([]byte("temp"), []byte("value"), 30*time.Second)
-
-// 过期键会自动清理
-time.Sleep(31 * time.Second)
-_, err = cache.Get([]byte("temp")) // 返回 ErrNotFound
-```
-
-### Ristretto 缓存使用
-
-```go
-// 创建高性能 Ristretto 缓存
-config := &cachex.RistrettoConfig{
-    NumCounters: 1e7,     // 预期的唯一键数量
-    MaxCost:     1 << 30, // 最大内存使用量（字节）
-    BufferItems: 64,      // 写入缓冲区大小
-}
-cache, err := cachex.NewRistrettoHandler(config)
-if err != nil {
-    log.Fatal(err)
-}
-defer cache.Close()
-
-// 基本操作
-err = cache.Set([]byte("key"), []byte("value"))
-val, err := cache.Get([]byte("key"))
-
-// TTL 支持
-err = cache.SetWithTTL([]byte("key-ttl"), []byte("value"), time.Minute)
-```
-
-### Redis 缓存使用
-
-```go
-// 创建 Redis 缓存（单节点）
-cache, err := cachex.NewRedisHandler(&cachex.RedisConfig{
-    Addrs: []string{"localhost:6379"},
-})
-if err != nil {
-    log.Fatal(err)
-}
-defer cache.Close()
-
-// Redis 集群配置
-clusterCache, err := cachex.NewRedisHandler(&cachex.RedisConfig{
-    Addrs: []string{
-        "localhost:7000",
-        "localhost:7001",
-        "localhost:7002",
-    },
-    IsCluster: true,
-})
-
-// 基本操作
-err = cache.Set([]byte("key"), []byte("value"))
-val, err := cache.Get([]byte("key"))
-err = cache.Del([]byte("key"))
-
-// 带 TTL 的操作
-err = cache.SetWithTTL([]byte("key-ttl"), []byte("value"), 24*time.Hour)
-ttl, err := cache.GetTTL([]byte("key-ttl"))
-```
-
-### 上下文感知缓存使用
-
-```go
-// 创建上下文感知缓存包装器
-baseCache := cachex.NewRistrettoHandler(nil)
-cache := cachex.NewCtxCache(baseCache)
-
-// 基本上下文操作
-ctx := context.Background()
-ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-defer cancel()
-
-// GetOrCompute - 并发请求去重
-loader := func(ctx context.Context) ([]byte, error) {
-    // 昂贵的计算或远程调用
-    return []byte("computed"), nil
-}
-val, err := cache.GetOrCompute(ctx, []byte("key"), loader)
-
-// WithCache - 在缓存中执行操作
-err = cache.WithCache(ctx, []byte("key"), func(val []byte) error {
-    // 使用缓存值的操作
-    return nil
-})
-```
-
-### 分片缓存使用
-
-```go
-// 创建分片缓存
-factory := func() cachex.Handler {
-    return cachex.NewLRUHandler(1000)
-}
-cache := cachex.NewShardedHandler(16, factory) // 16 个分片
-defer cache.Close()
-
-// 使用方式与普通缓存相同
-err := cache.Set([]byte("key"), []byte("value"))
-val, err := cache.Get([]byte("key"))
-
-// 键会自动分配到不同分片，提高并发性能
-```
-
-### 两级缓存使用
-
-```go
-// 创建两级缓存系统
-l1 := cachex.NewLRUHandler(1000)         // 快速本地缓存
-l2 := cachex.NewRedisHandler(redisConfig) // 慢速共享缓存
-
-cache := cachex.NewTwoLevelHandler(l1, l2, &cachex.TwoLevelConfig{
-    WriteStrategy: cachex.WriteThrough, // 写透策略
-})
-defer cache.Close()
-
-// 自动处理两级缓存
-err := cache.Set([]byte("key"), []byte("value"))
-val, err := cache.Get([]byte("key")) // 优先从 L1 获取，未命中则回退到 L2
-
-// TTL 在两级中保持一致
-err = cache.SetWithTTL([]byte("key"), []byte("value"), time.Hour)
-```
-
-### 错误处理最佳实践
-
-```go
-// 1. 检查特定错误类型
-if err == cachex.ErrNotFound {
-    // 处理键不存在的情况
-}
-
-// 2. 优雅降级
-val, err := cache.Get([]byte("key"))
-if err == cachex.ErrNotFound {
-    // 从备用源加载数据
-    val = loadFromBackup()
-}
-
-// 3. TTL 验证
-if err == cachex.ErrInvalidTTL {
-    // 使用默认 TTL
-    err = cache.SetWithTTL(key, value, defaultTTL)
-}
-
-// 4. 容量检查
-if err == cachex.ErrCapacityExceeded {
-    // 执行清理或扩容操作
-    cache.Del(oldKeys...)
-}
-
-// 5. 优雅关闭
-defer func() {
-    if err := cache.Close(); err != nil {
-        log.Printf("关闭缓存时出错: %v", err)
-    }
-}()
-```
-
-### 上下文感知缓存
-
-```go
-// 创建上下文感知缓存包装器
-ctx := context.Background()
-base := cachex.NewRistrettoHandler(nil)
-cache := cachex.NewCtxCache(base)
-
-// 使用 GetOrCompute 来去重并发加载
-val, err := cache.GetOrCompute(ctx, []byte("key"), func(ctx context.Context) ([]byte, error) {
-    // 对于并发请求，此函数只会被调用一次
-    return []byte("computed-value"), nil
-})
-```
-
-### Redis 缓存
-
-```go
-// 创建基于 Redis 的缓存
-redisCache, err := cachex.NewRedisHandler(&cachex.RedisConfig{
-    Addrs: []string{"localhost:6379"},
-})
-if err != nil {
-    log.Fatal(err)
-}
-defer redisCache.Close()
-
-// 像使用其他缓存实现一样使用
-err = redisCache.Set([]byte("key"), []byte("value"))
-```
-
-### 两级缓存
-
-```go
-// 创建 L1（快速）和 L2（慢速）缓存
-l1 := cachex.NewLRUHandler(1000)
-l2 := cachex.NewRedisHandler(&cachex.RedisConfig{
-    Addrs: []string{"localhost:6379"},
-})
-
-// 创建两级缓存
-cache := cachex.NewTwoLevelHandler(l1, l2, &cachex.TwoLevelConfig{
-    WriteStrategy: cachex.WriteThrough,
-})
-defer cache.Close()
-
-// 正常使用 - 它会自动处理两个级别
-val, err := cache.Get([]byte("key"))
-```
-
-## 可用的缓存实现
-
-### LRUHandler
-- 简单的内存 LRU 缓存
-- 支持 TTL
-- 线程安全
-- 适合本地缓存或测试
-
-### ExpiringHandler
-- 基于 map 的内存缓存
-- 自动清理过期键
-- 线程安全
-- 适合临时数据缓存
-
-### RistrettoHandler
-- 基于 dgraph-io/ristretto 的高性能缓存
-- 自动项目驱逐
-- 内存受限
-- 适合高并发生产环境使用
-
-### RedisHandler
-- 使用 Redis 的分布式缓存
-- 支持 Redis 集群
-- 持久化存储
-- 适合分布式系统
-
-### CtxCache
-- 上下文感知缓存包装器
-- 并发加载去重
-- 支持取消
-- 适合昂贵计算
-
-### ShardedHandler
-- 用于提高并发性能的分片缓存
-- 使用多个底层缓存
-- 减少锁竞争
-- 适合高吞吐量场景
-
-### TwoLevelHandler
-- 分层缓存（如内存 + Redis）
-- 不同的写入策略
-- 自动 L1/L2 同步
-- 适合优化访问模式
-
-## 错误处理
-
-该库为常见场景使用标准错误类型：
-
-- `ErrNotFound`: 缓存中未找到键
-- `ErrInvalidKey`: 无效或空键
-- `ErrInvalidValue`: 无效或空值
-- `ErrInvalidTTL`: 无效的 TTL 值
-- `ErrClosed`: 缓存实例已关闭
-- `ErrCapacityExceeded`: 超出缓存容量限制
 
 ## 贡献
 

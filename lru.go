@@ -71,7 +71,7 @@ func (h *LRUHandler) purgeExpired(e *list.Element) bool {
 
 // Set 实现 Handler.Set（不设置 TTL）
 func (h *LRUHandler) Set(key, value []byte) error {
-    return h.SetWithTTL(key, value, 0)
+    return h.SetWithTTL(key, value, -1) // -1 表示永不过期
 }
 
 // SetWithTTL 实现 Handler.SetWithTTL
@@ -82,7 +82,7 @@ func (h *LRUHandler) SetWithTTL(key, value []byte, ttl time.Duration) error {
     if value == nil {
         return ErrInvalidValue
     }
-    if ttl < 0 {
+    if ttl < -1 {
         return ErrInvalidTTL
     }
     
@@ -98,6 +98,12 @@ func (h *LRUHandler) SetWithTTL(key, value []byte, ttl time.Duration) error {
         ent.value = copyBytes(value)
         if ttl > 0 {
             ent.expiry = time.Now().Add(ttl)
+        } else if ttl == 0 {
+            // 0 表示立即过期
+            ent.expiry = time.Now().Add(-time.Second) 
+        } else if ttl == -1 {
+            // -1 表示永不过期，保持 expiry 为零值  
+            ent.expiry = time.Time{}
         } else {
             ent.expiry = time.Time{}
         }
@@ -108,6 +114,12 @@ func (h *LRUHandler) SetWithTTL(key, value []byte, ttl time.Duration) error {
     ent := &lruEntry{key: sk, value: copyBytes(value)}
     if ttl > 0 {
         ent.expiry = time.Now().Add(ttl)
+    } else if ttl == 0 {
+        // 0 表示立即过期
+        ent.expiry = time.Now().Add(-time.Second)
+    } else if ttl == -1 {
+        // -1 表示永不过期，保持 expiry 为零值
+        ent.expiry = time.Time{}
     }
     ele := h.ll.PushFront(ent)
     h.cache[sk] = ele

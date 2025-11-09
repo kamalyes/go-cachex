@@ -11,6 +11,7 @@
 package cachex
 
 import (
+	"context"
 	"errors"
 	"time"
 )
@@ -47,5 +48,16 @@ type Handler interface {
 	Get([]byte) ([]byte, error)
 	GetTTL([]byte) (time.Duration, error)
 	Del([]byte) error
+	Close() error
+}
+
+// ContextHandler 是支持 context 的缓存操作接口
+type ContextHandler interface {
+	Set(ctx context.Context, key, value []byte) error
+	SetWithTTL(ctx context.Context, key, value []byte, ttl time.Duration) error
+	Get(ctx context.Context, key []byte) ([]byte, error)
+	GetTTL(ctx context.Context, key []byte) (time.Duration, error)
+	Del(ctx context.Context, key []byte) error
+	GetOrCompute(ctx context.Context, key []byte, ttl time.Duration, loader func(context.Context) ([]byte, error)) ([]byte, error)
 	Close() error
 }

@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-11-06 21:15:15
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-06 21:35:36
+ * @LastEditTime: 2025-11-09 21:16:12
  * @FilePath: \go-cachex\expiring.go
  * @Description:
  *
@@ -77,7 +77,7 @@ func copyB(b []byte) []byte {
 
 // Set 将值写入缓存（无 TTL）
 func (h *ExpiringHandler) Set(key, value []byte) error {
-    return h.SetWithTTL(key, value, 0)
+    return h.SetWithTTL(key, value, -1) // -1 表示永不过期
 }
 
 // SetWithTTL 写入值并设置 TTL（ttl<=0 表示不过期）
@@ -92,6 +92,12 @@ func (h *ExpiringHandler) SetWithTTL(key, value []byte, ttl time.Duration) error
     it := expItem{val: copyB(value)}
     if ttl > 0 {
         it.expiry = time.Now().Add(ttl)
+    } else if ttl == 0 {
+        // 0 表示立即过期
+        it.expiry = time.Now().Add(-time.Second)
+    } else if ttl == -1 {
+        // -1 表示永不过期，保持 expiry 为零值
+        it.expiry = time.Time{}
     }
     h.items[sk] = it
     return nil

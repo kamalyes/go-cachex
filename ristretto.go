@@ -220,8 +220,13 @@ func (h *RistrettoHandler) SetWithTTL(k, v []byte, ttl time.Duration) error {
 
 	var ok bool
 	if ttl == -1 {
-		ok = h.cache.SetWithTTL(k, v, 1, 0*time.Second)
+		// -1 表示永不过期，在Ristretto中用0表示
+		ok = h.cache.SetWithTTL(k, v, 1, 0)
+	} else if ttl == 0 {
+		// 0 表示立即过期，在Ristretto中用一个很小的正数时间，让它几乎立即过期
+		ok = h.cache.SetWithTTL(k, v, 1, time.Nanosecond)
 	} else {
+		// 正常TTL
 		ok = h.cache.SetWithTTL(k, v, 1, ttl)
 	}
 	if !ok {
