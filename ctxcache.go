@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-11-05 22:55:22
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-06 22:00:59
+ * @LastEditTime: 2025-11-09 18:58:57
  * @FilePath: \go-cachex\ctxcache.go
  * @Description: context 的缓存封装 `CtxCache`
  * 实现之上提供对上下文取消和并发去重的支持主要功能包括：
@@ -221,4 +221,46 @@ func FromContext(ctx context.Context) *CtxCache {
         }
     }
     return nil
+}
+
+// CacheType 定义支持的缓存类型
+type CacheType string
+
+const (
+    CacheLRU       CacheType = "lru"
+    CacheRistretto CacheType = "ristretto"
+    CacheRedis     CacheType = "redis"
+    CacheExpiring  CacheType = "expiring"
+)
+
+// CacheConfig 用于统一配置入口
+type Cache struct {
+    Type      CacheType
+    Capacity  int           // lru/expiring/ristretto
+    RedisConf *RedisConfig  // redis
+    RistrettoConf *RistrettoConfig // ristretto
+}
+
+// NewCacheHandler 根据配置创建带 context 能力的缓存
+func NewCacheHandler(cfg *Cache) *CtxCache {
+    var h Handler
+    switch cfg.Type {
+    case CacheLRU:
+        h = NewLRUHandler(cfg.Capacity)
+    case CacheExpiring:
+        h = NewExpiringHandler(time.Minute)
+    case CacheRistretto:
+        if cfg.RistrettoConf != nil {
+            h, _ = NewRistrettoHandler(cfg.RistrettoConf)
+        } else {
+            h, _ = NewRistrettoHandler(nil)
+        }
+    case CacheRedis:
+        if cfg.RedisConf != nil {
+            h, _ = NewRedisHandler(cfg.RedisConf)
+        }
+    default:
+        h = NewLRUHandler(128)
+    }
+    return NewCtxCache(h)
 }
