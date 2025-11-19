@@ -118,6 +118,13 @@ type Handler interface {
 - **自动刷新**: 可配置的定时数据刷新
 - **缓存预热**: 启动时预加载热点数据
 
+#### 缓存包装器 🆕
+- **泛型支持**: 支持任意类型的数据缓存 `CacheWrapper[T]`
+- **延迟双删**: 实现延迟双删策略，确保缓存一致性
+- **数据压缩**: 自动Zlib压缩，减少Redis内存占用
+- **错误处理**: 优雅的错误处理和降级机制
+- **并发安全**: 支持高并发访问，适用于生产环境
+
 ### ⚡ **性能与监控**
 
 #### Context 支持
@@ -198,6 +205,60 @@ func main() {
 }
 ```
 
+### CacheWrapper 示例
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "time"
+    
+    "github.com/redis/go-redis/v9"
+    "github.com/kamalyes/go-cachex"
+)
+
+type User struct {
+    ID   int    `json:"id"`
+    Name string `json:"name"`
+}
+
+func main() {
+    // 创建Redis客户端
+    client := redis.NewClient(&redis.Options{
+        Addr: "localhost:6379",
+    })
+    defer client.Close()
+
+    // 创建用户数据加载器
+    userLoader := cachex.CacheWrapper(client, "user:123",
+        func(ctx context.Context) (*User, error) {
+            // 模拟数据库查询
+            fmt.Println("Loading user from database...")
+            return &User{ID: 123, Name: "Alice"}, nil
+        },
+        time.Hour, // 缓存1小时
+    )
+
+    ctx := context.Background()
+    
+    // 第一次调用 - 从数据库加载
+    user, err := userLoader(ctx)
+    if err != nil {
+        panic(err)
+    }
+    fmt.Printf("User: %+v\n", user)
+    
+    // 第二次调用 - 从缓存获取
+    user2, err := userLoader(ctx)
+    if err != nil {
+        panic(err)
+    }
+    fmt.Printf("Cached User: %+v\n", user2)
+}
+```
+
 ## 🧩 核心组件
 
 ### 缓存客户端
@@ -206,6 +267,12 @@ func main() {
 - `NewRedisClient()` - Redis分布式缓存
 - `NewRistrettoClient()` - 高性能Ristretto缓存
 - `NewTwoLevelClient()` - 两级缓存系统
+
+### 缓存包装器
+- `CacheWrapper[T]()` - 泛型缓存包装器，支持任意类型
+- 延迟双删策略，确保缓存一致性
+- 自动数据压缩，节省存储空间
+- 优雅的错误处理和降级机制
 
 ### 队列系统
 - `NewQueueHandler()` - 创建队列处理器
@@ -237,6 +304,8 @@ func main() {
 - [队列系统高级指南](./docs/QUEUE_ADVANCED.md) - 队列的详细配置和使用
 - [发布订阅高级指南](./docs/PUBSUB_ADVANCED.md) - PubSub的高级特性
 - [热Key缓存指南](./docs/HOTKEY_ADVANCED.md) - 热点数据缓存最佳实践
+- [缓存包装器高级指南](./docs/WRAPPER_ADVANCED.md) - CacheWrapper深入使用
+- [缓存包装器示例集合](./docs/WRAPPER_EXAMPLES.md) - 实用场景和代码示例
 
 ### 📊 **性能与架构**
 - [性能测试报告](./docs/PERFORMANCE-REPORT.md) - 详细性能基准测试

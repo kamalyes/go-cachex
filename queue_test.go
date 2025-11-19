@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-11-19 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-19 20:52:00
+ * @LastEditTime: 2025-11-19 23:52:55
  * @FilePath: \go-cachex\queue_test.go
  * @Description: 队列功能测试
  *
@@ -22,21 +22,24 @@ import (
 
 func setupRedisClient(t *testing.T) *redis.Client {
 	client := redis.NewClient(&redis.Options{
-		Addr:         "120.79.25.168:16389",
-		Password:     "M5Pi9YW6u",
-		DB:           1,
-		DialTimeout:  500 * time.Millisecond, // 更激进的超时设置
-		ReadTimeout:  500 * time.Millisecond,
-		WriteTimeout: 500 * time.Millisecond,
-		PoolTimeout:  500 * time.Millisecond,
-		PoolSize:     3, // 更小的连接池
-		MaxRetries:   1, // 减少重试次数
+		Addr:            "120.79.25.168:16389",
+		Password:        "M5Pi9YW6u",
+		DB:              1,
+		DialTimeout:     10 * time.Second, // 增加拨号超时
+		ReadTimeout:     5 * time.Second,  // 增加读超时
+		WriteTimeout:    5 * time.Second,  // 增加写超时
+		PoolTimeout:     10 * time.Second, // 增加池超时
+		PoolSize:        10,               // 恢复正常连接池大小
+		MinIdleConns:    2,                // 最小空闲连接
+		MaxRetries:      3,                // 增加重试次数
+		DisableIdentity: true,
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	// 增加连接测试超时
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// 测试连接 - 使用最短超时
+	// 测试连接
 	err := client.Ping(ctx).Err()
 	if err != nil {
 		client.Close()

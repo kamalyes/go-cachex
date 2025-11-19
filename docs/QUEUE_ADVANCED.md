@@ -1,13 +1,3 @@
-<!--
- * @Author: kamalyes 501893067@qq.com
- * @Date: 2025-11-19 21:11:25
- * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-19 21:11:47
- * @FilePath: \go-cachex\docs\QUEUE_ADVANCED.md
- * @Description: 
- * 
- * Copyright (c) 2025 by kamalyes, All Rights Reserved. 
--->
 # Redis 队列组件高级使用指南
 
 ## 🏗️ 架构设计
