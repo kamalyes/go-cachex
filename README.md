@@ -246,6 +246,7 @@ func main() {
 ### 💻 **开发指南**
 - [API 文档](https://pkg.go.dev/github.com/kamalyes/go-cachex) - 在线API文档
 - [示例代码](examples/) - 各种使用场景的示例
+- [测试状态报告](./TEST-STATUS-REPORT.md) - 测试覆盖率和已知问题
 - [贡献指南](.github/CODE_OF_CONDUCT.md) - 贡献代码的规范
 
 ## 🏃‍♂️ 示例代码
