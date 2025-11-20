@@ -14,8 +14,8 @@ github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f h1:lO4WD4F/r
 github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f/go.mod h1:cuUVRXasLTGF7a8hSLbxyZXjz+1KgoB3wDUb6vlszIc=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
-github.com/kamalyes/go-toolbox v0.11.68 h1:Kczg2ocyn/BcOWfR4HFlLUyyz22aomjZfrP0w05d2rM=
-github.com/kamalyes/go-toolbox v0.11.68/go.mod h1:DmXSId0yjUQ7vK08/pBwhwiiYH5UN3cChxMWogUtVfI=
+github.com/kamalyes/go-toolbox v0.11.71 h1:AQefZM6hBKono05w+ZtfAMkduw/HtISVIPNmPMVeSZw=
+github.com/kamalyes/go-toolbox v0.11.71/go.mod h1:DmXSId0yjUQ7vK08/pBwhwiiYH5UN3cChxMWogUtVfI=
 github.com/kr/pretty v0.2.0 h1:s5hAObm+yFO5uHYt5dYjxi2rXrsnmRpJx4OYvIWUaQs=
 github.com/kr/pretty v0.2.0/go.mod h1:ipq/a2n7PKx3OHsz4KJII5eveXtPO4qwEXGdVfWzfnI=
 github.com/kr/text v0.2.0 h1:5Nx0Ya0ZqY2ygV366QzturHI13Jq95ApcVaJBhpS+AY=

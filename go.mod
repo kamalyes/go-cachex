@@ -4,7 +4,7 @@ go 1.23.0
 
 require (
 	github.com/dgraph-io/ristretto/v2 v2.3.0
-	github.com/kamalyes/go-toolbox v0.11.68
+	github.com/kamalyes/go-toolbox v0.11.71
 	github.com/redis/go-redis/v9 v9.16.0
 	github.com/stretchr/testify v1.11.1
 )
