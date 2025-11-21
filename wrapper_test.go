@@ -14,14 +14,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/redis/go-redis/v9"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestCacheWrapper01_BasicStringCache 测试基本字符串缓存
@@ -1076,4 +1077,433 @@ func BenchmarkCacheWrapper_Performance(b *testing.B) {
 			_, _ = cachedLoader(ctx)
 		}
 	})
+}
+
+// TestCacheWrapper_WithForceRefresh01_BasicForceRefresh 测试基本强制刷新功能
+func TestCacheWrapper_WithForceRefresh01_BasicForceRefresh(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	callCount := int32(0)
+	dataVersion := int32(1)
+
+	dataLoader := func(ctx context.Context) (string, error) {
+		atomic.AddInt32(&callCount, 1)
+		version := atomic.LoadInt32(&dataVersion)
+		return fmt.Sprintf("data_v%d", version), nil
+	}
+
+	key := "test_force_refresh_key"
+
+	// 第一次调用 - 默认行为
+	cachedLoader1 := CacheWrapper(client, key, dataLoader, time.Minute)
+	result1, err := cachedLoader1(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "data_v1", result1)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&callCount))
+
+	// 第二次调用 - 使用缓存
+	result2, err := cachedLoader1(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "data_v1", result2)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&callCount)) // 调用次数不变
+
+	// 更新数据版本
+	atomic.StoreInt32(&dataVersion, 2)
+
+	// 第三次调用 - 不刷新，仍使用缓存
+	result3, err := cachedLoader1(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "data_v1", result3) // 仍然是旧版本
+	assert.Equal(t, int32(1), atomic.LoadInt32(&callCount))
+
+	// 第四次调用 - 使用 WithForceRefresh 强制刷新
+	cachedLoader2 := CacheWrapper(client, key, dataLoader, time.Minute, WithForceRefresh(true))
+	result4, err := cachedLoader2(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "data_v2", result4)                     // 获取到新版本
+	assert.Equal(t, int32(2), atomic.LoadInt32(&callCount)) // 调用次数增加
+}
+
+// TestCacheWrapper_WithForceRefresh02_ConditionalRefresh 测试条件性刷新
+func TestCacheWrapper_WithForceRefresh02_ConditionalRefresh(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	callCount := int32(0)
+
+	dataLoader := func(ctx context.Context) (int, error) {
+		atomic.AddInt32(&callCount, 1)
+		return int(atomic.LoadInt32(&callCount) * 10), nil
+	}
+
+	key := "test_conditional_refresh"
+
+	// 模拟根据条件决定是否刷新
+	testCases := []struct {
+		name         string
+		forceRefresh bool
+		expectedCall int32
+	}{
+		{"首次加载", false, 1},
+		{"使用缓存", false, 1},
+		{"强制刷新", true, 2},
+		{"再次使用缓存", false, 2},
+		{"再次强制刷新", true, 3},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var opts []CacheOption
+			if tc.forceRefresh {
+				opts = append(opts, WithForceRefresh(true))
+			}
+
+			cachedLoader := CacheWrapper(client, key, dataLoader, time.Minute, opts...)
+			_, err := cachedLoader(ctx)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expectedCall, atomic.LoadInt32(&callCount))
+		})
+	}
+}
+
+// TestCacheWrapper_WithForceRefresh03_MultipleOptions 测试多个选项组合
+func TestCacheWrapper_WithForceRefresh03_MultipleOptions(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	callCount := int32(0)
+
+	dataLoader := func(ctx context.Context) (string, error) {
+		atomic.AddInt32(&callCount, 1)
+		return fmt.Sprintf("call_%d", atomic.LoadInt32(&callCount)), nil
+	}
+
+	key := "test_multiple_options"
+
+	// 测试空选项
+	opts1 := []CacheOption{}
+	loader1 := CacheWrapper(client, key, dataLoader, time.Minute, opts1...)
+	result1, err := loader1(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "call_1", result1)
+
+	// 测试显式设置为 false
+	opts2 := []CacheOption{WithForceRefresh(false)}
+	loader2 := CacheWrapper(client, key, dataLoader, time.Minute, opts2...)
+	result2, err := loader2(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "call_1", result2) // 使用缓存
+	assert.Equal(t, int32(1), atomic.LoadInt32(&callCount))
+}
+
+// TestCacheWrapper_WithForceRefresh04_CacheDeletion 测试强制刷新时缓存是否被删除
+func TestCacheWrapper_WithForceRefresh04_CacheDeletion(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	key := "test_cache_deletion"
+
+	dataLoader := func(ctx context.Context) (string, error) {
+		return "new_data", nil
+	}
+
+	// 先设置一个旧缓存
+	client.Set(ctx, key, "old_compressed_data", time.Minute)
+
+	// 确认缓存存在
+	exists, err := client.Exists(ctx, key).Result()
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), exists)
+
+	// 使用 ForceRefresh
+	cachedLoader := CacheWrapper(client, key, dataLoader, time.Minute, WithForceRefresh(true))
+	result, err := cachedLoader(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "new_data", result)
+
+	// 验证缓存已被更新（通过再次获取验证）
+	cachedLoader2 := CacheWrapper(client, key, dataLoader, time.Minute)
+	result2, err := cachedLoader2(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "new_data", result2)
+}
+
+// TestCacheWrapper_WithForceRefresh05_ConcurrentRefresh 测试并发刷新场景
+func TestCacheWrapper_WithForceRefresh05_ConcurrentRefresh(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	callCount := int32(0)
+	key := "test_concurrent_refresh"
+
+	dataLoader := func(ctx context.Context) (int, error) {
+		time.Sleep(10 * time.Millisecond) // 模拟耗时操作
+		return int(atomic.AddInt32(&callCount, 1)), nil
+	}
+
+	// 第一次加载建立缓存
+	loader1 := CacheWrapper(client, key, dataLoader, time.Minute)
+	result1, err := loader1(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, result1)
+
+	// 并发刷新缓存
+	concurrency := 10
+	var wg sync.WaitGroup
+	results := make([]int, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			loader := CacheWrapper(client, key, dataLoader, time.Minute, WithForceRefresh(true))
+			result, _ := loader(ctx)
+			results[index] = result
+		}(i)
+	}
+
+	wg.Wait()
+
+	// 验证所有goroutine都获取到了数据
+	for i, result := range results {
+		assert.Greater(t, result, 0, "goroutine %d should get valid result", i)
+	}
+
+	// 验证数据加载函数被多次调用（因为并发刷新）
+	finalCount := atomic.LoadInt32(&callCount)
+	assert.Greater(t, finalCount, int32(1), "应该有多次数据加载调用")
+}
+
+// TestCacheWrapper_WithForceRefresh06_ErrorHandling 测试强制刷新时的错误处理
+func TestCacheWrapper_WithForceRefresh06_ErrorHandling(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	key := "test_error_handling"
+	expectedError := errors.New("data loading failed")
+
+	dataLoader := func(ctx context.Context) (string, error) {
+		return "", expectedError
+	}
+
+	// 使用强制刷新，数据加载失败
+	cachedLoader := CacheWrapper(client, key, dataLoader, time.Minute, WithForceRefresh(true))
+	result, err := cachedLoader(ctx)
+	assert.Error(t, err)
+	assert.Equal(t, expectedError, err)
+	assert.Empty(t, result)
+
+	// 验证缓存未被设置
+	exists, err := client.Exists(ctx, key).Result()
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), exists)
+}
+
+// TestCacheWrapper_WithForceRefresh07_StructWithRefresh 测试结构体数据的强制刷新
+func TestCacheWrapper_WithForceRefresh07_StructWithRefresh(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	defer client.Close()
+
+	type User struct {
+		ID       int    `json:"id"`
+		Name     string `json:"name"`
+		Version  int    `json:"version"`
+		UpdateAt int64  `json:"update_at"`
+	}
+
+	ctx := context.Background()
+	key := "test_struct_refresh"
+	version := int32(1)
+
+	dataLoader := func(ctx context.Context) (*User, error) {
+		v := atomic.LoadInt32(&version)
+		return &User{
+			ID:       100,
+			Name:     "Alice",
+			Version:  int(v),
+			UpdateAt: time.Now().Unix(),
+		}, nil
+	}
+
+	// 第一次加载
+	loader1 := CacheWrapper(client, key, dataLoader, time.Minute)
+	user1, err := loader1(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, user1.Version)
+
+	// 更新版本
+	atomic.StoreInt32(&version, 2)
+
+	// 不刷新，使用缓存
+	user2, err := loader1(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, user2.Version) // 仍是旧版本
+
+	// 等待至少1秒以确保Unix时间戳不同 (Unix时间戳是秒级精度)
+	time.Sleep(1100 * time.Millisecond)
+
+	// 强制刷新
+	loader2 := CacheWrapper(client, key, dataLoader, time.Minute, WithForceRefresh(true))
+	user3, err := loader2(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, user3.Version)                 // 新版本
+	assert.Greater(t, user3.UpdateAt, user1.UpdateAt) // 更新时间更新
+}
+
+// TestCacheWrapper_WithForceRefresh08_AdminRefreshSimulation 模拟管理员刷新场景
+func TestCacheWrapper_WithForceRefresh08_AdminRefreshSimulation(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	key := "test_admin_refresh"
+	callCount := int32(0)
+
+	dataLoader := func(ctx context.Context) (string, error) {
+		count := atomic.AddInt32(&callCount, 1)
+		return fmt.Sprintf("data_loaded_%d_times", count), nil
+	}
+
+	// 模拟普通用户访问（使用缓存）
+	simulateUserAccess := func(isAdmin bool) (string, error) {
+		opts := []CacheOption{}
+		if isAdmin {
+			opts = append(opts, WithForceRefresh(true))
+		}
+		loader := CacheWrapper(client, key, dataLoader, time.Minute, opts...)
+		return loader(ctx)
+	}
+
+	// 普通用户访问
+	result1, err := simulateUserAccess(false)
+	assert.NoError(t, err)
+	assert.Equal(t, "data_loaded_1_times", result1)
+
+	// 普通用户再次访问（使用缓存）
+	result2, err := simulateUserAccess(false)
+	assert.NoError(t, err)
+	assert.Equal(t, "data_loaded_1_times", result2)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&callCount))
+
+	// 管理员访问（强制刷新）
+	result3, err := simulateUserAccess(true)
+	assert.NoError(t, err)
+	assert.Equal(t, "data_loaded_2_times", result3)
+	assert.Equal(t, int32(2), atomic.LoadInt32(&callCount))
+
+	// 普通用户访问（获取到管理员刷新后的数据）
+	result4, err := simulateUserAccess(false)
+	assert.NoError(t, err)
+	assert.Equal(t, "data_loaded_2_times", result4)
+	assert.Equal(t, int32(2), atomic.LoadInt32(&callCount)) // 调用次数不变
+}
+
+// TestCacheWrapper_WithForceRefresh09_RefreshAfterExpiration 测试过期后的刷新行为
+func TestCacheWrapper_WithForceRefresh09_RefreshAfterExpiration(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	key := "test_expiration_refresh"
+	callCount := int32(0)
+
+	dataLoader := func(ctx context.Context) (string, error) {
+		count := atomic.AddInt32(&callCount, 1)
+		return fmt.Sprintf("data_%d", count), nil
+	}
+
+	// 使用很短的TTL
+	shortTTL := 100 * time.Millisecond
+
+	// 第一次加载
+	loader1 := CacheWrapper(client, key, dataLoader, shortTTL)
+	result1, err := loader1(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "data_1", result1)
+
+	// 等待缓存过期 + 延迟双删时间(100ms)
+	time.Sleep(250 * time.Millisecond)
+
+	// 缓存过期后，即使不使用 ForceRefresh 也会重新加载
+	result2, err := loader1(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "data_2", result2)
+	assert.Equal(t, int32(2), atomic.LoadInt32(&callCount))
+}
+
+// TestCacheWrapper_WithForceRefresh10_OptionsIsolation 测试选项隔离性
+func TestCacheWrapper_WithForceRefresh10_OptionsIsolation(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	key := "test_options_isolation"
+	callCount := int32(0)
+
+	dataLoader := func(ctx context.Context) (int, error) {
+		return int(atomic.AddInt32(&callCount, 1)), nil
+	}
+
+	// 创建两个不同配置的加载器
+	loader1 := CacheWrapper(client, key, dataLoader, time.Minute, WithForceRefresh(false))
+	loader2 := CacheWrapper(client, key, dataLoader, time.Minute, WithForceRefresh(true))
+
+	// 使用 loader1 (不刷新)
+	result1, err := loader1(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, result1)
+
+	// 使用 loader1 再次 (仍不刷新)
+	result2, err := loader1(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, result2)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&callCount))
+
+	// 使用 loader2 (强制刷新)
+	result3, err := loader2(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, result3)
+	assert.Equal(t, int32(2), atomic.LoadInt32(&callCount))
+
+	// 验证 loader1 和 loader2 互不影响
+	result4, err := loader1(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, result4) // 获取到 loader2 刷新后的缓存
 }

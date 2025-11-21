@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-11-19 23:50:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-20 00:15:00
+ * @LastEditTime: 2025-11-21 13:29:13
  * @FilePath: \go-cachex\wrapper.go
  * @Description: 缓存包装器实现
  *
@@ -26,9 +26,10 @@ package cachex
 import (
 	"context"
 	"encoding/json"
+	"time"
+
 	"github.com/kamalyes/go-toolbox/pkg/zipx"
 	"github.com/redis/go-redis/v9"
-	"time"
 )
 
 // CacheFunc 是一个函数类型，用于表示返回数据和错误的数据加载函数。
@@ -46,6 +47,21 @@ import (
 //	T: 加载的数据
 //	error: 加载过程中可能出现的错误
 type CacheFunc[T any] func(ctx context.Context) (T, error)
+
+// CacheOptions 缓存选项配置
+type CacheOptions struct {
+	ForceRefresh bool // 是否强制刷新缓存（清除缓存重新获取）
+}
+
+// CacheOption 缓存选项函数类型
+type CacheOption func(*CacheOptions)
+
+// WithForceRefresh 设置是否强制刷新缓存
+func WithForceRefresh(force bool) CacheOption {
+	return func(opts *CacheOptions) {
+		opts.ForceRefresh = force
+	}
+}
 
 // CacheWrapper 是一个高阶函数，用于为数据加载函数添加Redis缓存功能。
 //
@@ -84,15 +100,15 @@ type CacheFunc[T any] func(ctx context.Context) (T, error)
 //
 // 使用示例:
 //
-//	// 创建用户数据加载器
+//	创建用户数据加载器
 //	userLoader := func(ctx context.Context) (*User, error) {
 //	    return getUserFromDB(ctx, userID)
 //	}
 //
-//	// 包装为缓存加载器
+//	包装为缓存加载器
 //	cachedLoader := CacheWrapper(client, "user:123", userLoader, time.Hour)
 //
-//	// 使用缓存加载器
+//	使用缓存加载器
 //	user, err := cachedLoader(ctx)
 //
 // 注意事项:
@@ -100,13 +116,30 @@ type CacheFunc[T any] func(ctx context.Context) (T, error)
 //   - 缓存键名应该具有唯一性和可读性
 //   - 合理设置过期时间以平衡性能和数据一致性
 //   - 大对象缓存会消耗更多内存，即使有压缩
-func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T], expiration time.Duration) CacheFunc[T] {
+//   - 可通过 WithForceRefresh(true) 强制刷新缓存
+func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T], expiration time.Duration, opts ...CacheOption) CacheFunc[T] {
 	return func(ctx context.Context) (T, error) {
 		var result T
+		var err error
+		var cachedData string
+		var decompressedData []byte
+
+		// 应用选项配置
+		options := &CacheOptions{}
+		for _, opt := range opts {
+			opt(options)
+		}
+
+		// 如果设置了强制刷新，直接跳转到数据加载逻辑
+		if options.ForceRefresh {
+			// 删除旧缓存
+			client.Del(ctx, key)
+			goto executeFunc
+		}
 
 		// 第一步：尝试从Redis缓存中获取数据
 		// 这是最快的路径，如果缓存命中可以避免执行原始数据加载函数
-		cachedData, err := client.Get(ctx, key).Result()
+		cachedData, err = client.Get(ctx, key).Result()
 
 		// 错误处理：区分真正的Redis连接错误和键不存在的正常情况
 		// redis.Nil 表示键不存在，这是正常情况，应该继续执行数据加载
@@ -119,7 +152,7 @@ func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T
 		if err == nil && cachedData != "" {
 			// 解压缩缓存数据
 			// 使用Zlib算法解压缩，如果解压缩失败可能是数据损坏或版本不兼容
-			decompressedData, err := zipx.ZlibDecompress([]byte(cachedData))
+			decompressedData, err = zipx.ZlibDecompress([]byte(cachedData))
 			if err != nil {
 				// 解压缩失败，可能是旧版本数据或数据损坏
 				// 跳转到数据加载逻辑，重新获取并缓存新数据
@@ -128,7 +161,7 @@ func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T
 
 			// JSON反序列化
 			// 将解压缩后的JSON数据反序列化为目标类型
-			err = json.Unmarshal([]byte(decompressedData), &result)
+			err = json.Unmarshal(decompressedData, &result)
 			if err != nil {
 				// 反序列化失败，可能是数据结构变更或数据损坏
 				// 跳转到数据加载逻辑，重新获取数据
