@@ -3,6 +3,7 @@
 ## 🎯 重大更新内容
 
 ### 1. Handler接口标准化
+
 所有缓存实现现在都支持统一的核心接口：
 
 ```go
@@ -19,6 +20,7 @@ type Handler interface {
 ```
 
 ### 2. ContextHandler接口增强
+
 Client层的ContextHandler接口同步更新：
 
 ```go
@@ -45,6 +47,7 @@ type ContextHandler interface {
 ## 📊 新功能示例
 
 ### 批量操作
+
 ```go
 // 高效批量获取
 keys := [][]byte{[]byte("key1"), []byte("key2"), []byte("key3")}
@@ -61,6 +64,7 @@ for i, key := range keys {
 ```
 
 ### 统计监控
+
 ```go
 // 获取详细统计
 stats := handler.Stats()
@@ -78,7 +82,7 @@ if shardCount, exists := stats["shard_count"]; exists {
 
 ## 🚀 性能优势
 
-1. **批量操作优化**: 
+1. **批量操作优化**:
    - 减少锁开销
    - 网络往返次数减少（Redis）
    - 并行分片处理（Sharded/LRU Optimized）
@@ -104,6 +108,7 @@ if shardCount, exists := stats["shard_count"]; exists {
 ## 🎯 最佳实践
 
 1. **优先使用批量操作**:
+
    ```go
    // ❌ 避免
    for _, key := range keys {
@@ -115,6 +120,7 @@ if shardCount, exists := stats["shard_count"]; exists {
    ```
 
 2. **监控缓存健康**:
+
    ```go
    stats := handler.Stats()
    hitRate := stats["hit_rate"].(float64)
@@ -125,7 +131,7 @@ if shardCount, exists := stats["shard_count"]; exists {
 
 3. **选择最优实现**:
    - **超高性能**: LRU Optimized (23M+ ops/s)
-   - **分布式**: Redis 
+   - **分布式**: Redis
    - **读密集**: Ristretto
    - **通用场景**: LRU Classic
 
