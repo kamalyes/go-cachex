@@ -77,17 +77,15 @@ func TestIDGenerator_CustomOptions(t *testing.T) {
 	defer client.Close()
 
 	// 创建自定义 ID 生成器
-	gen := NewIDGenerator(
-		client,
-		WithKeyPrefix("test:id:seq:"),
-		WithTimeFormat("20060102"),
-		WithSequenceLength(8),
-		WithExpire(10*time.Minute),
-		WithSequenceStart(100),
-		WithIDPrefix("PRE-"),
-		WithIDSuffix("-SUF"),
-		WithSeparator("_"),
-	)
+	gen := NewIDGenerator(client).
+		SetKeyPrefix("test:id:seq:").
+		SetTimeFormat("20060102").
+		SetSequenceLength(8).
+		SetExpire(10 * time.Minute).
+		SetSequenceStart(100).
+		SetIDPrefix("PRE-").
+		SetIDSuffix("-SUF").
+		SetSeparator("_")
 
 	// 重置序列
 	timePrefix := gen.getTimePrefix()
@@ -120,7 +118,7 @@ func TestIDGenerator_GetCurrentAndByTime(t *testing.T) {
 	ctx := context.Background()
 	client := setupRedisClient(t)
 	defer client.Close()
-	gen := NewIDGenerator(client, WithSequenceStart(100))
+	gen := NewIDGenerator(client).SetSequenceStart(100)
 	timePrefix := gen.getTimePrefix()
 	_ = gen.ResetSequence(ctx, timePrefix)
 	gen.GenerateID(ctx)
@@ -137,7 +135,7 @@ func TestIDGenerator_ResetSequence(t *testing.T) {
 	ctx := context.Background()
 	client := setupRedisClient(t)
 	defer client.Close()
-	gen := NewIDGenerator(client, WithSequenceStart(100))
+	gen := NewIDGenerator(client).SetSequenceStart(100)
 	timePrefix := gen.getTimePrefix()
 	gen.GenerateID(ctx)
 	err := gen.ResetSequence(ctx, timePrefix)
@@ -169,7 +167,7 @@ func TestIDGenerator(t *testing.T) {
 	defer client.FlushDB(ctx)
 
 	// 测试生成ID
-	idGen := NewIDGenerator(client, WithKeyPrefix("ticket:id:seq:"), WithTimeFormat("2006010215"), WithSequenceLength(6))
+	idGen := NewIDGenerator(client).SetKeyPrefix("ticket:id:seq:").SetTimeFormat("2006010215").SetSequenceLength(6)
 
 	id, err := idGen.GenerateID(ctx)
 	assert.NoError(t, err)
@@ -191,12 +189,10 @@ func TestIDGenerator(t *testing.T) {
 	assert.NotEmpty(t, id)
 
 	// 测试设置不同的选项
-	idGenWithOptions := NewIDGenerator(
-		client,
-		WithKeyPrefix("order:id:seq:"),
-		WithTimeFormat("20060102"),
-		WithSequenceLength(8),
-	)
+	idGenWithOptions := NewIDGenerator(client).
+		SetKeyPrefix("order:id:seq:").
+		SetTimeFormat("20060102").
+		SetSequenceLength(8)
 
 	id, err = idGenWithOptions.GenerateID(ctx)
 	assert.NoError(t, err)
@@ -241,14 +237,12 @@ func TestIDGenerator_SequenceInitCallback(t *testing.T) {
 		called bool
 		initValue int64 = 8888
 	)
-	gen := NewIDGenerator(
-		client,
-		WithKeyPrefix("cb:id:seq:"),
-		WithSequenceInitCallback(func() int64 {
+	gen := NewIDGenerator(client).
+		SetKeyPrefix("cb:id:seq:").
+		SetSequenceInitCallback(func() int64 {
 			called = true
 			return initValue
-		}),
-	)
+		})
 	timePrefix := gen.getTimePrefix()
 	// 清理key，模拟key不存在
 	_ = gen.ResetSequence(ctx, timePrefix)

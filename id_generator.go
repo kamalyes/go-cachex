@@ -33,12 +33,12 @@ type IDGenerator struct {
 	OnSequenceInit func() int64 // key不存在时动态获取起始值
 }
 
-// Option 是配置IDGenerator的函数类型
-type Option func(*IDGenerator)
+// Option 是配置IDGenerator的函数类型 - 已废弃，改为链式调用
+// type Option func(*IDGenerator)
 
 // NewIDGenerator 创建ID生成器实例
-func NewIDGenerator(redisClient redis.UniversalClient, options ...Option) *IDGenerator {
-	gen := &IDGenerator{
+func NewIDGenerator(redisClient redis.UniversalClient) *IDGenerator {
+	return &IDGenerator{
 		redisClient: redisClient,
 		keyPrefix:   "default:key:prefix:",
 		timeFormat:  "2006010215",
@@ -49,72 +49,60 @@ func NewIDGenerator(redisClient redis.UniversalClient, options ...Option) *IDGen
 		idSuffix:    "",
 		separator:   "",
 	}
-	for _, option := range options {
-		option(gen)
-	}
-	return gen
 }
 
-// WithKeyPrefix 设置Redis键前缀
-func WithKeyPrefix(prefix string) Option {
-	return func(g *IDGenerator) {
-		g.keyPrefix = prefix
-	}
+// SetKeyPrefix 设置Redis键前缀
+func (g *IDGenerator) SetKeyPrefix(prefix string) *IDGenerator {
+	g.keyPrefix = prefix
+	return g
 }
 
-// WithTimeFormat 设置时间格式
-func WithTimeFormat(format string) Option {
-	return func(g *IDGenerator) {
-		g.timeFormat = format
-	}
+// SetTimeFormat 设置时间格式
+func (g *IDGenerator) SetTimeFormat(format string) *IDGenerator {
+	g.timeFormat = format
+	return g
 }
 
-// WithSequenceLength 设置序列号长度
-func WithSequenceLength(length int) Option {
-	return func(g *IDGenerator) {
-		g.seqLength = length
-	}
+// SetSequenceLength 设置序列号长度
+func (g *IDGenerator) SetSequenceLength(length int) *IDGenerator {
+	g.seqLength = length
+	return g
 }
 
-// WithExpire 设置序列号过期时间
-func WithExpire(d time.Duration) Option {
-	return func(g *IDGenerator) {
-		g.expire = d
-	}
+// SetExpire 设置序列号过期时间
+func (g *IDGenerator) SetExpire(d time.Duration) *IDGenerator {
+	g.expire = d
+	return g
 }
 
-// WithSequenceStart 设置序列号起始值
-func WithSequenceStart(start int64) Option {
-	return func(g *IDGenerator) {
-		g.seqStart = start
-	}
+// SetSequenceStart 设置序列号起始值
+func (g *IDGenerator) SetSequenceStart(start int64) *IDGenerator {
+	g.seqStart = start
+	return g
 }
 
-// WithIDPrefix 设置ID前缀
-func WithIDPrefix(prefix string) Option {
-	return func(g *IDGenerator) {
-		g.idPrefix = prefix
-	}
+// SetIDPrefix 设置ID前缀
+func (g *IDGenerator) SetIDPrefix(prefix string) *IDGenerator {
+	g.idPrefix = prefix
+	return g
 }
 
-// WithIDSuffix 设置ID后缀
-func WithIDSuffix(suffix string) Option {
-	return func(g *IDGenerator) {
-		g.idSuffix = suffix
-	}
+// SetIDSuffix 设置ID后缀
+func (g *IDGenerator) SetIDSuffix(suffix string) *IDGenerator {
+	g.idSuffix = suffix
+	return g
 }
 
-// WithSeparator 设置分隔符
-func WithSeparator(sep string) Option {
-	return func(g *IDGenerator) {
-		g.separator = sep
-	}
+// SetSeparator 设置分隔符
+func (g *IDGenerator) SetSeparator(sep string) *IDGenerator {
+	g.separator = sep
+	return g
 }
 
-func WithSequenceInitCallback(cb func() int64) Option {
-    return func(g *IDGenerator) {
-        g.OnSequenceInit = cb
-    }
+// SetSequenceInitCallback 设置key不存在时的序列号初始化回调
+func (g *IDGenerator) SetSequenceInitCallback(cb func() int64) *IDGenerator {
+	g.OnSequenceInit = cb
+	return g
 }
 
 // getTimePrefix 获取当前时间前缀
