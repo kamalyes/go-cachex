@@ -26,10 +26,9 @@ package cachex
 import (
 	"context"
 	"encoding/json"
-	"time"
-
 	"github.com/kamalyes/go-toolbox/pkg/zipx"
 	"github.com/redis/go-redis/v9"
+	"time"
 )
 
 // CacheFunc 是一个函数类型，用于表示返回数据和错误的数据加载函数。

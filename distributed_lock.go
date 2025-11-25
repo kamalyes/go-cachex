@@ -328,10 +328,28 @@ type LockManager struct {
 }
 
 // NewLockManager 创建锁管理器
-func NewLockManager(client *redis.Client, config LockConfig) *LockManager {
+func NewLockManager(redisClient redis.UniversalClient, config ...LockConfig) *LockManager {
+	// 类型断言为*redis.Client
+	client, ok := redisClient.(*redis.Client)
+	if !ok {
+		panic("LockManager requires *redis.Client, cluster mode not supported yet")
+	}
+
+	cfg := LockConfig{
+		TTL:              time.Minute * 5,
+		RetryInterval:    time.Millisecond * 100,
+		MaxRetries:       10,
+		Namespace:        "lock",
+		EnableWatchdog:   true,
+		WatchdogInterval: time.Minute,
+	}
+	if len(config) > 0 {
+		cfg = config[0]
+	}
+
 	return &LockManager{
 		client: client,
-		config: config,
+		config: cfg,
 		locks:  make(map[string]*DistributedLock),
 	}
 }

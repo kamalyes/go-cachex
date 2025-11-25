@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-11-19 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-25 09:55:02
+ * @LastEditTime: 2025-11-26 22:55:27
  * @FilePath: \go-cachex\id_generator.go
  * @Description: 通用ID生成器 - 基于Redis实现分布式序列号
  *
@@ -14,23 +14,22 @@ package cachex
 import (
 	"context"
 	"fmt"
-	"time"
-
 	"github.com/redis/go-redis/v9"
+	"time"
 )
 
 // IDGenerator 通用ID生成器
 type IDGenerator struct {
-	redisClient redis.UniversalClient // 支持单机和集群
-	keyPrefix   string // Redis key前缀
-	timeFormat  string // 时间格式
-	seqLength   int    // 序列号长度
-	expire      time.Duration // 序列号过期时间
-	seqStart    int64  // 序列号起始值
-	idPrefix    string // ID前缀
-	idSuffix    string // ID后缀
-	separator   string // 分隔符
-	OnSequenceInit func() int64 // key不存在时动态获取起始值
+	redisClient    redis.UniversalClient // 支持单机和集群
+	keyPrefix      string                // Redis key前缀
+	timeFormat     string                // 时间格式
+	seqLength      int                   // 序列号长度
+	expire         time.Duration         // 序列号过期时间
+	seqStart       int64                 // 序列号起始值
+	idPrefix       string                // ID前缀
+	idSuffix       string                // ID后缀
+	separator      string                // 分隔符
+	OnSequenceInit func() int64          // key不存在时动态获取起始值
 }
 
 // Option 是配置IDGenerator的函数类型 - 已废弃，改为链式调用
@@ -51,56 +50,56 @@ func NewIDGenerator(redisClient redis.UniversalClient) *IDGenerator {
 	}
 }
 
-// SetKeyPrefix 设置Redis键前缀
-func (g *IDGenerator) SetKeyPrefix(prefix string) *IDGenerator {
+// WithKeyPrefix 设置Redis键前缀
+func (g *IDGenerator) WithKeyPrefix(prefix string) *IDGenerator {
 	g.keyPrefix = prefix
 	return g
 }
 
-// SetTimeFormat 设置时间格式
-func (g *IDGenerator) SetTimeFormat(format string) *IDGenerator {
+// WithTimeFormat 设置时间格式
+func (g *IDGenerator) WithTimeFormat(format string) *IDGenerator {
 	g.timeFormat = format
 	return g
 }
 
-// SetSequenceLength 设置序列号长度
-func (g *IDGenerator) SetSequenceLength(length int) *IDGenerator {
+// WithSequenceLength 设置序列号长度
+func (g *IDGenerator) WithSequenceLength(length int) *IDGenerator {
 	g.seqLength = length
 	return g
 }
 
-// SetExpire 设置序列号过期时间
-func (g *IDGenerator) SetExpire(d time.Duration) *IDGenerator {
+// WithExpire 设置序列号过期时间
+func (g *IDGenerator) WithExpire(d time.Duration) *IDGenerator {
 	g.expire = d
 	return g
 }
 
-// SetSequenceStart 设置序列号起始值
-func (g *IDGenerator) SetSequenceStart(start int64) *IDGenerator {
+// WithSequenceStart 设置序列号起始值
+func (g *IDGenerator) WithSequenceStart(start int64) *IDGenerator {
 	g.seqStart = start
 	return g
 }
 
-// SetIDPrefix 设置ID前缀
-func (g *IDGenerator) SetIDPrefix(prefix string) *IDGenerator {
+// WithIDPrefix 设置ID前缀
+func (g *IDGenerator) WithIDPrefix(prefix string) *IDGenerator {
 	g.idPrefix = prefix
 	return g
 }
 
-// SetIDSuffix 设置ID后缀
-func (g *IDGenerator) SetIDSuffix(suffix string) *IDGenerator {
+// WithIDSuffix 设置ID后缀
+func (g *IDGenerator) WithIDSuffix(suffix string) *IDGenerator {
 	g.idSuffix = suffix
 	return g
 }
 
-// SetSeparator 设置分隔符
-func (g *IDGenerator) SetSeparator(sep string) *IDGenerator {
+// WithSeparator 设置分隔符
+func (g *IDGenerator) WithSeparator(sep string) *IDGenerator {
 	g.separator = sep
 	return g
 }
 
-// SetSequenceInitCallback 设置key不存在时的序列号初始化回调
-func (g *IDGenerator) SetSequenceInitCallback(cb func() int64) *IDGenerator {
+// WithSequenceInitCallback 设置key不存在时的序列号初始化回调
+func (g *IDGenerator) WithSequenceInitCallback(cb func() int64) *IDGenerator {
 	g.OnSequenceInit = cb
 	return g
 }
@@ -122,23 +121,40 @@ func (g *IDGenerator) GenerateID(ctx context.Context) (string, error) {
 	}
 	timePrefix := g.getTimePrefix()
 	redisKey := g.getRedisKey(timePrefix)
-	// 首次设置起始值（优先用回调）
-	if exists, err := g.redisClient.Exists(ctx, redisKey).Result(); err == nil && exists == 0 {
-		start := g.seqStart
-		if g.OnSequenceInit != nil {
-			start = g.OnSequenceInit()
-		}
-		if start > 1 {
-			if err := g.redisClient.Set(ctx, redisKey, start, g.expire).Err(); err != nil {
-				return "", fmt.Errorf("failed to set sequence start: %w", err)
-			}
-		}
+
+	// 使用 Lua 脚本保证原子性：检查 key 是否存在，不存在则初始化，然后 INCR
+	luaScript := `
+		local key = KEYS[1]
+		local expire = tonumber(ARGV[1])
+		local seqStart = tonumber(ARGV[2])
+		local exists = redis.call('EXISTS', key)
+		if exists == 0 and seqStart > 1 then
+			redis.call('SET', key, seqStart-1, 'EX', expire)
+		end
+		local seq = redis.call('INCR', key)
+		if exists == 0 and seqStart <= 1 then
+			redis.call('EXPIRE', key, expire)
+		end
+		return seq
+	`
+
+	start := g.seqStart
+	if g.OnSequenceInit != nil {
+		start = g.OnSequenceInit()
 	}
-	seq, err := g.redisClient.Incr(ctx, redisKey).Result()
+	expireSec := int64(g.expire.Seconds())
+	args := []interface{}{expireSec, start}
+
+	res, err := g.redisClient.Eval(ctx, luaScript, []string{redisKey}, args...).Result()
 	if err != nil {
-		return "", fmt.Errorf("failed to get sequence from redis: %w", err)
+		return "", fmt.Errorf("failed to generate sequence: %w", err)
 	}
-	_ = g.redisClient.Expire(ctx, redisKey, g.expire)
+
+	seq, ok := res.(int64)
+	if !ok {
+		return "", fmt.Errorf("unexpected sequence type: %T", res)
+	}
+
 	id := g.formatID(timePrefix, seq)
 	return id, nil
 }
@@ -228,8 +244,36 @@ func (g *IDGenerator) GenerateIDs(ctx context.Context, n int) ([]string, error) 
 	return ids, nil
 }
 
-// ResetSequence 重置指定时间的序列号（仅用于测试或特殊场景）
+// ResetSequence 仅在 key 不存在时初始化序列号，已存在则不做任何操作
+// 这样可以避免在分布式环境下误删已有序列号导致ID重复
 func (g *IDGenerator) ResetSequence(ctx context.Context, timePrefix string) error {
+	if g.redisClient == nil {
+		return fmt.Errorf("redis client is not available")
+	}
+	redisKey := g.getRedisKey(timePrefix)
+	exists, err := g.redisClient.Exists(ctx, redisKey).Result()
+	if err != nil {
+		return fmt.Errorf("failed to check key existence: %w", err)
+	}
+	if exists == 0 {
+		// key 不存在时才初始化
+		start := g.seqStart
+		if g.OnSequenceInit != nil {
+			start = g.OnSequenceInit()
+		}
+		if start > 1 {
+			// 设置为 start-1，这样第一次 INCR 会得到 start
+			return g.redisClient.Set(ctx, redisKey, start-1, g.expire).Err()
+		}
+		// start <= 1 时不需要设置，让 INCR 从 0 开始
+	}
+	// key 已存在则不做任何操作，保护已有序列号
+	return nil
+}
+
+// ForceResetSequence 强制重置指定时间的序列号(仅用于测试或特殊场景)
+// 警告：此方法会删除已有序列号，可能导致ID重复，生产环境慎用
+func (g *IDGenerator) ForceResetSequence(ctx context.Context, timePrefix string) error {
 	if g.redisClient == nil {
 		return fmt.Errorf("redis client is not available")
 	}
@@ -261,6 +305,6 @@ func (g *IDGenerator) GetSequenceByTime(ctx context.Context, timePrefix string) 
 }
 
 // Getter方法，便于测试
-func (g *IDGenerator) GetIDPrefix() string    { return g.idPrefix }
-func (g *IDGenerator) GetIDSuffix() string    { return g.idSuffix }
-func (g *IDGenerator) GetSeparator() string   { return g.separator }
+func (g *IDGenerator) GetIDPrefix() string  { return g.idPrefix }
+func (g *IDGenerator) GetIDSuffix() string  { return g.idSuffix }
+func (g *IDGenerator) GetSeparator() string { return g.separator }

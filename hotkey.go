@@ -369,10 +369,26 @@ type HotKeyManager struct {
 }
 
 // NewHotKeyManager 创建热key管理器
-func NewHotKeyManager(client *redis.Client, config HotKeyConfig) *HotKeyManager {
+func NewHotKeyManager(redisClient redis.UniversalClient, config ...HotKeyConfig) *HotKeyManager {
+	// 类型断言为*redis.Client
+	client, ok := redisClient.(*redis.Client)
+	if !ok {
+		panic("HotKeyManager requires *redis.Client, cluster mode not supported yet")
+	}
+
+	cfg := HotKeyConfig{
+		DefaultTTL:        time.Hour,
+		RefreshInterval:   time.Minute * 5,
+		EnableAutoRefresh: true,
+		Namespace:         "hotkey",
+	}
+	if len(config) > 0 {
+		cfg = config[0]
+	}
+
 	return &HotKeyManager{
 		client: client,
-		config: config,
+		config: cfg,
 		caches: make(map[string]interface{}),
 	}
 }

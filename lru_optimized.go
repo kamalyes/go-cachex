@@ -77,44 +77,54 @@ func zeroAllocByteToString(b []byte) string {
 
 // 高性能entry结构，按缓存行对齐
 type fastEntry struct {
-	_       [8]byte  // 缓存行填充
-	key     string   // 键
-	value   []byte   // 值
-	expiry  int64    // 过期时间戳
-	prev    *fastEntry // 双向链表前驱
-	next    *fastEntry // 双向链表后继
-	_       [8]byte  // 缓存行填充
+	_      [8]byte    // 缓存行填充
+	key    string     // 键
+	value  []byte     // 值
+	expiry int64      // 过期时间戳
+	prev   *fastEntry // 双向链表前驱
+	next   *fastEntry // 双向链表后继
+	_      [8]byte    // 缓存行填充
 }
 
 // LRU分片，每个分片独立管理一部分数据
 type lruShard struct {
 	// 缓存行对齐的互斥锁
-	mu       sync.RWMutex
-	_        [56]byte // 填充到64字节缓存行
-	
+	mu sync.RWMutex
+	_  [56]byte // 填充到64字节缓存行
+
 	// 数据结构
 	cache    map[string]*fastEntry
 	head     *fastEntry // 链表头(最新)
 	tail     *fastEntry // 链表尾(最旧)
 	capacity int
-	size     int32  // 原子操作的大小计数
-	
+	size     int32 // 原子操作的大小计数
+
 	// 对象池
 	entryPool sync.Pool
-	
+
 	// 统计信息
 	hits   int64
 	misses int64
 	_      [40]byte // 缓存行填充
 }
 
-// LRUOptimizedHandler 是分片式高性能 LRU 缓存
+// LRUOptimizedHandler 高性能分片LRU缓存处理器
 type LRUOptimizedHandler struct {
 	shards     []*lruShard
 	shardCount uint32
 	shardMask  uint32
 	maxEntries int
 	closed     int32 // 原子操作的关闭标志
+
+	// singleflight用于GetOrCompute防止并发重复计算
+	loadGroup sync.Map // map[string]*singleLoadCall
+}
+
+// singleLoadCall GetOrCompute的单次调用封装
+type singleLoadCall struct {
+	wg  sync.WaitGroup
+	val []byte
+	err error
 }
 
 // NewLRUOptimizedHandler 创建分片式高性能LRU缓存
@@ -122,7 +132,7 @@ func NewLRUOptimizedHandler(maxEntries int) *LRUOptimizedHandler {
 	if maxEntries <= 0 {
 		maxEntries = defaultShardCapacity * defaultShardCount
 	}
-	
+
 	// 计算分片数量，确保是2的幂次方
 	shardCount := defaultShardCount
 	if maxEntries < defaultShardCount {
@@ -131,24 +141,24 @@ func NewLRUOptimizedHandler(maxEntries int) *LRUOptimizedHandler {
 	for shardCount < maxEntries/defaultShardCapacity && shardCount < 256 {
 		shardCount <<= 1
 	}
-	
+
 	shardCapacity := maxEntries / shardCount
 	if shardCapacity < 1 {
 		shardCapacity = 1
 	}
-	
+
 	h := &LRUOptimizedHandler{
 		shards:     make([]*lruShard, shardCount),
 		shardCount: uint32(shardCount),
 		shardMask:  uint32(shardCount - 1),
 		maxEntries: maxEntries,
 	}
-	
+
 	// 初始化每个分片
 	for i := 0; i < shardCount; i++ {
 		h.shards[i] = newLRUShard(shardCapacity)
 	}
-	
+
 	return h
 }
 
@@ -158,20 +168,20 @@ func newLRUShard(capacity int) *lruShard {
 		cache:    make(map[string]*fastEntry, capacity),
 		capacity: capacity,
 	}
-	
+
 	// 初始化双向链表
 	s.head = &fastEntry{}
 	s.tail = &fastEntry{}
 	s.head.next = s.tail
 	s.tail.prev = s.head
-	
+
 	// 初始化对象池
 	s.entryPool = sync.Pool{
 		New: func() interface{} {
 			return &fastEntry{}
 		},
 	}
-	
+
 	return s
 }
 
@@ -250,20 +260,20 @@ func (h *LRUOptimizedHandler) SetWithTTL(key, value []byte, ttl time.Duration) e
 	if atomic.LoadInt32(&h.closed) != 0 {
 		return ErrClosed
 	}
-	
+
 	shard := h.getShard(key)
 	sk := zeroAllocByteToString(key)
-	
+
 	var expiry int64
 	if ttl > 0 {
 		expiry = fastNow() + ttl.Nanoseconds()
 	} else if ttl == 0 {
 		expiry = fastNow() - 1 // 立即过期
 	}
-	
+
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
-	
+
 	// 检查是否已存在
 	if entry, exists := shard.cache[sk]; exists {
 		// 更新现有条目
@@ -278,19 +288,19 @@ func (h *LRUOptimizedHandler) SetWithTTL(key, value []byte, ttl time.Duration) e
 		shard.moveToHead(entry)
 		return nil
 	}
-	
+
 	// 创建新条目
 	entry := shard.getEntry()
 	entry.key = string(key)
 	entry.value = make([]byte, len(value))
 	copy(entry.value, value)
 	entry.expiry = expiry
-	
+
 	// 添加到缓存和链表
 	shard.cache[sk] = entry
 	shard.addToHead(entry)
 	atomic.AddInt32(&shard.size, 1)
-	
+
 	// 检查容量限制
 	if shard.capacity > 0 && int(atomic.LoadInt32(&shard.size)) > shard.capacity {
 		tail := shard.removeTail()
@@ -300,7 +310,7 @@ func (h *LRUOptimizedHandler) SetWithTTL(key, value []byte, ttl time.Duration) e
 			shard.putEntry(tail)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -312,10 +322,10 @@ func (h *LRUOptimizedHandler) Get(key []byte) ([]byte, error) {
 	if atomic.LoadInt32(&h.closed) != 0 {
 		return nil, ErrClosed
 	}
-	
+
 	shard := h.getShard(key)
 	sk := zeroAllocByteToString(key)
-	
+
 	// 先用读锁查找
 	shard.mu.RLock()
 	entry, exists := shard.cache[sk]
@@ -324,11 +334,11 @@ func (h *LRUOptimizedHandler) Get(key []byte) ([]byte, error) {
 		atomic.AddInt64(&shard.misses, 1)
 		return nil, ErrNotFound
 	}
-	
+
 	// 快速检查过期
 	if shard.isExpired(entry.expiry) {
 		shard.mu.RUnlock()
-		
+
 		// 升级到写锁进行清理
 		shard.mu.Lock()
 		if entry, exists := shard.cache[sk]; exists && shard.isExpired(entry.expiry) {
@@ -341,19 +351,19 @@ func (h *LRUOptimizedHandler) Get(key []byte) ([]byte, error) {
 		atomic.AddInt64(&shard.misses, 1)
 		return nil, ErrNotFound
 	}
-	
+
 	// 复制数据
 	result := make([]byte, len(entry.value))
 	copy(result, entry.value)
 	shard.mu.RUnlock()
-	
+
 	// 升级到写锁更新LRU位置
 	shard.mu.Lock()
 	if entry, exists := shard.cache[sk]; exists && !shard.isExpired(entry.expiry) {
 		shard.moveToHead(entry)
 	}
 	shard.mu.Unlock()
-	
+
 	atomic.AddInt64(&shard.hits, 1)
 	return result, nil
 }
@@ -366,31 +376,31 @@ func (h *LRUOptimizedHandler) GetTTL(key []byte) (time.Duration, error) {
 	if atomic.LoadInt32(&h.closed) != 0 {
 		return 0, ErrClosed
 	}
-	
+
 	shard := h.getShard(key)
 	sk := zeroAllocByteToString(key)
-	
+
 	shard.mu.RLock()
 	defer shard.mu.RUnlock()
-	
+
 	entry, exists := shard.cache[sk]
 	if !exists {
 		return 0, ErrNotFound
 	}
-	
+
 	if shard.isExpired(entry.expiry) {
 		return 0, ErrNotFound
 	}
-	
+
 	if entry.expiry == 0 {
 		return 0, nil // 永不过期
 	}
-	
+
 	remaining := entry.expiry - fastNow()
 	if remaining <= 0 {
 		return 0, ErrNotFound
 	}
-	
+
 	return time.Duration(remaining), nil
 }
 
@@ -402,20 +412,20 @@ func (h *LRUOptimizedHandler) Del(key []byte) error {
 	if atomic.LoadInt32(&h.closed) != 0 {
 		return ErrClosed
 	}
-	
+
 	shard := h.getShard(key)
 	sk := zeroAllocByteToString(key)
-	
+
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
-	
+
 	if entry, exists := shard.cache[sk]; exists {
 		delete(shard.cache, sk)
 		shard.removeEntry(entry)
 		atomic.AddInt32(&shard.size, -1)
 		shard.putEntry(entry)
 	}
-	
+
 	return nil
 }
 
@@ -424,7 +434,7 @@ func (h *LRUOptimizedHandler) Close() error {
 	if !atomic.CompareAndSwapInt32(&h.closed, 0, 1) {
 		return nil // 已经关闭
 	}
-	
+
 	// 清理所有分片
 	for _, shard := range h.shards {
 		shard.mu.Lock()
@@ -436,7 +446,7 @@ func (h *LRUOptimizedHandler) Close() error {
 		atomic.StoreInt32(&shard.size, 0)
 		shard.mu.Unlock()
 	}
-	
+
 	return nil
 }
 
@@ -453,28 +463,28 @@ func (h *LRUOptimizedHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
 		}
 		return results, errors
 	}
-	
+
 	results := make([][]byte, len(keys))
 	errors := make([]error, len(keys))
-	
+
 	// 按分片分组键值
 	type shardBatch struct {
 		shard   *lruShard
 		indices []int
 		keys    []string
 	}
-	
+
 	batches := make(map[*lruShard]*shardBatch)
-	
+
 	for i, key := range keys {
 		if key == nil {
 			errors[i] = ErrInvalidKey
 			continue
 		}
-		
+
 		shard := h.getShard(key)
 		sk := zeroAllocByteToString(key)
-		
+
 		if batches[shard] == nil {
 			batches[shard] = &shardBatch{
 				shard:   shard,
@@ -482,42 +492,42 @@ func (h *LRUOptimizedHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
 				keys:    make([]string, 0, 4),
 			}
 		}
-		
+
 		batch := batches[shard]
 		batch.indices = append(batch.indices, i)
 		batch.keys = append(batch.keys, sk)
 	}
-	
+
 	// 并发处理各个分片
 	var wg sync.WaitGroup
 	for _, batch := range batches {
 		wg.Add(1)
 		go func(b *shardBatch) {
 			defer wg.Done()
-			
+
 			b.shard.mu.RLock()
 			defer b.shard.mu.RUnlock()
-			
+
 			for j, sk := range b.keys {
 				idx := b.indices[j]
-				
+
 				entry, exists := b.shard.cache[sk]
 				if !exists {
 					errors[idx] = ErrNotFound
 					continue
 				}
-				
+
 				if b.shard.isExpired(entry.expiry) {
 					errors[idx] = ErrNotFound
 					continue
 				}
-				
+
 				results[idx] = make([]byte, len(entry.value))
 				copy(results[idx], entry.value)
 			}
 		}(batch)
 	}
-	
+
 	wg.Wait()
 	return results, errors
 }
@@ -529,22 +539,22 @@ func (h *LRUOptimizedHandler) Stats() map[string]interface{} {
 			"closed": true,
 		}
 	}
-	
+
 	totalEntries := int32(0)
 	totalHits := int64(0)
 	totalMisses := int64(0)
-	
+
 	for _, shard := range h.shards {
 		totalEntries += atomic.LoadInt32(&shard.size)
 		totalHits += atomic.LoadInt64(&shard.hits)
 		totalMisses += atomic.LoadInt64(&shard.misses)
 	}
-	
+
 	hitRate := float64(0)
 	if totalHits+totalMisses > 0 {
 		hitRate = float64(totalHits) / float64(totalHits+totalMisses)
 	}
-	
+
 	return map[string]interface{}{
 		"entries":     totalEntries,
 		"max_entries": h.maxEntries,
@@ -556,7 +566,8 @@ func (h *LRUOptimizedHandler) Stats() map[string]interface{} {
 	}
 }
 
-// GetOrCompute 获取缓存值，如果不存在则计算并设置 
+// GetOrCompute 获取缓存值，如果不存在则计算并设置
+// GetOrCompute 获取或计算值(使用singleflight防止并发重复计算)
 func (h *LRUOptimizedHandler) GetOrCompute(key []byte, ttl time.Duration, loader func() ([]byte, error)) ([]byte, error) {
 	if len(key) == 0 {
 		return nil, ErrInvalidKey
@@ -567,9 +578,63 @@ func (h *LRUOptimizedHandler) GetOrCompute(key []byte, ttl time.Duration, loader
 		return value, nil
 	}
 
+	// 使用singleflight模式防止并发重复计算
+	keyStr := string(key)
+
+	// 快速路径:检查是否已有进行中的调用
+	if v, loaded := h.loadGroup.Load(keyStr); loaded {
+		sc := v.(*singleLoadCall)
+		sc.wg.Wait()
+		if sc.err != nil {
+			return nil, sc.err
+		}
+		// 返回拷贝
+		result := make([]byte, len(sc.val))
+		copy(result, sc.val)
+		return result, nil
+	}
+
+	// 创建新的调用并预先设置wg
+	call := &singleLoadCall{}
+	call.wg.Add(1)
+
+	// 尝试存储
+	actual, loaded := h.loadGroup.LoadOrStore(keyStr, call)
+	if loaded {
+		// 其他goroutine已经开始调用,等待结果
+		sc := actual.(*singleLoadCall)
+		sc.wg.Wait()
+		if sc.err != nil {
+			return nil, sc.err
+		}
+		// 返回拷贝
+		result := make([]byte, len(sc.val))
+		copy(result, sc.val)
+		return result, nil
+	}
+
+	// 当前goroutine负责执行调用
+	defer func() {
+		call.wg.Done()
+		// 延迟删除
+		time.AfterFunc(time.Millisecond*10, func() {
+			h.loadGroup.Delete(keyStr)
+		})
+	}()
+
+	// 再次检查缓存(double-check)
+	if value, err := h.Get(key); err == nil {
+		call.val = value
+		// 返回拷贝
+		result := make([]byte, len(value))
+		copy(result, value)
+		return result, nil
+	}
+
 	// 缓存未命中，调用loader
 	value, err := loader()
 	if err != nil {
+		call.err = err
 		return nil, err
 	}
 
@@ -579,6 +644,9 @@ func (h *LRUOptimizedHandler) GetOrCompute(key []byte, ttl time.Duration, loader
 	} else {
 		h.SetWithTTL(key, value, ttl)
 	}
+
+	// 保存结果
+	call.val = value
 
 	// 返回值的拷贝
 	result := make([]byte, len(value))

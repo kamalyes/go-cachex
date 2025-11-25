@@ -60,7 +60,13 @@ type PubSub struct {
 }
 
 // NewPubSub 创建发布订阅实例
-func NewPubSub(client *redis.Client, config ...PubSubConfig) *PubSub {
+func NewPubSub(redisClient redis.UniversalClient, config ...PubSubConfig) *PubSub {
+	// 类型断言为*redis.Client
+	client, ok := redisClient.(*redis.Client)
+	if !ok {
+		panic("PubSub requires *redis.Client, cluster mode not supported yet")
+	}
+
 	cfg := DefaultPubSubConfig()
 	if len(config) > 0 {
 		cfg = config[0]
