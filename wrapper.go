@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-11-19 23:50:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-21 13:55:08
+ * @LastEditTime: 2025-12-05 13:50:02
  * @FilePath: \go-cachex\wrapper.go
  * @Description: 缓存包装器实现
  *
@@ -26,9 +26,12 @@ package cachex
 import (
 	"context"
 	"encoding/json"
+	"math/rand"
+	"time"
+
+	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/kamalyes/go-toolbox/pkg/zipx"
 	"github.com/redis/go-redis/v9"
-	"time"
 )
 
 // CacheFunc 是一个函数类型，用于表示返回数据和错误的数据加载函数。
@@ -49,12 +52,13 @@ type CacheFunc[T any] func(ctx context.Context) (T, error)
 
 // CacheOptions 缓存选项配置
 type CacheOptions struct {
-	ForceRefresh bool           // 是否强制刷新缓存（清除缓存重新获取）
-	TTLOverride  *time.Duration // 覆盖默认 TTL（为 nil 时使用默认值）
-	SkipCompress bool           // 跳过压缩（用于小数据或已压缩的数据）
-	UseAsync     bool           // 使用异步更新缓存（适用于非关键数据）
-	RetryOnError bool           // Redis 错误时重试（默认不重试）
-	RetryTimes   int            // 重试次数（默认 0）
+	ForceRefresh  bool           // 是否强制刷新缓存（清除缓存重新获取）
+	TTLOverride   *time.Duration // 覆盖默认 TTL（为 nil 时使用默认值）
+	SkipCompress  bool           // 跳过压缩（用于小数据或已压缩的数据）
+	UseAsync      bool           // 使用异步更新缓存（适用于非关键数据）
+	RetryOnError  bool           // Redis 错误时重试（默认不重试）
+	RetryTimes    int            // 重试次数（默认 0）
+	JitterPercent *float64       // TTL 随机抖动百分比（0-1，nil 时使用默认 0.005 即 ±0.5%）
 }
 
 // CacheOption 缓存选项函数类型
@@ -133,6 +137,29 @@ func WithRetry(times int) CacheOption {
 			times = 1
 		}
 		opts.RetryTimes = times
+	}
+}
+
+// WithJitter 设置 TTL 随机抖动百分比，避免缓存雪崩
+//
+// 参数:
+//
+//	percent: 抖动百分比（0-1），例如 0.005 表示 ±0.5% 的随机抖动
+//
+// 使用场景:
+//   - 大量缓存同时创建，避免同时失效
+//   - 防止缓存雪崩
+//   - 分散缓存失效时间
+//
+// 示例:
+//
+//	WithJitter(0.005)  // ±0.5% 抖动，1小时缓存会在 59.7-60.3 分钟之间随机失效
+//	WithJitter(0.01)   // ±1% 抖动，1小时缓存会在 59.4-60.6 分钟之间随机失效
+//	WithJitter(0.05)   // ±5% 抖动，1小时缓存会在 57-63 分钟之间随机失效
+func WithJitter(percent float64) CacheOption {
+	return func(opts *CacheOptions) {
+		percent := mathx.Between(percent, 0.0, 1.0)
+		opts.JitterPercent = &percent
 	}
 }
 
@@ -328,6 +355,22 @@ func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T
 		// 应用 TTL 覆盖选项
 		if options.TTLOverride != nil {
 			expiration = *options.TTLOverride
+		}
+
+		// 应用 TTL 随机抖动，避免缓存雪崩
+		jitterPercent := 0.005 // 默认 ±0.5% 抖动
+		if options.JitterPercent != nil {
+			jitterPercent = *options.JitterPercent
+		}
+		if jitterPercent > 0 {
+			// 计算抖动范围：expiration * (1 ± jitterPercent)
+			jitterRange := float64(expiration) * jitterPercent
+			jitter := rand.Int63n(int64(jitterRange*2)) - int64(jitterRange)
+			expiration = expiration + time.Duration(jitter)
+			// 确保 TTL 不会为负数
+			if expiration < 0 {
+				expiration = time.Second
+			}
 		}
 
 		// 如果设置了强制刷新，直接跳转到数据加载逻辑
