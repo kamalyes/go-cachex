@@ -5,12 +5,10 @@ go 1.23.0
 require (
 	github.com/alicebob/miniredis/v2 v2.35.0
 	github.com/dgraph-io/ristretto/v2 v2.3.0
-	github.com/kamalyes/go-toolbox v0.11.79
+	github.com/kamalyes/go-toolbox v0.11.86
 	github.com/redis/go-redis/v9 v9.16.0
 	github.com/stretchr/testify v1.11.1
 )
-
-replace github.com/kamalyes/go-toolbox => ../go-toolbox
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -20,5 +18,6 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/yuin/gopher-lua v1.1.1 // indirect
 	golang.org/x/sys v0.35.0 // indirect
+	google.golang.org/protobuf v1.36.10 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
