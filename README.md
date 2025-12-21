@@ -77,18 +77,25 @@ Go-Cachex 采用模块化分层架构设计，提供灵活且强大的缓存解�
 - **Expiring Cache**: 简单的 TTL 缓存，后台自动清理
 
 #### 统一Handler接口
+
+所有缓存实现都支持**双API设计**：
+
+- **简化版API**: `Set()`, `Get()`, `Del()` 等 - 适合快速简单的操作
+- **WithCtx API**: `SetWithCtx()`, `GetWithCtx()` 等 - 支持超时控制和取消
+
 ```go
-type Handler interface {
-    Set(key, value []byte) error
-    SetWithTTL(key, value []byte, ttl time.Duration) error
-    Get(key []byte) ([]byte, error)
-    GetTTL(key []byte) ([]byte, time.Duration, error)
-    Del(key []byte) error
-    BatchGet(keys [][]byte) ([][]byte, []error)
-    Stats() Stats
-    Close() error
-}
+// 简化版 - 快速简单
+cache.Set(key, value)
+val, _ := cache.Get(key)
+
+// WithCtx版 - 超时控制
+ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+defer cancel()
+cache.SetWithCtx(ctx, key, value)
+val, _ := cache.GetWithCtx(ctx, key)
 ```
+
+> 📘 详细API说明请查看 [USAGE.md](./USAGE.md)
 
 ### 🔥 **高级特性**
 
@@ -127,10 +134,17 @@ type Handler interface {
 
 ### ⚡ **性能与监控**
 
+#### 双API设计 🆕
+- **简化版方法**: 不带context，适合简单场景快速调用
+- **完整版方法**: 带context，支持超时控制和取消操作
+- **统一接口**: 所有Handler实现都支持双API，灵活选择
+- **向后兼容**: 简化版方法内部自动调用WithCtx版本
+
 #### Context 支持
-- **上下文取消**: 所有操作支持 context，可实现超时控制
-- **并发去重**: 内置 singleflight 机制，避免重复计算  
-- **GetOrCompute**: 智能加载函数，缓存未命中时自动计算
+- **超时控制**: WithCtx方法支持context超时控制
+- **取消操作**: 支持通过context取消长时间运行的操作
+- **并发去重**: GetOrComputeWithCtx内置singleflight机制
+- **链路追踪**: Context可用于分布式链路追踪
 
 #### 统计与监控
 - **性能指标**: 命中率、操作计数、延迟统计
@@ -156,178 +170,96 @@ type Handler interface {
 go get -u github.com/kamalyes/go-cachex
 ```
 
-### 快速示例
+### 5分钟入门
 
 ```go
 package main
 
 import (
-    "context"
     "fmt"
     "time"
-    
     "github.com/kamalyes/go-cachex"
 )
 
 func main() {
-    ctx := context.Background()
+    // 创建LRU缓存
+    cache := cachex.NewLRUHandler(1000)
+    defer cache.Close()
     
-    // 创建 LRU 缓存客户端
-    client, err := cachex.NewLRUClient(ctx, 1000)
-    if err != nil {
-        panic(err)
-    }
-    defer client.Close()
+    // 设置和获取
+    cache.Set([]byte("key"), []byte("value"))
+    val, _ := cache.Get([]byte("key"))
+    fmt.Printf("值: %s\n", string(val))
     
-    // 基本操作
-    err = client.Set(ctx, []byte("hello"), []byte("world"))
-    if err != nil {
-        panic(err)
-    }
+    // 带TTL
+    cache.SetWithTTL([]byte("temp"), []byte("data"), 5*time.Second)
     
-    val, err := client.Get(ctx, []byte("hello"))
-    if err != nil {
-        panic(err)
-    }
-    
-    fmt.Printf("Value: %s\n", string(val))
-    
-    // 使用 GetOrCompute
-    result, err := client.GetOrCompute(ctx, []byte("computed"), 
-        func(ctx context.Context) ([]byte, error) {
-            return []byte("computed value"), nil
-        })
-    if err != nil {
-        panic(err)
-    }
-    
-    fmt.Printf("Computed: %s\n", string(result))
+    // 查看统计
+    stats := cache.Stats()
+    fmt.Printf("条目数: %v\n", stats["entries"])
 }
 ```
 
-### CacheWrapper 示例
-
-```go
-package main
-
-import (
-    "context"
-    "fmt"
-    "time"
-    
-    "github.com/redis/go-redis/v9"
-    "github.com/kamalyes/go-cachex"
-)
-
-type User struct {
-    ID   int    `json:"id"`
-    Name string `json:"name"`
-}
-
-func main() {
-    // 创建Redis客户端
-    client := redis.NewClient(&redis.Options{
-        Addr: "localhost:6379",
-    })
-    defer client.Close()
-
-    // 创建用户数据加载器
-    userLoader := cachex.CacheWrapper(client, "user:123",
-        func(ctx context.Context) (*User, error) {
-            // 模拟数据库查询
-            fmt.Println("Loading user from database...")
-            return &User{ID: 123, Name: "Alice"}, nil
-        },
-        time.Hour, // 缓存1小时
-    )
-
-    ctx := context.Background()
-    
-    // 第一次调用 - 从数据库加载
-    user, err := userLoader(ctx)
-    if err != nil {
-        panic(err)
-    }
-    fmt.Printf("User: %+v\n", user)
-    
-    // 第二次调用 - 从缓存获取
-    user2, err := userLoader(ctx)
-    if err != nil {
-        panic(err)
-    }
-    fmt.Printf("Cached User: %+v\n", user2)
-}
-```
+> 💡 **更多示例**：查看 [USAGE.md](./USAGE.md) 获取完整的使用指南和高级特性
 
 ## 🧩 核心组件
 
-### 缓存客户端
-- `NewLRUClient()` - 内存LRU缓存
-- `NewLRUOptimizedClient()` - 高性能分片LRU  
-- `NewRedisClient()` - Redis分布式缓存
-- `NewRistrettoClient()` - 高性能Ristretto缓存
-- `NewTwoLevelClient()` - 两级缓存系统
+### 缓存Handler实现
+- **LRU Cache** - 经典LRU算法，适合中小型应用
+- **LRU Optimized** - 16分片架构，500%+性能提升，适合高并发场景
+- **Ristretto** - 高命中率缓存，适合读密集应用
+- **Redis** - 分布式缓存，适合多服务共享
+- **TwoLevel** - 两级缓存，结合内存和分布式优势
+- **Expiring** - 自动过期清理，适合临时数据
+- **Sharded** - 自定义分片策略
 
-### 缓存包装器
-- `CacheWrapper[T]()` - 泛型缓存包装器，支持任意类型
-- 延迟双删策略，确保缓存一致性
-- 自动数据压缩，节省存储空间
-- 优雅的错误处理和降级机制
+### 高级功能
+- **队列系统** - FIFO/LIFO/优先级/延迟队列
+- **分布式锁** - Redis分布式锁，支持看门狗
+- **发布订阅** - Redis Pub/Sub消息系统
+- **热Key缓存** - 热点数据自动加载和刷新
+- **泛型包装器** - CacheWrapper[T]泛型支持
 
-### 队列系统
-- `NewQueueHandler()` - 创建队列处理器
-- `QueueType` - FIFO/LIFO/Priority/Delayed
-- `ProcessWithLock()` - 支持分布式锁的处理
-
-### 分布式锁
-- `NewDistributedLock()` - 创建分布式锁
-- `TryLock()` / `Lock()` - 获取锁
-- `Unlock()` - 释放锁
-
-### 发布订阅
-- `NewPubSub()` - 创建发布订阅客户端  
-- `Subscribe()` - 订阅消息
-- `Publish()` - 发布消息
-
-### 热Key缓存
-- `NewHotKeyCache()` - 创建热key缓存
-- `DataLoader` - 数据加载器接口
-- `Refresh()` - 手动刷新数据
+> 📘 **详细用法**：查看 [USAGE.md](./USAGE.md) 了解每个组件的详细使用方法
 
 ## 📖 文档索引
 
-### 📋 **基础文档**
-- [详细使用指南](./USAGE.md) - 完整的API使用说明
-- [Redis配置指南](./REDIS_CONFIG.md) - Redis相关配置说明
-
-### 🔧 **组件文档**  
-- [队列系统高级指南](./docs/QUEUE_ADVANCED.md) - 队列的详细配置和使用
-- [发布订阅高级指南](./docs/PUBSUB_ADVANCED.md) - PubSub的高级特性
-- [热Key缓存指南](./docs/HOTKEY_ADVANCED.md) - 热点数据缓存最佳实践
-- [缓存包装器高级指南](./docs/WRAPPER_ADVANCED.md) - CacheWrapper深入使用
-- [缓存包装器示例集合](./docs/WRAPPER_EXAMPLES.md) - 实用场景和代码示例
+### 📘 **使用文档**
+- **[USAGE.md](./USAGE.md)** - 完整的API使用指南、示例代码、最佳实践
+- **[REDIS_CONFIG.md](./REDIS_CONFIG.md)** - Redis配置详解
 
 ### 📊 **性能与架构**
-- [性能测试报告](./docs/PERFORMANCE-REPORT.md) - 详细性能基准测试
-- [LRU优化报告](./docs/LRU-OPTIMIZATION-REPORT.md) - LRU优化技术细节
-- [接口统一总结](./docs/INTERFACE-UNIFICATION-SUMMARY.md) - 架构设计文档
+- **[PERFORMANCE-REPORT.md](./docs/PERFORMANCE-REPORT.md)** - 性能基准测试报告
+- **[LRU-OPTIMIZATION-REPORT.md](./docs/LRU-OPTIMIZATION-REPORT.md)** - LRU优化技术详解
+- **[INTERFACE-UNIFICATION-SUMMARY.md](./docs/INTERFACE-UNIFICATION-SUMMARY.md)** - 接口设计文档
 
-### 💻 **开发指南**
-- [API 文档](https://pkg.go.dev/github.com/kamalyes/go-cachex) - 在线API文档
-- [示例代码](examples/) - 各种使用场景的示例
-- [测试状态报告](./TEST-STATUS-REPORT.md) - 测试覆盖率和已知问题
-- [贡献指南](.github/CODE_OF_CONDUCT.md) - 贡献代码的规范
+### 🔧 **高级组件**
+- **[QUEUE_ADVANCED.md](./docs/QUEUE_ADVANCED.md)** - 队列系统高级用法
+- **[PUBSUB_ADVANCED.md](./docs/PUBSUB_ADVANCED.md)** - 发布订阅高级特性
+- **[HOTKEY_ADVANCED.md](./docs/HOTKEY_ADVANCED.md)** - 热Key缓存指南
+- **[WRAPPER_ADVANCED.md](./docs/WRAPPER_ADVANCED.md)** - CacheWrapper深入使用 🆕
+- **[WRAPPER_EXAMPLES.md](./docs/WRAPPER_EXAMPLES.md)** - 包装器示例集合
+- **[WRAPPER_GUIDE.md](./docs/WRAPPER_GUIDE.md)** - 包装器使用指南
 
-## 🏃‍♂️ 示例代码
+### 💻 **开发资源**
+- **[API文档](https://pkg.go.dev/github.com/kamalyes/go-cachex)** - 在线API参考
+- **[examples/](examples/)** - 代码示例集合
+- **[TEST-STATUS-REPORT.md](./TEST-STATUS-REPORT.md)** - 测试覆盖率报告
 
-各组件的详细示例请查看 [examples/](examples/) 目录：
+## 🏃‍♂️ 代码示例
 
-- [`examples/lru/`](examples/lru/) - LRU缓存示例
-- [`examples/lru_optimized/`](examples/lru_optimized/) - 优化LRU示例  
-- [`examples/ristretto/`](examples/ristretto/) - Ristretto缓存示例
-- [`examples/twolevel/`](examples/twolevel/) - 两级缓存示例
-- [`examples/ctxcache/`](examples/ctxcache/) - Context缓存示例
-- [`examples/expiring/`](examples/expiring/) - 过期缓存示例
+查看 [examples/](examples/) 目录获取各组件的完整示例：
+
+```
+examples/
+├── lru/              # LRU缓存示例
+├── lru_optimized/    # 高性能LRU示例
+├── ristretto/        # Ristretto缓存示例
+├── redis/            # Redis缓存示例
+├── twolevel/         # 两级缓存示例
+├── ctxcache/         # Context缓存示例
+└── expiring/         # 过期缓存示例
+```
 
 ## 📈 性能报告
 

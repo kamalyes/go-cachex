@@ -168,7 +168,9 @@ func (m *MultiLevelCache[T]) Delete(ctx context.Context, key string) error {
 // InvalidateL1 使L1缓存失效
 func (m *MultiLevelCache[T]) InvalidateL1(key string) {
 	m.l1Cache.Del([]byte(key))
-} // GetStats 获取统计信息
+}
+
+// GetStats 获取统计信息
 func (m *MultiLevelCache[T]) GetStats() map[string]int64 {
 	m.stats.RLock()
 	defer m.stats.RUnlock()

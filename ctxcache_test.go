@@ -224,11 +224,11 @@ func TestCtxCache_GetOrComputeAdvanced(t *testing.T) {
 
 		// 测试手动取消
 		ctx2, cancel2 := context.WithCancel(context.Background())
-		
+
 		var wg sync.WaitGroup
 		wg.Add(1)
 		var resultErr error
-		
+
 		go func() {
 			defer wg.Done()
 			_, resultErr = c.GetOrCompute(ctx2, []byte("manual_cancel"), 0, loader)
@@ -610,8 +610,8 @@ func BenchmarkCtxCache_Different_TTL(b *testing.B) {
 	ttls := []time.Duration{
 		0,                      // No TTL
 		100 * time.Millisecond, // Short TTL
-		time.Second,           // Medium TTL
-		-1,                    // Never expire
+		time.Second,            // Medium TTL
+		-1,                     // Never expire
 	}
 
 	b.ResetTimer()

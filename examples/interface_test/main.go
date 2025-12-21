@@ -17,21 +17,21 @@ func main() {
 		handler cachex.Handler
 		err     error
 	}{}
-	
+
 	// LRU Handler
 	handlers = append(handlers, struct {
 		name    string
 		handler cachex.Handler
 		err     error
 	}{"LRU", cachex.NewLRUHandler(100), nil})
-	
+
 	// LRU Optimized Handler
 	handlers = append(handlers, struct {
 		name    string
 		handler cachex.Handler
 		err     error
 	}{"LRU_Optimized", cachex.NewLRUOptimizedHandler(100), nil})
-	
+
 	// Ristretto Handler
 	ristrettoHandler, ristrettoErr := cachex.NewRistrettoHandler(&cachex.RistrettoConfig{
 		NumCounters: 1000,
@@ -43,7 +43,7 @@ func main() {
 		handler cachex.Handler
 		err     error
 	}{"Ristretto", ristrettoHandler, ristrettoErr})
-	
+
 	// TwoLevel Handler
 	handlers = append(handlers, struct {
 		name    string
@@ -54,7 +54,7 @@ func main() {
 		cachex.NewLRUHandler(100),
 		false, // writeThrough
 	), nil})
-	
+
 	// Sharded Handler
 	handlers = append(handlers, struct {
 		name    string
@@ -63,7 +63,7 @@ func main() {
 	}{"Sharded", cachex.NewShardedHandler(func() cachex.Handler {
 		return cachex.NewLRUHandler(25)
 	}, 4), nil})
-	
+
 	// Expiring Handler
 	handlers = append(handlers, struct {
 		name    string
@@ -87,11 +87,11 @@ func main() {
 		// 测试基本操作
 		testData := map[string]string{
 			"key1": "value1",
-			"key2": "value2", 
+			"key2": "value2",
 			"key3": "value3",
 		}
 
-		// 设置测试数据
+		// 设置测试数据 - 使用简化版API
 		for k, v := range testData {
 			err := h.handler.Set([]byte(k), []byte(v))
 			if err != nil {
@@ -100,10 +100,17 @@ func main() {
 			}
 		}
 
+		// 测试WithCtx版本
+		ctx := context.Background()
+		err := h.handler.SetWithCtx(ctx, []byte("ctx_key"), []byte("ctx_value"))
+		if err == nil {
+			fmt.Printf("WithCtx API: ✅\n")
+		}
+
 		// 测试BatchGet
 		keys := [][]byte{[]byte("key1"), []byte("key2"), []byte("key3"), []byte("nonexistent")}
 		results, errors := h.handler.BatchGet(keys)
-		
+
 		fmt.Printf("BatchGet 结果:\n")
 		for i, key := range keys {
 			if errors[i] == nil {
@@ -125,7 +132,7 @@ func main() {
 	}
 
 	fmt.Println("\n=== ContextHandler 接口测试 ===")
-	
+
 	// 测试Client (实现ContextHandler)
 	ctx := context.Background()
 	client, err := cachex.NewClient(ctx, &cachex.ClientConfig{
@@ -141,12 +148,12 @@ func main() {
 	// 设置测试数据
 	testData := map[string]string{
 		"client_key1": "client_value1",
-		"client_key2": "client_value2", 
+		"client_key2": "client_value2",
 		"client_key3": "client_value3",
 	}
 
 	for k, v := range testData {
-		err := client.Set(ctx, []byte(k), []byte(v))
+		err := client.Set([]byte(k), []byte(v))
 		if err != nil {
 			fmt.Printf("❌ Client Set failed: %v\n", err)
 		}
@@ -154,8 +161,8 @@ func main() {
 
 	// 测试Client BatchGet
 	keys := [][]byte{[]byte("client_key1"), []byte("client_key2"), []byte("client_key3")}
-	results, errors := client.BatchGet(ctx, keys)
-	
+	results, errors := client.BatchGet(keys)
+
 	fmt.Printf("Client BatchGet 结果:\n")
 	for i, key := range keys {
 		if errors[i] == nil {
@@ -166,7 +173,7 @@ func main() {
 	}
 
 	// 测试Client Stats
-	stats := client.Stats(ctx)
+	stats := client.Stats()
 	fmt.Printf("Client Stats 结果:\n")
 	for k, v := range stats {
 		fmt.Printf("  %s: %v\n", k, v)

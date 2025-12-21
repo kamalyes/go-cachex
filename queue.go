@@ -2,8 +2,8 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-11-19 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-19 20:48:27
- * @FilePath: \go-cachex\queue.go
+ * @LastEditTime: 2025-12-21 15:35:16
+ * @FilePath: \engine-im-service\go-cachex\queue.go
  * @Description: Redis队列实现，支持FIFO、优先级队列等多种队列类型
  *
  * Copyright (c) 2025 by kamalyes, All Rights Reserved.
@@ -14,8 +14,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/redis/go-redis/v9"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // QueueType 队列类型
@@ -113,9 +114,11 @@ func (q *QueueHandler) Enqueue(ctx context.Context, queueName string, queueType 
 
 	switch queueType {
 	case QueueTypeFIFO:
-		return q.client.LPush(ctx, queueKey, data).Err()
-	case QueueTypeLIFO:
+		// FIFO: RPush + LPop, 右边入队，左边出队，先进先出
 		return q.client.RPush(ctx, queueKey, data).Err()
+	case QueueTypeLIFO:
+		// LIFO: LPush + LPop, 左边入栈，左边出栈，后进先出
+		return q.client.LPush(ctx, queueKey, data).Err()
 	case QueueTypePriority:
 		return q.client.ZAdd(ctx, queueKey, redis.Z{
 			Score:  item.Priority,
@@ -152,10 +155,11 @@ func (q *QueueHandler) dequeueWithTimeout(ctx context.Context, queueName string,
 
 	switch queueType {
 	case QueueTypeFIFO:
+		// FIFO: RPush + LPop, 左边出队
 		if timeout > 0 {
-			result, err = q.client.BRPop(ctx, timeout, queueKey).Result()
+			result, err = q.client.BLPop(ctx, timeout, queueKey).Result()
 		} else {
-			data, popErr := q.client.RPop(ctx, queueKey).Result()
+			data, popErr := q.client.LPop(ctx, queueKey).Result()
 			if popErr != nil {
 				if popErr == redis.Nil {
 					return nil, nil
@@ -299,8 +303,10 @@ func (q *QueueHandler) Peek(ctx context.Context, queueName string, queueType Que
 
 	switch queueType {
 	case QueueTypeFIFO:
-		result, err = q.client.LRange(ctx, queueKey, int64(-count), -1).Result()
+		// FIFO: RPush + LPop, 直接从左边peek，无需反转
+		result, err = q.client.LRange(ctx, queueKey, 0, int64(count-1)).Result()
 	case QueueTypeLIFO:
+		// LIFO: LPush + LPop, 从左边peek
 		result, err = q.client.LRange(ctx, queueKey, 0, int64(count-1)).Result()
 	case QueueTypePriority:
 		zResult, zErr := q.client.ZRevRangeWithScores(ctx, queueKey, 0, int64(count-1)).Result()

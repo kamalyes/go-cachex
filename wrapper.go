@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/kamalyes/go-toolbox/pkg/mathx"
+	"github.com/kamalyes/go-toolbox/pkg/validator"
 	"github.com/kamalyes/go-toolbox/pkg/zipx"
 	"github.com/redis/go-redis/v9"
 )
@@ -50,15 +51,25 @@ import (
 //	error: 加载过程中可能出现的错误
 type CacheFunc[T any] func(ctx context.Context) (T, error)
 
+// CacheDistributedLock 分布式锁配置
+type CacheDistributedLock struct {
+	Timeout        time.Duration // 获取锁的超时时间（默认 500ms）
+	Expiration     time.Duration // 锁的过期时间（默认 5s）
+	EnableWatchdog bool          // 是否启用看门狗自动续期（默认 true）
+}
+
 // CacheOptions 缓存选项配置
 type CacheOptions struct {
-	ForceRefresh  bool           // 是否强制刷新缓存（清除缓存重新获取）
-	TTLOverride   *time.Duration // 覆盖默认 TTL（为 nil 时使用默认值）
-	SkipCompress  bool           // 跳过压缩（用于小数据或已压缩的数据）
-	UseAsync      bool           // 使用异步更新缓存（适用于非关键数据）
-	RetryOnError  bool           // Redis 错误时重试（默认不重试）
-	RetryTimes    int            // 重试次数（默认 0）
-	JitterPercent *float64       // TTL 随机抖动百分比（0-1，nil 时使用默认 0.005 即 ±0.5%）
+	ForceRefresh         bool                  // 是否强制刷新缓存（清除缓存重新获取）
+	TTLOverride          *time.Duration        // 覆盖默认 TTL（为 nil 时使用默认值）
+	SkipCompress         bool                  // 跳过压缩（用于小数据或已压缩的数据）
+	UseAsync             bool                  // 使用异步更新缓存（适用于非关键数据）
+	RetryOnError         bool                  // Redis 错误时重试（默认不重试）
+	RetryTimes           int                   // 重试次数（默认 0）
+	JitterPercent        *float64              // TTL 随机抖动百分比（0-1，nil 时使用默认 0.005 即 ±0.5%）
+	CachePenetration     bool                  // 是否启用缓存穿透保护（false=不保护，true=缓存默认值）
+	DefaultValue         interface{}           // 缓存穿透时的默认值（需要与泛型类型T匹配）
+	CacheDistributedLock *CacheDistributedLock // 分布式锁配置（nil 表示不启用）
 }
 
 // CacheOption 缓存选项函数类型
@@ -160,6 +171,88 @@ func WithJitter(percent float64) CacheOption {
 	return func(opts *CacheOptions) {
 		percent := mathx.Between(percent, 0.0, 1.0)
 		opts.JitterPercent = &percent
+	}
+}
+
+// WithCachePenetration 启用缓存穿透保护，当数据不存在时缓存默认值
+//
+// 参数:
+//
+//	defaultValue: 数据不存在时要缓存的默认值（必须与泛型类型T兼容）
+//	ttl: 默认值的缓存时长（可选，nil 时使用 5 分钟）
+//
+// 使用场景:
+//   - 防止缓存穿透攻击（大量查询不存在的数据）
+//   - 减少数据库压力（避免重复查询不存在的数据）
+//   - 提高系统稳定性
+//
+// 注意:
+//   - 默认值使用与正常数据相同的 TTL
+//   - 如需为默认值设置不同的 TTL，可组合使用 WithTTL
+//
+// 示例:
+//
+//	查询用户设置，不存在时缓存空对象
+//	WithCachePenetration(&models.AgentSettingsModel{})
+//
+//	查询用户信息，不存在时缓存默认值并保留 5 分钟
+//	WithCachePenetration(&User{ID: -1}), WithTTL(5*time.Minute)
+func WithCachePenetration[T any](defaultValue T) CacheOption {
+	return func(opts *CacheOptions) {
+		opts.CachePenetration = true
+		opts.DefaultValue = defaultValue
+	}
+}
+
+// WithDistributedLock 启用分布式锁防止缓存击穿
+//
+// 参数:
+//
+//	config: 分布式锁配置（可选，nil 时使用默认配置）
+//
+// 默认配置:
+//   - Timeout: 500ms（获取锁超时时间）
+//   - Expiration: 5s（锁过期时间）
+//   - EnableWatchdog: true（启用看门狗自动续期）
+//
+// 使用场景:
+//   - 高并发场景下防止缓存击穿（多个请求同时查询 DB）
+//   - 第一个请求获取锁后查询 DB，其他请求等待并从缓存读取
+//   - 看门狗机制自动续期，防止长时间查询导致锁过期
+//
+// 示例:
+//
+//	使用默认配置
+//	WithDistributedLock(nil)
+//
+//	自定义配置
+//	WithDistributedLock(&CacheDistributedLock{
+//	    Timeout:        1 * time.Second,
+//	    Expiration:     10 * time.Second,
+//	    EnableWatchdog: true,
+//	})
+//
+//	快速配置（禁用看门狗）
+//	WithDistributedLock(&CacheDistributedLock{EnableWatchdog: false})
+func WithDistributedLock(lock *CacheDistributedLock) CacheOption {
+	return func(opts *CacheOptions) {
+		if lock == nil {
+			// 使用默认配置
+			lock = &CacheDistributedLock{
+				Timeout:        500 * time.Millisecond,
+				Expiration:     5 * time.Second,
+				EnableWatchdog: true,
+			}
+		} else {
+			// 填充零值字段的默认值
+			if lock.Timeout == 0 {
+				lock.Timeout = 500 * time.Millisecond
+			}
+			if lock.Expiration == 0 {
+				lock.Expiration = 5 * time.Second
+			}
+		}
+		opts.CacheDistributedLock = lock
 	}
 }
 
@@ -338,7 +431,8 @@ func Combine(opts ...CacheOption) CacheOption {
 //   - 大对象缓存会消耗更多内存，即使有压缩
 //   - 可通过 WithForceRefresh(true) 强制刷新缓存
 func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T], expiration time.Duration, opts ...CacheOption) CacheFunc[T] {
-	return func(ctx context.Context) (T, error) {
+	var wrappedFunc CacheFunc[T]
+	wrappedFunc = func(ctx context.Context) (T, error) {
 		var result T
 		var err error
 		var cachedData string
@@ -422,12 +516,102 @@ func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T
 		}
 
 	executeFunc:
-		// 第三步：执行原始数据加载函数
+		// 第三步：执行原始数据加载函数（分布式锁保护）
 		// 当缓存未命中、解压缩失败或反序列化失败时执行此逻辑
+
+		// 🔒 分布式锁保护：防止缓存击穿（多个并发请求同时查询 DB）
+		if options.CacheDistributedLock != nil {
+			lockKey := key + ":lock"
+			lockConfig := LockConfig{
+				TTL:              options.CacheDistributedLock.Expiration,
+				RetryInterval:    50 * time.Millisecond,
+				MaxRetries:       int(options.CacheDistributedLock.Timeout.Milliseconds() / 50),
+				EnableWatchdog:   options.CacheDistributedLock.EnableWatchdog,
+				WatchdogInterval: options.CacheDistributedLock.Expiration / 3,
+			}
+
+			lock := NewDistributedLock(client, lockKey, lockConfig)
+
+			// 尝试从缓存读取的辅助函数（避免重复代码）
+			tryGetFromCache := func() (T, bool) {
+				cachedData, err := client.Get(ctx, key).Result()
+				if err == nil && cachedData != "" {
+					var decompressedData []byte
+					if options.SkipCompress {
+						decompressedData = []byte(cachedData)
+					} else {
+						if decompressed, decompressErr := zipx.ZlibDecompress([]byte(cachedData)); decompressErr == nil {
+							decompressedData = decompressed
+						}
+					}
+					if len(decompressedData) > 0 {
+						var cacheResult T
+						if unmarshalErr := json.Unmarshal(decompressedData, &cacheResult); unmarshalErr == nil {
+							return cacheResult, true
+						}
+					}
+				}
+				var zero T
+				return zero, false
+			}
+
+			// 尝试获取锁（带超时控制）
+			lockCtx, cancel := context.WithTimeout(ctx, options.CacheDistributedLock.Timeout)
+			defer cancel()
+
+			lockErr := lock.Lock(lockCtx)
+			if lockErr != nil {
+				// 获取锁失败（其他 goroutine 正在查询 DB）
+				// 等待策略：多次重试从缓存读取，等待其他 goroutine 完成 DB 查询
+				maxRetries := 5
+				retryInterval := 50 * time.Millisecond
+
+				for i := 0; i < maxRetries; i++ {
+					time.Sleep(retryInterval)
+					if cacheResult, ok := tryGetFromCache(); ok {
+						return cacheResult, nil
+					}
+				}
+
+				// 缓存仍未命中，降级：直接查询 DB（避免长时间阻塞）
+			} else {
+				// 获取锁成功，确保最终释放锁
+				defer lock.Unlock(ctx)
+
+				// 双重检查：获取锁后再次检查缓存（可能其他 goroutine 已更新缓存）
+				if cacheResult, ok := tryGetFromCache(); ok {
+					return cacheResult, nil
+				}
+			}
+		}
+
 		result, err = cacheFunc(ctx)
 		if err != nil {
 			// 数据加载失败，直接返回错误，不进行缓存操作
 			return result, err
+		}
+
+		// 🔥 缓存穿透保护：当启用且查询结果为空时，递归调用缓存默认值
+		if options.CachePenetration && validator.IsNil(result) && options.DefaultValue != nil {
+			if defaultVal, ok := options.DefaultValue.(T); ok {
+				// 创建返回默认值的 loader 函数
+				defaultLoader := func(ctx context.Context) (T, error) {
+					return defaultVal, nil
+				}
+
+				// 构建递归调用的选项（移除分布式锁配置，避免重复加锁）
+				recursiveOpts := make([]CacheOption, 0, len(opts))
+				for _, opt := range opts {
+					recursiveOpts = append(recursiveOpts, opt)
+				}
+				// 禁用分布式锁（外层已有锁保护）
+				recursiveOpts = append(recursiveOpts, func(o *CacheOptions) {
+					o.CacheDistributedLock = nil
+				})
+
+				// 递归调用，让缓存逻辑处理默认值的序列化、压缩和存储
+				return CacheWrapper(client, key, defaultLoader, expiration, recursiveOpts...)(ctx)
+			}
 		}
 
 		// 第四步：准备缓存数据
@@ -470,6 +654,8 @@ func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T
 		// 返回加载的数据
 		return result, nil
 	}
+
+	return wrappedFunc
 }
 
 // updateCache 更新缓存的内部辅助函数

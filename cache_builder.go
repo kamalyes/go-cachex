@@ -185,10 +185,10 @@ type SmartCache struct {
 
 // singleCall 单次调用封装
 type singleCall struct {
-	wg     sync.WaitGroup
-	val    interface{}
-	err    error
-	done   uint32 // 使用原子操作标记完成状态
+	wg   sync.WaitGroup
+	val  interface{}
+	err  error
+	done uint32 // 使用原子操作标记完成状态
 }
 
 // doCall 执行单次调用(singleflight模式) - 优化版无竞争

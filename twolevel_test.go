@@ -142,34 +142,34 @@ func TestTwoLevel_BasicOperations(t *testing.T) {
 }
 
 func TestTwoLevel_GetFallbackAndPromote(t *testing.T) {
-    l1 := NewLRUHandler(1)              // very small L1
-    l2 := NewExpiringHandler(0)         // L2 holds more
-    defer l1.Close()
-    defer l2.Close()
+	l1 := NewLRUHandler(1)      // very small L1
+	l2 := NewExpiringHandler(0) // L2 holds more
+	defer l1.Close()
+	defer l2.Close()
 
-    // put value only in L2
-    if err := l2.Set([]byte("k"), []byte("v")); err != nil {
-        t.Fatalf("l2 set err: %v", err)
-    }
+	// put value only in L2
+	if err := l2.Set([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("l2 set err: %v", err)
+	}
 
-    two := NewTwoLevelHandler(l1, l2, true)
-    defer two.Close()
+	two := NewTwoLevelHandler(l1, l2, true)
+	defer two.Close()
 
-    // Get should return from L2 and promote to L1
-    v, err := two.Get([]byte("k"))
-    if err != nil || string(v) != "v" {
-        t.Fatalf("unexpected get: %v %v", v, err)
-    }
+	// Get should return from L2 and promote to L1
+	v, err := two.Get([]byte("k"))
+	if err != nil || string(v) != "v" {
+		t.Fatalf("unexpected get: %v %v", v, err)
+	}
 
-    // Now L1 should have it
-    if v2, err := l1.Get([]byte("k")); err != nil || string(v2) != "v" {
-        t.Fatalf("L1 should be promoted, got: %v %v", v2, err)
-    }
+	// Now L1 should have it
+	if v2, err := l1.Get([]byte("k")); err != nil || string(v2) != "v" {
+		t.Fatalf("L1 should be promoted, got: %v %v", v2, err)
+	}
 }
 
 func TestTwoLevel_DetailedOperations(t *testing.T) {
 	t.Run("L1 Miss L2 Hit Promotion", func(t *testing.T) {
-		l1 := NewLRUHandler(2) // Small L1 capacity
+		l1 := NewLRUHandler(2)  // Small L1 capacity
 		l2 := NewLRUHandler(10) // Larger L2 capacity
 		defer l1.Close()
 		defer l2.Close()
@@ -198,7 +198,7 @@ func TestTwoLevel_DetailedOperations(t *testing.T) {
 
 	t.Run("L1 Eviction and L2 Fallback", func(t *testing.T) {
 		l1 := NewLRUHandler(2) // Very small L1
-		l2 := NewLRUHandler(10) 
+		l2 := NewLRUHandler(10)
 		defer l1.Close()
 		defer l2.Close()
 
@@ -281,7 +281,7 @@ func TestTwoLevel_DetailedOperations(t *testing.T) {
 		// L1 should now have it with remaining TTL
 		ttl1, err := l1.GetTTL([]byte("promote_ttl"))
 		assert.NoError(t, err)
-		assert.True(t, ttl1 > 0 && ttl1 < 200*time.Millisecond, 
+		assert.True(t, ttl1 > 0 && ttl1 < 200*time.Millisecond,
 			"Promoted TTL should be less than original")
 	})
 
@@ -321,32 +321,32 @@ func TestTwoLevel_DetailedOperations(t *testing.T) {
 
 	t.Run("Different Backend Combinations", func(t *testing.T) {
 		combinations := []struct {
-			name string
+			name      string
 			l1Factory func() Handler
 			l2Factory func() Handler
 		}{
 			{
-				name: "LRU + LRU",
+				name:      "LRU + LRU",
 				l1Factory: func() Handler { return NewLRUHandler(5) },
 				l2Factory: func() Handler { return NewLRUHandler(20) },
 			},
 			{
-				name: "LRU + Expiring",
+				name:      "LRU + Expiring",
 				l1Factory: func() Handler { return NewLRUHandler(5) },
 				l2Factory: func() Handler { return NewExpiringHandler(10 * time.Millisecond) },
 			},
 			{
-				name: "Expiring + LRU",
+				name:      "Expiring + LRU",
 				l1Factory: func() Handler { return NewExpiringHandler(10 * time.Millisecond) },
 				l2Factory: func() Handler { return NewLRUHandler(20) },
 			},
 			{
-				name: "LRU + Ristretto",
+				name:      "LRU + Ristretto",
 				l1Factory: func() Handler { return NewLRUHandler(5) },
-				l2Factory: func() Handler { 
+				l2Factory: func() Handler {
 					rist, _ := NewRistrettoHandler(&RistrettoConfig{
 						NumCounters: 100,
-						MaxCost: 10<<20,
+						MaxCost:     10 << 20,
 						BufferItems: 6,
 					})
 					return rist
@@ -394,7 +394,7 @@ func TestTwoLevel_ConcurrencyAndPerformance(t *testing.T) {
 
 		const workers = 20
 		const operations = 100
-		
+
 		var wg sync.WaitGroup
 		errCh := make(chan error, workers*operations)
 
@@ -406,7 +406,7 @@ func TestTwoLevel_ConcurrencyAndPerformance(t *testing.T) {
 				for op := 0; op < operations; op++ {
 					key := []byte(fmt.Sprintf("worker_%d_op_%d", workerID, op))
 					value := []byte(fmt.Sprintf("value_%d_%d", workerID, op))
-					
+
 					if err := two.Set(key, value); err != nil {
 						errCh <- err
 						return
@@ -437,7 +437,7 @@ func TestTwoLevel_ConcurrencyAndPerformance(t *testing.T) {
 				for op := 0; op < operations; op++ {
 					key := []byte(fmt.Sprintf("worker_%d_op_%d", workerID, op))
 					expectedValue := []byte(fmt.Sprintf("value_%d_%d", workerID, op))
-					
+
 					val, err := two.Get(key)
 					if err != nil {
 						mu.Lock()
@@ -563,7 +563,7 @@ func TestTwoLevel_ConcurrencyAndPerformance(t *testing.T) {
 		for i := 0; i < numItems; i++ {
 			key := []byte(fmt.Sprintf("item_%d", i))
 			expectedValue := []byte(fmt.Sprintf("value_%d", i))
-			
+
 			val, err := two.Get(key)
 			assert.NoError(t, err)
 			assert.Equal(t, expectedValue, val, "Item %d should be accessible", i)
@@ -575,7 +575,7 @@ func TestTwoLevel_ConcurrencyAndPerformance(t *testing.T) {
 			key := []byte(keyStr)
 			// Access again to ensure promotion
 			two.Get(key)
-			
+
 			// Should now be in L1
 			_, err := l1.Get(key)
 			assert.NoError(t, err, "%s should be in L1 after promotion", keyStr)
@@ -800,10 +800,10 @@ func BenchmarkTwoLevel_DifferentBackends(b *testing.B) {
 		{
 			name:      "LRU_Ristretto",
 			l1Factory: func() Handler { return NewLRUHandler(1000) },
-			l2Factory: func() Handler { 
+			l2Factory: func() Handler {
 				rist, _ := NewRistrettoHandler(&RistrettoConfig{
 					NumCounters: 10000,
-					MaxCost: 100<<20,
+					MaxCost:     100 << 20,
 					BufferItems: 6,
 				})
 				return rist

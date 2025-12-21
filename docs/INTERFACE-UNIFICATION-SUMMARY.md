@@ -2,58 +2,74 @@
 
 ## 🎯 重大更新内容
 
-### 1. Handler接口标准化
+### 1. 双API设计 - Handler接口标准化 🆕
 
-所有缓存实现现在都支持统一的核心接口：
+所有缓存实现现在都支持**双API设计**，提供简化版和完整版两种调用方式：
 
 ```go
 type Handler interface {
-    Set([]byte, []byte) error
-    SetWithTTL([]byte, []byte, time.Duration) error
-    Get([]byte) ([]byte, error)
-    GetTTL([]byte) (time.Duration, error)
-    Del([]byte) error
-    BatchGet([][]byte) ([][]byte, []error)    // 🆕 批量操作
-    Stats() map[string]interface{}            // 🆕 统计信息
+    // ========== 简化版方法（不带context） ==========
+    Set(key, value []byte) error
+    SetWithTTL(key, value []byte, ttl time.Duration) error
+    Get(key []byte) ([]byte, error)
+    GetTTL(key []byte) (time.Duration, error)
+    Del(key []byte) error
+    BatchGet(keys [][]byte) ([][]byte, []error)
+    GetOrCompute(key []byte, ttl time.Duration, loader func() ([]byte, error)) ([]byte, error)
+    
+    // ========== 完整版方法（带context） ==========
+    SetWithCtx(ctx context.Context, key, value []byte) error
+    SetWithTTLAndCtx(ctx context.Context, key, value []byte, ttl time.Duration) error
+    GetWithCtx(ctx context.Context, key []byte) ([]byte, error)
+    GetTTLWithCtx(ctx context.Context, key []byte) (time.Duration, error)
+    DelWithCtx(ctx context.Context, key []byte) error
+    BatchGetWithCtx(ctx context.Context, keys [][]byte) ([][]byte, []error)
+    GetOrComputeWithCtx(ctx context.Context, key []byte, ttl time.Duration, loader func(context.Context) ([]byte, error)) ([]byte, error)
+    
+    // ========== 通用方法 ==========
+    Stats() map[string]interface{}
     Close() error
 }
 ```
 
-### 2. ContextHandler接口增强
+### 2. 设计理念
 
-Client层的ContextHandler接口同步更新：
-
-```go
-type ContextHandler interface {
-    // ... 原有方法
-    BatchGet(ctx context.Context, keys [][]byte) ([][]byte, []error)  // 🆕
-    Stats(ctx context.Context) map[string]interface{}                 // 🆕
-    // ...
-}
-```
+- **简化版方法**：适合简单场景，快速调用，内部自动使用`context.Background()`
+- **WithCtx方法**：适合需要超时控制、取消操作、链路追踪的场景
+- **向后兼容**：简化版方法内部委托给WithCtx方法，保持代码统一
+- **灵活选择**：开发者可根据场景自由选择使用哪种API
 
 ## 🔧 实现覆盖
 
-| Handler类型 | BatchGet | Stats | 特色功能 |
-|------------|----------|-------|----------|
-| LRU | ✅ | ✅ | 过期项统计、容量监控 |
-| LRU Optimized | ✅ | ✅ | 分片统计、命中率、性能指标 |
-| Ristretto | ✅ | ✅ | 完整Ristretto指标、成本统计 |
-| TwoLevel | ✅ | ✅ | L1/L2分层统计、智能提升监控 |
-| Sharded | ✅ | ✅ | 每分片详细统计、负载均衡 |
-| Expiring | ✅ | ✅ | 过期项监控、后台清理状态 |
-| Redis | ✅ | ✅ | Redis服务器信息、连接状态 |
+所有Handler实现都已完成双API改造：
 
-## 📊 新功能示例
+| Handler类型 | 简化API | WithCtx API | BatchGet | Stats | 特色功能 |
+|------------|---------|-------------|----------|-------|----------|
+| LRU | ✅ | ✅ | ✅ | ✅ | 过期项统计、容量监控 |
+| LRU Optimized | ✅ | ✅ | ✅ | ✅ | 16分片统计、命中率、性能指标 |
+| Ristretto | ✅ | ✅ | ✅ | ✅ | 完整Ristretto指标、成本统计 |
+| TwoLevel | ✅ | ✅ | ✅ | ✅ | L1/L2分层统计、智能提升监控 |
+| Sharded | ✅ | ✅ | ✅ | ✅ | 每分片详细统计、负载均衡 |
+| Expiring | ✅ | ✅ | ✅ | ✅ | 过期项监控、后台清理状态 |
+| Redis | ✅ | ✅ | ✅ | ✅ | Redis服务器信息、连接状态 |
 
-### 批量操作
+## 📊 使用示例
+
+### 简化版API - 快速简单
 
 ```go
-// 高效批量获取
-keys := [][]byte{[]byte("key1"), []byte("key2"), []byte("key3")}
-results, errors := handler.BatchGet(keys)
+// 基本操作
+cache := cachex.NewLRUHandler(1000)
+defer cache.Close()
 
-// 错误处理
+cache.Set([]byte("key"), []byte("value"))
+val, _ := cache.Get([]byte("key"))
+cache.Del([]byte("key"))
+
+// 批量操作
+keys := [][]byte{[]byte("key1"), []byte("key2"), []byte("key3")}
+results, errors := cache.BatchGet(keys)
+
 for i, key := range keys {
     if errors[i] == nil {
         fmt.Printf("%s: %s\n", string(key), string(results[i]))
@@ -63,11 +79,28 @@ for i, key := range keys {
 }
 ```
 
+### WithCtx API - 超时控制
+
+```go
+// 带超时的操作
+ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+defer cancel()
+
+cache.SetWithCtx(ctx, []byte("key"), []byte("value"))
+val, err := cache.GetWithCtx(ctx, []byte("key"))
+if err == context.DeadlineExceeded {
+    // 处理超时
+}
+
+// 带取消的批量操作
+results, errors := cache.BatchGetWithCtx(ctx, keys)
+```
+
 ### 统计监控
 
 ```go
 // 获取详细统计
-stats := handler.Stats()
+stats := cache.Stats()
 
 // 通用信息
 fmt.Printf("条目数: %v\n", stats["entries"])

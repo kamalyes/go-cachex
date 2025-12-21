@@ -32,11 +32,11 @@ const (
 
 // AdvancedCacheConfig 高级缓存配置
 type AdvancedCacheConfig struct {
-	Compression      CompressionType // 压缩类型
-	MinSizeForCompress int            // 启用压缩的最小大小（字节）
-	DefaultTTL       time.Duration   // 默认TTL
-	Namespace        string          // 命名空间
-	EnableMetrics    bool            // 是否启用指标统计
+	Compression        CompressionType // 压缩类型
+	MinSizeForCompress int             // 启用压缩的最小大小（字节）
+	DefaultTTL         time.Duration   // 默认TTL
+	Namespace          string          // 命名空间
+	EnableMetrics      bool            // 是否启用指标统计
 }
 
 // CacheMetrics 缓存指标
@@ -52,12 +52,12 @@ type CacheMetrics struct {
 
 // AdvancedCache 高级缓存包装器
 type AdvancedCache[T any] struct {
-	client    *redis.Client
-	config    AdvancedCacheConfig
-	metrics   *CacheMetrics
-	queue     *QueueHandler
-	hotkey    *HotKeyManager
-	lockMgr   *LockManager
+	client  *redis.Client
+	config  AdvancedCacheConfig
+	metrics *CacheMetrics
+	queue   *QueueHandler
+	hotkey  *HotKeyManager
+	lockMgr *LockManager
 }
 
 // NewAdvancedCache 创建高级缓存
@@ -124,12 +124,12 @@ func (c *AdvancedCache[T]) compress(data []byte) ([]byte, error) {
 
 	var buf strings.Builder
 	writer := gzip.NewWriter(&buf)
-	
+
 	if _, err := writer.Write(data); err != nil {
 		writer.Close()
 		return nil, err
 	}
-	
+
 	if err := writer.Close(); err != nil {
 		return nil, err
 	}
@@ -203,7 +203,7 @@ func (c *AdvancedCache[T]) Set(ctx context.Context, key string, value T, ttl ...
 // Get 获取缓存
 func (c *AdvancedCache[T]) Get(ctx context.Context, key string) (T, bool, error) {
 	var zero T
-	
+
 	fullKey := c.getKey(key)
 	data, err := c.client.Get(ctx, fullKey).Bytes()
 	if err != nil {
@@ -244,7 +244,7 @@ func (c *AdvancedCache[T]) GetOrSet(ctx context.Context, key string, fn func() (
 	// 使用分布式锁防止缓存击穿
 	lockKey := fmt.Sprintf("getorset:%s", key)
 	lock := c.lockMgr.GetLock(lockKey)
-	
+
 	if err := lock.Lock(ctx); err != nil {
 		// 如果获取锁失败，直接执行函数
 		return fn()
@@ -391,13 +391,13 @@ func (c *AdvancedCache[T]) Ping(ctx context.Context) error {
 func (c *AdvancedCache[T]) Close() error {
 	// 停止热key自动刷新
 	c.hotkey.StopAll()
-	
+
 	// 释放所有锁
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
-	
+
 	c.lockMgr.ReleaseAllLocks(ctx)
-	
+
 	return c.client.Close()
 }
 
@@ -425,7 +425,7 @@ func (c *AdvancedCache[T]) BatchGet(ctx context.Context, keys []string) (map[str
 	// 使用Pipeline批量获取
 	pipe := c.client.Pipeline()
 	cmds := make([]*redis.StringCmd, len(fullKeys))
-	
+
 	for i, fullKey := range fullKeys {
 		cmds[i] = pipe.Get(ctx, fullKey)
 	}
@@ -436,7 +436,7 @@ func (c *AdvancedCache[T]) BatchGet(ctx context.Context, keys []string) (map[str
 	}
 
 	result := make(map[string]T)
-	
+
 	for i, cmd := range cmds {
 		data, err := cmd.Bytes()
 		if err != nil {
@@ -475,7 +475,7 @@ func (c *AdvancedCache[T]) BatchSet(ctx context.Context, items map[string]T, ttl
 	}
 
 	pipe := c.client.Pipeline()
-	
+
 	for key, value := range items {
 		data, err := json.Marshal(value)
 		if err != nil {

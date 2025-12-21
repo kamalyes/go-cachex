@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	ristretto "github.com/dgraph-io/ristretto/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -215,7 +216,7 @@ func TestRistrettoLargeData(t *testing.T) {
 		for i := 0; i < numItems; i += checkInterval {
 			key := []byte("key" + strconv.Itoa(i))
 			expectedValue := []byte("value" + strconv.Itoa(i))
-			
+
 			got, err := handler.Get(key)
 			if assert.NoError(err, "Get should succeed for item %d", i) {
 				assert.Equal(expectedValue, got, "Values should match for item %d", i)
@@ -241,10 +242,10 @@ func TestRistrettoLargeData(t *testing.T) {
 				base := routineID * numOpsPerGoroutine
 				for j := 0; j < numOpsPerGoroutine; j++ {
 					key := []byte(strconv.Itoa(base + j))
-					value := []byte("value" + strconv.Itoa(base + j))
-					
+					value := []byte("value" + strconv.Itoa(base+j))
+
 					assert.NoError(handler.Set(key, value), "Concurrent Set should succeed")
-					
+
 					if got, err := handler.Get(key); assert.NoError(err) {
 						assert.Equal(value, got, "Concurrent Get should return correct value")
 					}
@@ -268,15 +269,15 @@ func TestRistretto_DetailedOperations(t *testing.T) {
 			MaxCost:     1 << 20, // 1MB
 			BufferItems: 64,
 		}
-		
+
 		handler, err := NewRistrettoHandler(config)
 		require.NoError(t, err)
 		defer handler.Close()
-		
+
 		// Test with custom config
 		key := []byte("custom-test")
 		value := []byte("custom-value")
-		
+
 		assert.NoError(t, handler.Set(key, value))
 		got, err := handler.Get(key)
 		assert.NoError(t, err)
@@ -287,16 +288,16 @@ func TestRistretto_DetailedOperations(t *testing.T) {
 		handler, err := NewDefaultRistrettoHandler()
 		require.NoError(t, err)
 		defer handler.Close()
-		
+
 		// Test with large values (10KB each)
 		largeValue := make([]byte, 10*1024)
 		for i := range largeValue {
 			largeValue[i] = byte(i % 256)
 		}
-		
+
 		key := []byte("large-value-key")
 		assert.NoError(t, handler.Set(key, largeValue))
-		
+
 		got, err := handler.Get(key)
 		assert.NoError(t, err)
 		assert.Equal(t, largeValue, got)
@@ -306,14 +307,14 @@ func TestRistretto_DetailedOperations(t *testing.T) {
 		if testing.Short() {
 			t.Skip("Skipping stress test in short mode")
 		}
-		
+
 		handler, err := NewDefaultRistrettoHandler()
 		require.NoError(t, err)
 		defer handler.Close()
-		
+
 		const numOperations = 50000
 		var wg sync.WaitGroup
-		
+
 		// Perform mixed operations concurrently
 		for i := 0; i < 5; i++ {
 			wg.Add(1)
@@ -322,17 +323,17 @@ func TestRistretto_DetailedOperations(t *testing.T) {
 				for j := 0; j < numOperations/5; j++ {
 					key := []byte(fmt.Sprintf("stress-%d-%d", workerID, j))
 					value := []byte(fmt.Sprintf("value-%d-%d", workerID, j))
-					
+
 					// Set
 					handler.Set(key, value)
-					
+
 					// Get
 					handler.Get(key)
-					
+
 					// Update
 					newValue := []byte(fmt.Sprintf("updated-%d-%d", workerID, j))
 					handler.Set(key, newValue)
-					
+
 					// Delete occasionally
 					if j%10 == 0 {
 						handler.Del(key)
@@ -340,7 +341,7 @@ func TestRistretto_DetailedOperations(t *testing.T) {
 				}
 			}(i)
 		}
-		
+
 		wg.Wait()
 	})
 }
@@ -352,15 +353,15 @@ func BenchmarkRistretto_Set(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer handler.Close()
-	
+
 	keys := make([][]byte, b.N)
 	values := make([][]byte, b.N)
-	
+
 	for i := 0; i < b.N; i++ {
 		keys[i] = []byte(fmt.Sprintf("key-%d", i))
 		values[i] = []byte(fmt.Sprintf("value-%d", i))
 	}
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		handler.Set(keys[i], values[i])
@@ -373,19 +374,19 @@ func BenchmarkRistretto_Get(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer handler.Close()
-	
+
 	// Prepopulate
 	for i := 0; i < 1000; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i))
 		value := []byte(fmt.Sprintf("value-%d", i))
 		handler.Set(key, value)
 	}
-	
+
 	keys := make([][]byte, b.N)
 	for i := 0; i < b.N; i++ {
 		keys[i] = []byte(fmt.Sprintf("key-%d", i%1000))
 	}
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		handler.Get(keys[i])
@@ -398,15 +399,15 @@ func BenchmarkRistretto_SetWithTTL(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer handler.Close()
-	
+
 	keys := make([][]byte, b.N)
 	values := make([][]byte, b.N)
-	
+
 	for i := 0; i < b.N; i++ {
 		keys[i] = []byte(fmt.Sprintf("key-%d", i))
 		values[i] = []byte(fmt.Sprintf("value-%d", i))
 	}
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		handler.SetWithTTL(keys[i], values[i], time.Hour)
@@ -419,15 +420,15 @@ func BenchmarkRistretto_Mixed(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer handler.Close()
-	
+
 	keys := make([][]byte, 1000)
 	values := make([][]byte, 1000)
-	
+
 	for i := 0; i < 1000; i++ {
 		keys[i] = []byte(fmt.Sprintf("key-%d", i))
 		values[i] = []byte(fmt.Sprintf("value-%d", i))
 	}
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		idx := i % 1000
@@ -448,20 +449,20 @@ func BenchmarkRistretto_ConcurrentAccess(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer handler.Close()
-	
+
 	// Prepopulate
 	for i := 0; i < 100; i++ {
 		key := []byte(fmt.Sprintf("key-%d", i))
 		value := []byte(fmt.Sprintf("value-%d", i))
 		handler.Set(key, value)
 	}
-	
+
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			idx := rand.Intn(100)
 			key := []byte(fmt.Sprintf("key-%d", idx))
-			
+
 			switch rand.Intn(2) {
 			case 0: // Read
 				handler.Get(key)
@@ -479,18 +480,18 @@ func BenchmarkRistretto_LargeValues(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer handler.Close()
-	
+
 	// Create large values (1KB each)
 	largeValue := make([]byte, 1024)
 	for i := range largeValue {
 		largeValue[i] = byte(i % 256)
 	}
-	
+
 	keys := make([][]byte, b.N)
 	for i := 0; i < b.N; i++ {
 		keys[i] = []byte(fmt.Sprintf("key-%d", i))
 	}
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		handler.Set(keys[i], largeValue)
@@ -500,11 +501,11 @@ func BenchmarkRistretto_LargeValues(b *testing.B) {
 // 内存和性能对比测试
 func BenchmarkRistretto_ConfigComparison(b *testing.B) {
 	configs := []*RistrettoConfig{
-		{NumCounters: 1e3, MaxCost: 1 << 10, BufferItems: 64},  // Small
-		{NumCounters: 1e4, MaxCost: 1 << 20, BufferItems: 64},  // Medium
-		{NumCounters: 1e6, MaxCost: 1 << 30, BufferItems: 64},  // Large
+		{NumCounters: 1e3, MaxCost: 1 << 10, BufferItems: 64}, // Small
+		{NumCounters: 1e4, MaxCost: 1 << 20, BufferItems: 64}, // Medium
+		{NumCounters: 1e6, MaxCost: 1 << 30, BufferItems: 64}, // Large
 	}
-	
+
 	for i, config := range configs {
 		b.Run(fmt.Sprintf("Config-%d", i), func(b *testing.B) {
 			handler, err := NewRistrettoHandler(config)
@@ -512,7 +513,7 @@ func BenchmarkRistretto_ConfigComparison(b *testing.B) {
 				b.Fatal(err)
 			}
 			defer handler.Close()
-			
+
 			for i := 0; i < b.N; i++ {
 				key := []byte(fmt.Sprintf("key-%d", i))
 				value := []byte(fmt.Sprintf("value-%d", i))
@@ -520,4 +521,126 @@ func BenchmarkRistretto_ConfigComparison(b *testing.B) {
 			}
 		})
 	}
+}
+
+// 补充缺失的测试以提升覆盖率
+func TestRistrettoConfig_Setters(t *testing.T) {
+	config := NewDefaultRistrettoConfig()
+
+	t.Run("SetNumCounters", func(t *testing.T) {
+		config.SetNumCounters(2000)
+		assert.Equal(t, int64(2000), config.NumCounters)
+	})
+
+	t.Run("SetMaxCost", func(t *testing.T) {
+		config.SetMaxCost(1 << 25)
+		assert.Equal(t, int64(1<<25), config.MaxCost)
+	})
+
+	t.Run("SetBufferItems", func(t *testing.T) {
+		config.SetBufferItems(128)
+		assert.Equal(t, int64(128), config.BufferItems)
+	})
+
+	t.Run("EnableMetrics", func(t *testing.T) {
+		config.EnableMetrics()
+		assert.True(t, config.Metrics)
+	})
+
+	t.Run("SetOnEvict", func(t *testing.T) {
+		config.SetOnEvict(func(item *ristretto.Item[[]byte]) {
+			// Callback for eviction
+		})
+		assert.NotNil(t, config.OnEvict)
+	})
+
+	t.Run("SetOnReject", func(t *testing.T) {
+		config.SetOnReject(func(item *ristretto.Item[[]byte]) {
+			// Callback for rejection
+		})
+		assert.NotNil(t, config.OnReject)
+	})
+
+	t.Run("SetOnExit", func(t *testing.T) {
+		config.SetOnExit(func(val []byte) {
+			// Callback for exit
+		})
+		assert.NotNil(t, config.OnExit)
+	})
+
+	t.Run("SetShouldUpdate", func(t *testing.T) {
+		config.SetShouldUpdate(func(cur, prev []byte) bool {
+			return true
+		})
+		assert.NotNil(t, config.ShouldUpdate)
+	})
+
+	t.Run("SetKeyToHash", func(t *testing.T) {
+		config.SetKeyToHash(func(key []byte) (uint64, uint64) {
+			return 0, 0
+		})
+		assert.NotNil(t, config.KeyToHash)
+	})
+
+	t.Run("SetCost", func(t *testing.T) {
+		config.SetCost(func(value []byte) int64 {
+			return 1
+		})
+		assert.NotNil(t, config.Cost)
+	})
+
+	t.Run("SetIgnoreInternalCost", func(t *testing.T) {
+		config.SetIgnoreInternalCost(true)
+		assert.True(t, config.IgnoreInternalCost)
+	})
+
+	t.Run("SetTtlTickerDurationInSec", func(t *testing.T) {
+		config.SetTtlTickerDurationInSec(10)
+		assert.Equal(t, int64(10), config.TtlTickerDurationInSec)
+	})
+}
+
+func TestRistrettoHandler_MissingMethods(t *testing.T) {
+	handler, err := NewDefaultRistrettoHandler()
+	require.NoError(t, err)
+	defer handler.Close()
+
+	t.Run("BatchGet", func(t *testing.T) {
+		handler.Set([]byte("batch1"), []byte("value1"))
+		handler.Set([]byte("batch2"), []byte("value2"))
+
+		keys := [][]byte{[]byte("batch1"), []byte("batch2"), []byte("nonexistent")}
+		results, errs := handler.BatchGet(keys)
+		assert.Len(t, results, 3)
+		assert.Len(t, errs, 3)
+		// 前两个应该成功
+		assert.NoError(t, errs[0])
+		assert.NoError(t, errs[1])
+		// 第三个不存在应该有错误
+		assert.Error(t, errs[2])
+	})
+
+	t.Run("Stats", func(t *testing.T) {
+		stats := handler.Stats()
+		assert.NotNil(t, stats)
+	})
+
+	t.Run("GetOrCompute", func(t *testing.T) {
+		callCount := 0
+		compute := func() ([]byte, error) {
+			callCount++
+			return []byte("computed"), nil
+		}
+
+		val, err := handler.GetOrCompute([]byte("compute_key"), 1*time.Hour, compute)
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("computed"), val)
+		assert.Equal(t, 1, callCount)
+
+		// 第二次不应该调用compute
+		val2, err := handler.GetOrCompute([]byte("compute_key"), 1*time.Hour, compute)
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("computed"), val2)
+		assert.Equal(t, 1, callCount)
+	})
 }

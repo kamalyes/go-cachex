@@ -24,9 +24,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/redis/go-redis/v9"
 	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // NewRedisOptions 创建推荐的Redis配置
@@ -92,13 +93,71 @@ func (h *RedisHandler) WithCtx(ctx context.Context) *RedisHandler {
 	}
 }
 
-// Get 实现 Handler 接口的 Get 方法
+// ========== 简化版方法（不带context） ==========
+
+// Get 获取缓存值
 func (h *RedisHandler) Get(k []byte) ([]byte, error) {
+	ctx := h.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return h.GetWithCtx(ctx, k)
+}
+
+// Set 设置缓存值
+func (h *RedisHandler) Set(k, v []byte) error {
+	ctx := h.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return h.SetWithCtx(ctx, k, v)
+}
+
+// SetWithTTL 设置带TTL的缓存值
+func (h *RedisHandler) SetWithTTL(k, v []byte, ttl time.Duration) error {
+	ctx := h.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return h.SetWithTTLAndCtx(ctx, k, v, ttl)
+}
+
+// GetTTL 获取键的剩余TTL
+func (h *RedisHandler) GetTTL(k []byte) (time.Duration, error) {
+	ctx := h.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return h.GetTTLWithCtx(ctx, k)
+}
+
+// Del 删除缓存键
+func (h *RedisHandler) Del(k []byte) error {
+	ctx := h.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return h.DelWithCtx(ctx, k)
+}
+
+// BatchGet 批量获取
+func (h *RedisHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
+	ctx := h.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return h.BatchGetWithCtx(ctx, keys)
+}
+
+// ========== 完整版方法（带context） ==========
+
+// GetWithCtx 获取缓存值
+func (h *RedisHandler) GetWithCtx(ctx context.Context, k []byte) ([]byte, error) {
 	if err := ValidateBasicOp(k, h.redis != nil, false); err != nil {
 		return nil, err
 	}
 
-	sCmd := h.redis.Get(h.ctx, string(k))
+	sCmd := h.redis.Get(ctx, string(k))
 	if errors.Is(sCmd.Err(), redis.Nil) {
 		return nil, ErrNotFound
 	}
@@ -111,13 +170,13 @@ func (h *RedisHandler) Get(k []byte) ([]byte, error) {
 	return sCmd.Bytes()
 }
 
-// GetTTL 实现 Handler 接口的 GetTTL 方法
-func (h *RedisHandler) GetTTL(k []byte) (time.Duration, error) {
+// GetTTLWithCtx 获取键的剩余TTL
+func (h *RedisHandler) GetTTLWithCtx(ctx context.Context, k []byte) (time.Duration, error) {
 	if err := ValidateBasicOp(k, h.redis != nil, false); err != nil {
 		return 0, err
 	}
 
-	dCmd := h.redis.TTL(h.ctx, string(k))
+	dCmd := h.redis.TTL(ctx, string(k))
 	if errors.Is(dCmd.Err(), redis.Nil) {
 		return 0, ErrNotFound
 	}
@@ -130,18 +189,18 @@ func (h *RedisHandler) GetTTL(k []byte) (time.Duration, error) {
 	return dCmd.Val(), nil
 }
 
-// Set 实现 Handler 接口的 Set 方法
-func (h *RedisHandler) Set(k, v []byte) error {
-	return h.SetWithTTL(k, v, redis.KeepTTL)
+// SetWithCtx 设置缓存值
+func (h *RedisHandler) SetWithCtx(ctx context.Context, k, v []byte) error {
+	return h.SetWithTTLAndCtx(ctx, k, v, redis.KeepTTL)
 }
 
-// SetWithTTL 实现 Handler 接口的 SetWithTTL 方法
-func (h *RedisHandler) SetWithTTL(k, v []byte, ttl time.Duration) error {
+// SetWithTTLAndCtx 设置带TTL的缓存值
+func (h *RedisHandler) SetWithTTLAndCtx(ctx context.Context, k, v []byte, ttl time.Duration) error {
 	if err := ValidateWriteWithTTLOp(k, v, ttl, h.redis != nil, false); err != nil {
 		return err
 	}
 
-	sCmd := h.redis.Set(h.ctx, string(k), v, ttl)
+	sCmd := h.redis.Set(ctx, string(k), v, ttl)
 	if err := sCmd.Err(); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return ErrTimeout
@@ -151,13 +210,13 @@ func (h *RedisHandler) SetWithTTL(k, v []byte, ttl time.Duration) error {
 	return nil
 }
 
-// Del 实现 Handler 接口的 Del 方法
-func (h *RedisHandler) Del(k []byte) error {
+// DelWithCtx 删除缓存键
+func (h *RedisHandler) DelWithCtx(ctx context.Context, k []byte) error {
 	if err := ValidateBasicOp(k, h.redis != nil, false); err != nil {
 		return err
 	}
 
-	sCmd := h.redis.Del(h.ctx, string(k))
+	sCmd := h.redis.Del(ctx, string(k))
 	if err := sCmd.Err(); err != nil {
 		if err != redis.Nil {
 			if errors.Is(err, context.DeadlineExceeded) {
@@ -169,19 +228,14 @@ func (h *RedisHandler) Del(k []byte) error {
 	return nil
 }
 
-// BatchGet 批量获取多个键的值
-func (h *RedisHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
+// BatchGetWithCtx 批量获取多个键的值
+func (h *RedisHandler) BatchGetWithCtx(ctx context.Context, keys [][]byte) ([][]byte, []error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
 
 	results := make([][]byte, len(keys))
 	errors := make([]error, len(keys))
-
-	ctx := h.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
 
 	// 转换为字符串键
 	strKeys := make([]string, len(keys))
@@ -262,21 +316,29 @@ func (h *RedisHandler) Stats() map[string]interface{} {
 	return stats
 }
 
-// GetOrCompute 获取缓存值，如果不存在则计算并设置
+// GetOrCompute 获取缓存值，如果不存在则计算并设置（简化版，不带context）
 func (h *RedisHandler) GetOrCompute(key []byte, ttl time.Duration, loader func() ([]byte, error)) ([]byte, error) {
-	if len(key) == 0 {
-		return nil, ErrInvalidKey
-	}
-
 	ctx := h.ctx
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	// 包装loader以适配带ctx的版本
+	ctxLoader := func(context.Context) ([]byte, error) {
+		return loader()
+	}
+	return h.GetOrComputeWithCtx(ctx, key, ttl, ctxLoader)
+}
+
+// GetOrComputeWithCtx 获取缓存值，如果不存在则计算并设置
+func (h *RedisHandler) GetOrComputeWithCtx(ctx context.Context, key []byte, ttl time.Duration, loader func(context.Context) ([]byte, error)) ([]byte, error) {
+	if len(key) == 0 {
+		return nil, ErrInvalidKey
 	}
 
 	strKey := string(key)
 
 	// 首先尝试从缓存获取
-	if value, err := h.Get(key); err == nil {
+	if value, err := h.GetWithCtx(ctx, key); err == nil {
 		result := make([]byte, len(value))
 		copy(result, value)
 		return result, nil
@@ -320,7 +382,7 @@ func (h *RedisHandler) GetOrCompute(key []byte, ttl time.Duration, loader func()
 	}()
 
 	// 双重检查：可能在等待LoadOrStore期间已经被缓存
-	if value, err := h.Get(key); err == nil {
+	if value, err := h.GetWithCtx(ctx, key); err == nil {
 		call.val = value
 		result := make([]byte, len(value))
 		copy(result, value)
@@ -350,7 +412,7 @@ func (h *RedisHandler) GetOrCompute(key []byte, ttl time.Duration, loader func()
 		}()
 
 		// 三重检查缓存（可能在等待锁期间已被其他实例设置）
-		if value, err := h.Get(key); err == nil {
+		if value, err := h.GetWithCtx(ctx, key); err == nil {
 			call.val = value
 			result := make([]byte, len(value))
 			copy(result, value)
@@ -358,7 +420,7 @@ func (h *RedisHandler) GetOrCompute(key []byte, ttl time.Duration, loader func()
 		}
 
 		// 执行实际的计算
-		value, err := loader()
+		value, err := loader(ctx)
 		if err != nil {
 			call.err = err
 			return nil, err
@@ -366,9 +428,9 @@ func (h *RedisHandler) GetOrCompute(key []byte, ttl time.Duration, loader func()
 
 		// 将结果写入缓存
 		if ttl <= 0 {
-			h.Set(key, value)
+			h.SetWithCtx(ctx, key, value)
 		} else {
-			h.SetWithTTL(key, value, ttl)
+			h.SetWithTTLAndCtx(ctx, key, value, ttl)
 		}
 
 		// 保存结果
@@ -400,7 +462,7 @@ func (h *RedisHandler) GetOrCompute(key []byte, ttl time.Duration, loader func()
 			}
 
 			// 重试获取缓存值
-			if value, err := h.Get(key); err == nil {
+			if value, err := h.GetWithCtx(ctx, key); err == nil {
 				call.val = value
 				result := make([]byte, len(value))
 				copy(result, value)
@@ -429,7 +491,7 @@ func (h *RedisHandler) GetOrCompute(key []byte, ttl time.Duration, loader func()
 			}()
 
 			// 再次检查缓存
-			if value, err := h.Get(key); err == nil {
+			if value, err := h.GetWithCtx(ctx, key); err == nil {
 				call.val = value
 				result := make([]byte, len(value))
 				copy(result, value)
@@ -437,7 +499,7 @@ func (h *RedisHandler) GetOrCompute(key []byte, ttl time.Duration, loader func()
 			}
 
 			// 执行计算
-			value, err := loader()
+			value, err := loader(ctx)
 			if err != nil {
 				call.err = err
 				return nil, err
@@ -445,9 +507,9 @@ func (h *RedisHandler) GetOrCompute(key []byte, ttl time.Duration, loader func()
 
 			// 写入缓存
 			if ttl <= 0 {
-				h.Set(key, value)
+				h.SetWithCtx(ctx, key, value)
 			} else {
-				h.SetWithTTL(key, value, ttl)
+				h.SetWithTTLAndCtx(ctx, key, value, ttl)
 			}
 
 			call.val = value
@@ -457,7 +519,7 @@ func (h *RedisHandler) GetOrCompute(key []byte, ttl time.Duration, loader func()
 		}
 
 		// 最后尝试从缓存获取
-		if value, err := h.Get(key); err == nil {
+		if value, err := h.GetWithCtx(ctx, key); err == nil {
 			call.val = value
 			result := make([]byte, len(value))
 			copy(result, value)

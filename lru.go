@@ -14,6 +14,7 @@ package cachex
 
 import (
 	"container/list"
+	"context"
 	"sync"
 	"time"
 )
@@ -23,188 +24,230 @@ import (
 // - 当超过容量时，按最近最少使用 (LRU) 驱逐
 // - 支持可选的 TTL（通过 SetWithTTL）
 type LRUHandler struct {
-    mu        sync.Mutex
-    maxEntries int
-    ll        *list.List
-    cache     map[string]*list.Element
-    closed    bool
+	mu         sync.Mutex
+	maxEntries int
+	ll         *list.List
+	cache      map[string]*list.Element
+	closed     bool
 }
 
 type lruEntry struct {
-    key    string
-    value  []byte
-    expiry time.Time // zero 表示不过期
+	key    string
+	value  []byte
+	expiry time.Time // zero 表示不过期
 }
 
 // NewLRUHandler 创建一个新的 LRUHandler，maxEntries<=0 表示无限容量
 func NewLRUHandler(maxEntries int) *LRUHandler {
-    return &LRUHandler{
-        maxEntries: maxEntries,
-        ll:         list.New(),
-        cache:      make(map[string]*list.Element),
-    }
+	return &LRUHandler{
+		maxEntries: maxEntries,
+		ll:         list.New(),
+		cache:      make(map[string]*list.Element),
+	}
 }
 
 func copyBytes(b []byte) []byte {
-    if b == nil {
-        return nil
-    }
-    nb := make([]byte, len(b))
-    copy(nb, b)
-    return nb
+	if b == nil {
+		return nil
+	}
+	nb := make([]byte, len(b))
+	copy(nb, b)
+	return nb
 }
 
 // purgeExpired 检查并移除指定元素如果已过期，返回是否被移除
 func (h *LRUHandler) purgeExpired(e *list.Element) bool {
-    if e == nil {
-        return false
-    }
-    ent := e.Value.(*lruEntry)
-    if !ent.expiry.IsZero() && time.Now().After(ent.expiry) {
-        // remove
-        h.ll.Remove(e)
-        delete(h.cache, ent.key)
-        return true
-    }
-    return false
+	if e == nil {
+		return false
+	}
+	ent := e.Value.(*lruEntry)
+	if !ent.expiry.IsZero() && time.Now().After(ent.expiry) {
+		// remove
+		h.ll.Remove(e)
+		delete(h.cache, ent.key)
+		return true
+	}
+	return false
 }
 
-// Set 实现 Handler.Set（不设置 TTL）
-func (h *LRUHandler) Set(key, value []byte) error {
-    return h.SetWithTTL(key, value, -1) // -1 表示永不过期
-}
+// ========== 简化版方法（不带context） ==========
 
-// SetWithTTL 实现 Handler.SetWithTTL
-func (h *LRUHandler) SetWithTTL(key, value []byte, ttl time.Duration) error {
-    if key == nil {
-        return ErrInvalidKey
-    }
-    if value == nil {
-        return ErrInvalidValue
-    }
-    if ttl < -1 {
-        return ErrInvalidTTL
-    }
-    
-    h.mu.Lock()
-    defer h.mu.Unlock()
-    if h.closed {
-        return ErrClosed
-    }
-    sk := string(key)
-    if ele, ok := h.cache[sk]; ok {
-        // 覆盖并移动到前
-        ent := ele.Value.(*lruEntry)
-        ent.value = copyBytes(value)
-        if ttl > 0 {
-            ent.expiry = time.Now().Add(ttl)
-        } else if ttl == 0 {
-            // 0 表示立即过期
-            ent.expiry = time.Now().Add(-time.Second) 
-        } else if ttl == -1 {
-            // -1 表示永不过期，保持 expiry 为零值  
-            ent.expiry = time.Time{}
-        } else {
-            ent.expiry = time.Time{}
-        }
-        h.ll.MoveToFront(ele)
-        return nil
-    }
-
-    ent := &lruEntry{key: sk, value: copyBytes(value)}
-    if ttl > 0 {
-        ent.expiry = time.Now().Add(ttl)
-    } else if ttl == 0 {
-        // 0 表示立即过期
-        ent.expiry = time.Now().Add(-time.Second)
-    } else if ttl == -1 {
-        // -1 表示永不过期，保持 expiry 为零值
-        ent.expiry = time.Time{}
-    }
-    ele := h.ll.PushFront(ent)
-    h.cache[sk] = ele
-
-    if h.maxEntries > 0 && h.ll.Len() > h.maxEntries {
-        // remove oldest
-        back := h.ll.Back()
-        if back != nil {
-            old := back.Value.(*lruEntry)
-            delete(h.cache, old.key)
-            h.ll.Remove(back)
-        }
-    }
-
-    return nil
-}
-
-// Get 实现 Handler.Get
+// Get 获取缓存值
 func (h *LRUHandler) Get(key []byte) ([]byte, error) {
-    if err := ValidateBasicOp(key, true, h.closed); err != nil {
-        return nil, err
-    }
-
-    h.mu.Lock()
-    defer h.mu.Unlock()
-    sk := string(key)
-    ele, ok := h.cache[sk]
-    if !ok {
-        return nil, ErrNotFound
-    }
-    if h.purgeExpired(ele) {
-        return nil, ErrNotFound
-    }
-    ent := ele.Value.(*lruEntry)
-    h.ll.MoveToFront(ele)
-    return copyBytes(ent.value), nil
+	return h.GetWithCtx(context.Background(), key)
 }
 
-// GetTTL 实现 Handler.GetTTL
+// GetTTL 获取键的剩余TTL
 func (h *LRUHandler) GetTTL(key []byte) (time.Duration, error) {
-    if key == nil {
-        return 0, ErrInvalidKey
-    }
-
-    h.mu.Lock()
-    defer h.mu.Unlock()
-    if h.closed {
-        return 0, ErrClosed
-    }
-    sk := string(key)
-    ele, ok := h.cache[sk]
-    if !ok {
-        return 0, ErrNotFound
-    }
-    if h.purgeExpired(ele) {
-        return 0, ErrNotFound
-    }
-    ent := ele.Value.(*lruEntry)
-    if ent.expiry.IsZero() {
-        return 0, nil
-    }
-    return time.Until(ent.expiry), nil
+	return h.GetTTLWithCtx(context.Background(), key)
 }
 
-// Del 实现 Handler.Del
+// Set 设置缓存键值对（不带TTL）
+func (h *LRUHandler) Set(key, value []byte) error {
+	return h.SetWithTTL(key, value, -1)
+}
+
+// SetWithTTL 设置带TTL的缓存键值对
+func (h *LRUHandler) SetWithTTL(key, value []byte, ttl time.Duration) error {
+	return h.SetWithTTLAndCtx(context.Background(), key, value, ttl)
+}
+
+// Del 删除缓存键
 func (h *LRUHandler) Del(key []byte) error {
-    if key == nil {
-        return ErrInvalidKey
-    }
-
-    h.mu.Lock()
-    defer h.mu.Unlock()
-    if h.closed {
-        return ErrClosed
-    }
-    sk := string(key)
-    if ele, ok := h.cache[sk]; ok {
-        h.ll.Remove(ele)
-        delete(h.cache, sk)
-    }
-    return nil
+	return h.DelWithCtx(context.Background(), key)
 }
 
-// BatchGet 批量获取多个键的值
+// BatchGet 批量获取
 func (h *LRUHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
+	return h.BatchGetWithCtx(context.Background(), keys)
+}
+
+// GetOrCompute 获取或计算（简化版）
+func (h *LRUHandler) GetOrCompute(key []byte, ttl time.Duration, loader func() ([]byte, error)) ([]byte, error) {
+	ctxLoader := func(context.Context) ([]byte, error) {
+		return loader()
+	}
+	return h.GetOrComputeWithCtx(context.Background(), key, ttl, ctxLoader)
+}
+
+// ========== 完整版方法（带context） ==========
+
+// GetWithCtx 获取缓存值（支持context）
+func (h *LRUHandler) GetWithCtx(ctx context.Context, key []byte) ([]byte, error) {
+	if err := ValidateBasicOp(key, true, h.closed); err != nil {
+		return nil, err
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	sk := string(key)
+	ele, ok := h.cache[sk]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if h.purgeExpired(ele) {
+		return nil, ErrNotFound
+	}
+	ent := ele.Value.(*lruEntry)
+	h.ll.MoveToFront(ele)
+	return copyBytes(ent.value), nil
+}
+
+// GetTTLWithCtx 获取键的剩余TTL（支持context）
+func (h *LRUHandler) GetTTLWithCtx(ctx context.Context, key []byte) (time.Duration, error) {
+	if key == nil {
+		return 0, ErrInvalidKey
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return 0, ErrClosed
+	}
+	sk := string(key)
+	ele, ok := h.cache[sk]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	if h.purgeExpired(ele) {
+		return 0, ErrNotFound
+	}
+	ent := ele.Value.(*lruEntry)
+	if ent.expiry.IsZero() {
+		return 0, nil
+	}
+	return time.Until(ent.expiry), nil
+}
+
+// SetWithCtx 设置缓存键值对（支持context）
+func (h *LRUHandler) SetWithCtx(ctx context.Context, key, value []byte) error {
+	return h.SetWithTTLAndCtx(ctx, key, value, -1)
+}
+
+// SetWithTTLAndCtx 设置带TTL的缓存键值对（支持context）
+func (h *LRUHandler) SetWithTTLAndCtx(ctx context.Context, key, value []byte, ttl time.Duration) error {
+	if key == nil {
+		return ErrInvalidKey
+	}
+	if value == nil {
+		return ErrInvalidValue
+	}
+	if ttl < -1 {
+		return ErrInvalidTTL
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return ErrClosed
+	}
+	sk := string(key)
+	if ele, ok := h.cache[sk]; ok {
+		// 覆盖并移动到前
+		ent := ele.Value.(*lruEntry)
+		ent.value = copyBytes(value)
+		if ttl > 0 {
+			ent.expiry = time.Now().Add(ttl)
+		} else if ttl == 0 {
+			// 0 表示立即过期
+			ent.expiry = time.Now().Add(-time.Second)
+		} else if ttl == -1 {
+			// -1 表示永不过期，保持 expiry 为零值
+			ent.expiry = time.Time{}
+		} else {
+			ent.expiry = time.Time{}
+		}
+		h.ll.MoveToFront(ele)
+		return nil
+	}
+
+	ent := &lruEntry{key: sk, value: copyBytes(value)}
+	if ttl > 0 {
+		ent.expiry = time.Now().Add(ttl)
+	} else if ttl == 0 {
+		// 0 表示立即过期
+		ent.expiry = time.Now().Add(-time.Second)
+	} else if ttl == -1 {
+		// -1 表示永不过期，保持 expiry 为零值
+		ent.expiry = time.Time{}
+	}
+	ele := h.ll.PushFront(ent)
+	h.cache[sk] = ele
+
+	if h.maxEntries > 0 && h.ll.Len() > h.maxEntries {
+		// remove oldest
+		back := h.ll.Back()
+		if back != nil {
+			old := back.Value.(*lruEntry)
+			delete(h.cache, old.key)
+			h.ll.Remove(back)
+		}
+	}
+
+	return nil
+}
+
+// DelWithCtx 删除缓存键（支持context）
+func (h *LRUHandler) DelWithCtx(ctx context.Context, key []byte) error {
+	if key == nil {
+		return ErrInvalidKey
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return ErrClosed
+	}
+	sk := string(key)
+	if ele, ok := h.cache[sk]; ok {
+		h.ll.Remove(ele)
+		delete(h.cache, sk)
+	}
+	return nil
+}
+
+// BatchGetWithCtx 批量获取
+func (h *LRUHandler) BatchGetWithCtx(ctx context.Context, keys [][]byte) ([][]byte, []error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
@@ -253,6 +296,36 @@ func (h *LRUHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
 	return results, errors
 }
 
+// GetOrComputeWithCtx 获取或计算缓存值
+func (h *LRUHandler) GetOrComputeWithCtx(ctx context.Context, key []byte, ttl time.Duration, loader func(context.Context) ([]byte, error)) ([]byte, error) {
+	// 先尝试获取
+	if val, err := h.GetWithCtx(ctx, key); err == nil {
+		return val, nil
+	}
+
+	// 检查context是否已取消
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// 调用loader计算值
+	val, err := loader(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// 写入缓存
+	if ttl > 0 {
+		_ = h.SetWithTTLAndCtx(ctx, key, val, ttl)
+	} else {
+		_ = h.SetWithCtx(ctx, key, val)
+	}
+
+	return val, nil
+}
+
 // Stats 返回缓存统计信息
 func (h *LRUHandler) Stats() map[string]interface{} {
 	h.mu.Lock()
@@ -284,63 +357,15 @@ func (h *LRUHandler) Stats() map[string]interface{} {
 	}
 }
 
-// GetOrCompute 获取缓存值，如果不存在则计算并设置
-func (h *LRUHandler) GetOrCompute(key []byte, ttl time.Duration, loader func() ([]byte, error)) ([]byte, error) {
-	if len(key) == 0 {
-		return nil, ErrInvalidKey
-	}
-
-	sk := string(key)
-
-	// 首先尝试获取
-	h.mu.Lock()
-	if h.closed {
-		h.mu.Unlock()
-		return nil, ErrClosed
-	}
-
-	if ele, hit := h.cache[sk]; hit {
-		entry := ele.Value.(*lruEntry)
-		// 检查TTL
-		if !entry.expiry.IsZero() && time.Now().After(entry.expiry) {
-			// 过期，删除
-			h.ll.Remove(ele)
-			delete(h.cache, sk)
-		} else {
-			// 移动到前面并返回
-			h.ll.MoveToFront(ele)
-			valueCopy := copyBytes(entry.value)
-			h.mu.Unlock()
-			return valueCopy, nil
-		}
-	}
-	h.mu.Unlock()
-
-	// 缓存未命中，调用loader
-	value, err := loader()
-	if err != nil {
-		return nil, err
-	}
-
-	// 将结果写入缓存
-	if ttl <= 0 {
-		h.Set(key, value)
-	} else {
-		h.SetWithTTL(key, value, ttl)
-	}
-
-	return copyBytes(value), nil
-}
-
 // Close 实现 Handler.Close
 func (h *LRUHandler) Close() error {
-    h.mu.Lock()
-    defer h.mu.Unlock()
-    if h.closed {
-        return nil
-    }
-    h.closed = true
-    h.ll = nil
-    h.cache = make(map[string]*list.Element)
-    return nil
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return nil
+	}
+	h.closed = true
+	h.ll = nil
+	h.cache = make(map[string]*list.Element)
+	return nil
 }

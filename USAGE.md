@@ -1,177 +1,30 @@
 # Go-Cachex 使用指南
 
-本文档提供 Go-Cachex 的详细使用说明和最佳实践。
+本文档提供 Go-Cachex 各种Handler的实际使用示例和代码演示。
+
+> 💡 **文档导航**: 
+> - [README](./README.md) - 项目概览
+> - [接口设计文档](./docs/INTERFACE-UNIFICATION-SUMMARY.md) - Handler接口定义和设计说明
+> - [性能报告](./docs/PERFORMANCE-REPORT.md) - 性能测试数据
 
 ## 目录
 
-- [快速开始](#快速开始)
-- [客户端接口](#客户端接口)
-- [缓存实现](#缓存实现)
-- [Context 支持](#context-支持)
-- [错误处理](#错误处理)
-- [最佳实践](#最佳实践)
+- [LRU缓存使用](#lru缓存使用)
+- [LRU优化版使用](#lru优化版使用)
+- [Redis缓存使用](#redis缓存使用)
+- [Ristretto缓存使用](#ristretto缓存使用)
+- [过期缓存使用](#过期缓存使用)
+- [分片缓存使用](#分片缓存使用)
+- [两级缓存使用](#两级缓存使用)
+- [Context超时控制](#context超时控制)
+- [并发去重](#并发去重)
+- [错误处理示例](#错误处理示例)
+- [性能优化技巧](#性能优化技巧)
+- [生产环境最佳实践](#生产环境最佳实践)
 
-## 快速开始
+> 📖 **接口说明**: 所有Handler都实现统一的双API接口（简化版 + WithCtx版本），详见 [接口设计文档](./docs/INTERFACE-UNIFICATION-SUMMARY.md)
 
-### 安装
-
-```sh
-go get -u github.com/kamalyes/go-cachex
-```
-
-### 基本示例
-
-```go
-package main
-
-import (
-    "context"
-    "fmt"
-    "time"
-    
-    "github.com/kamalyes/go-cachex"
-)
-
-func main() {
-    ctx := context.Background()
-    
-    // 创建 LRU 缓存客户端
-    client, err := cachex.NewLRUClient(ctx, 1000)
-    if err != nil {
-        panic(err)
-    }
-    defer client.Close()
-    
-    // 基本操作
-    err = client.Set(ctx, []byte("hello"), []byte("world"))
-    if err != nil {
-        panic(err)
-    }
-    
-    val, err := client.Get(ctx, []byte("hello"))
-    if err != nil {
-        panic(err)
-    }
-    
-    fmt.Printf("Value: %s\n", string(val)) // Output: Value: world
-}
-```
-
-## 客户端接口
-
-### 统一客户端配置
-
-Go-Cachex 提供统一的客户端接口，支持所有缓存实现：
-
-```go
-// 使用 ClientConfig 配置
-client, err := cachex.NewClient(ctx, &cachex.ClientConfig{
-    Type:     cachex.CacheLRU,
-    Capacity: 1000,
-})
-
-// 使用便利函数
-lruClient, err := cachex.NewLRUClient(ctx, 1000)
-redisClient, err := cachex.NewRedisClient(ctx, &cachex.RedisConfig{
-    Addrs: []string{"localhost:6379"},
-})
-ristrettoClient, err := cachex.NewRistrettoClient(ctx, &cachex.RistrettoConfig{
-    NumCounters: 1e7,
-    MaxCost:     1 << 30,
-    BufferItems: 64,
-})
-```
-
-### 基本操作
-
-```go
-// 设置值
-err := client.Set(ctx, []byte("key"), []byte("value"))
-
-// 获取值
-val, err := client.Get(ctx, []byte("key"))
-
-// 设置带 TTL 的值
-err = client.SetWithTTL(ctx, []byte("key"), []byte("value"), time.Hour)
-
-// 获取 TTL
-ttl, err := client.GetTTL(ctx, []byte("key"))
-
-// 删除键
-err = client.Del(ctx, []byte("key"))
-
-// 智能加载（去重）
-val, err = client.GetOrCompute(ctx, []byte("key"), time.Hour, func(ctx context.Context) ([]byte, error) {
-    // 昂贵的计算，并发请求下只会执行一次
-    return []byte("computed"), nil
-})
-```
-
-### 批量操作
-
-所有缓存实现都支持高效的批量操作：
-
-```go
-// 批量获取多个键
-keys := [][]byte{
-    []byte("key1"),
-    []byte("key2"), 
-    []byte("key3"),
-    []byte("nonexistent"),
-}
-
-results, errors := client.BatchGet(ctx, keys)
-
-for i, key := range keys {
-    if errors[i] == nil {
-        fmt.Printf("%s: %s\n", string(key), string(results[i]))
-    } else {
-        fmt.Printf("%s: %v\n", string(key), errors[i])
-    }
-}
-
-// 输出:
-// key1: value1
-// key2: value2  
-// key3: value3
-// nonexistent: key not found in cache
-```
-
-### 统计与监控
-
-获取详细的缓存统计信息：
-
-```go
-stats := client.Stats(ctx)
-
-// 通用统计信息
-fmt.Printf("缓存类型: %v\n", stats["client_type"])
-fmt.Printf("容量: %v\n", stats["client_capacity"])
-fmt.Printf("当前条目: %v\n", stats["entries"])
-
-// LRU Optimized 专用统计
-if shardCount, exists := stats["shard_count"]; exists {
-    fmt.Printf("分片数量: %v\n", shardCount)
-    fmt.Printf("命中率: %v\n", stats["hit_rate"])
-}
-
-// Ristretto 专用统计
-if hitRate, exists := stats["hit_rate"]; exists {
-    fmt.Printf("命中率: %.2f%%\n", hitRate.(float64)*100)
-    fmt.Printf("键添加: %v\n", stats["keys_added"])
-    fmt.Printf("键驱逐: %v\n", stats["keys_evicted"])
-}
-
-// TwoLevel 分层统计
-if l1Cache, exists := stats["l1_cache"]; exists {
-    fmt.Printf("L1缓存: %v\n", l1Cache)
-    fmt.Printf("L2缓存: %v\n", stats["l2_cache"])
-}
-```
-
-## 缓存实现
-
-### LRU 缓存
+## LRU缓存使用
 
 适合本地缓存和测试环境：
 
@@ -184,13 +37,18 @@ client, err := cachex.NewLRUClient(ctx, 1000) // 容量 1000
 // - 支持 TTL
 // - 线程安全
 
-// 直接使用 Handler
+// 直接使用 Handler - 简化版API
 cache := cachex.NewLRUHandler(1000)
 defer cache.Close()
 
 err := cache.Set([]byte("key"), []byte("value"))
 val, err := cache.Get([]byte("key"))
 err = cache.SetWithTTL([]byte("key-ttl"), []byte("value"), 5*time.Second)
+
+// 完整版API - 带context支持
+ctx := context.Background()
+err = cache.SetWithCtx(ctx, []byte("key2"), []byte("value2"))
+val2, err := cache.GetWithCtx(ctx, []byte("key2"))
 ```
 
 ### LRU Optimized 缓存 (推荐)
@@ -211,12 +69,17 @@ client, err := cachex.NewLRUOptimizedClient(ctx, 10000) // 容量 10000
 cache := cachex.NewLRUOptimizedHandler(10000)
 defer cache.Close()
 
-// 基础操作（极致性能）
+// 简化版API（极致性能）
 err := cache.Set([]byte("key"), []byte("value"))        // 68ns/op, 0 allocs
 val, err := cache.Get([]byte("key"))                    // 178ns/op
 results, errs := cache.BatchGet([][]byte{               // 并行处理
     []byte("key1"), []byte("key2"), []byte("key3"),
 })
+
+// WithCtx版本 - 支持超时控制
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+defer cancel()
+val2, err := cache.GetWithCtx(ctx, []byte("key"))
 
 // 实时统计
 stats := cache.Stats()
@@ -258,8 +121,13 @@ cache, err := cachex.NewRedisHandler(&cachex.RedisConfig{
 })
 defer cache.Close()
 
+// 简化版API
 err = cache.Set([]byte("key"), []byte("value"))
 err = cache.SetWithTTL([]byte("key-ttl"), []byte("value"), 24*time.Hour)
+
+// WithCtx版本
+ctx := context.Background()
+err = cache.SetWithCtx(ctx, []byte("key2"), []byte("value2"))
 ```
 
 ### Ristretto 缓存
@@ -282,8 +150,13 @@ config := &cachex.RistrettoConfig{
 cache, err := cachex.NewRistrettoHandler(config)
 defer cache.Close()
 
+// 简化版API
 err = cache.Set([]byte("key"), []byte("value"))
 err = cache.SetWithTTL([]byte("key-ttl"), []byte("value"), time.Minute)
+
+// WithCtx版本
+ctx := context.Background()
+val, err := cache.GetWithCtx(ctx, []byte("key"))
 ```
 
 ### 过期缓存
@@ -295,9 +168,13 @@ err = cache.SetWithTTL([]byte("key-ttl"), []byte("value"), time.Minute)
 cache := cachex.NewExpiringHandler()
 defer cache.Close()
 
-// 基本操作与 TTL
+// 简化版API
 err := cache.Set([]byte("key"), []byte("value"))
 err = cache.SetWithTTL([]byte("temp"), []byte("value"), 30*time.Second)
+
+// WithCtx版本
+ctx := context.Background()
+err = cache.SetWithCtx(ctx, []byte("key2"), []byte("value2"))
 
 // 过期键会自动清理
 time.Sleep(31 * time.Second)
@@ -337,9 +214,13 @@ factory := func() cachex.Handler {
 cache := cachex.NewShardedHandler(16, factory) // 16 个分片
 defer cache.Close()
 
-// 使用方式与普通缓存相同，键自动分配到不同分片
+// 简化版API - 键自动分配到不同分片
 err := cache.Set([]byte("key"), []byte("value"))
 val, err := cache.Get([]byte("key"))
+
+// WithCtx版本
+ctx := context.Background()
+val2, err := cache.GetWithCtx(ctx, []byte("key"))
 ```
 
 #### 两级缓存
@@ -347,90 +228,23 @@ val, err := cache.Get([]byte("key"))
 ```go
 // 创建两级缓存系统
 l1 := cachex.NewLRUHandler(1000)         // 快速本地缓存
-l2 := cachex.NewRedisHandler(redisConfig) // 慢速共享缓存
+l2, _ := cachex.NewRedisHandler(&cachex.RedisConfig{
+    Addrs: []string{"localhost:6379"},
+})
 
 cache := cachex.NewTwoLevelHandler(l1, l2, &cachex.TwoLevelConfig{
     WriteStrategy: cachex.WriteThrough, // 写透策略
 })
 defer cache.Close()
 
-// 自动处理两级缓存：优先从 L1 获取，未命中则回退到 L2
+// 简化版API - 自动处理两级缓存
 err := cache.Set([]byte("key"), []byte("value"))
 val, err := cache.Get([]byte("key"))
 err = cache.SetWithTTL([]byte("key"), []byte("value"), time.Hour)
-```
 
-## 统一Handler接口
-
-### 接口标准化
-
-🔧 所有缓存实现都支持相同的核心接口，确保一致的API体验：
-
-```go
-type Handler interface {
-    Set([]byte, []byte) error
-    SetWithTTL([]byte, []byte, time.Duration) error
-    Get([]byte) ([]byte, error)
-    GetTTL([]byte) (time.Duration, error)
-    Del([]byte) error
-    BatchGet([][]byte) ([][]byte, []error)    // 批量操作
-    Stats() map[string]interface{}            // 统计信息
-    Close() error
-}
-```
-
-### 直接使用Handler示例
-
-所有Handler实现都可以直接使用，无需Client包装：
-
-```go
-// 任选一种Handler实现
-handlers := []cachex.Handler{
-    cachex.NewLRUHandler(100),
-    cachex.NewLRUOptimizedHandler(100),
-    cachex.NewExpiringHandler(time.Minute),
-    cachex.NewShardedHandler(func() cachex.Handler {
-        return cachex.NewLRUHandler(25)
-    }, 4),
-}
-
-for _, handler := range handlers {
-    // 统一的接口操作
-    handler.Set([]byte("key"), []byte("value"))
-    
-    // 批量获取
-    results, errors := handler.BatchGet([][]byte{
-        []byte("key1"), []byte("key2"),
-    })
-    
-    // 统计信息
-    stats := handler.Stats()
-    fmt.Printf("类型: %v, 条目: %v\n", 
-        stats["cache_type"], stats["entries"])
-    
-    handler.Close()
-}
-```
-
-### ContextHandler接口
-
-Client层支持context感知的统一接口：
-
-```go
-type ContextHandler interface {
-    Set(ctx context.Context, key, value []byte) error
-    SetWithTTL(ctx context.Context, key, value []byte, ttl time.Duration) error
-    Get(ctx context.Context, key []byte) ([]byte, error)
-    GetTTL(ctx context.Context, key []byte) (time.Duration, error)
-    Del(ctx context.Context, key []byte) error
-    GetOrCompute(ctx context.Context, key []byte, ttl time.Duration, loader func(context.Context) ([]byte, error)) ([]byte, error)
-    BatchGet(ctx context.Context, keys [][]byte) ([][]byte, []error)
-    Stats(ctx context.Context) map[string]interface{}
-    Close() error
-}
-
-// 所有Client都实现ContextHandler接口
-var client cachex.ContextHandler = myClient
+// WithCtx版本
+ctx := context.Background()
+val2, err := cache.GetWithCtx(ctx, []byte("key"))
 ```
 
 ## Context 支持
@@ -675,7 +489,7 @@ func main() {
 
 ```go
 // 📊 实时监控缓存状态
-func monitorCache(client cachex.ContextHandler) {
+func monitorCache(client cachex.Handler) {
     ticker := time.NewTicker(10 * time.Second)
     defer ticker.Stop()
     
@@ -706,7 +520,7 @@ func monitorCache(client cachex.ContextHandler) {
 }
 
 // 🚨 性能告警系统
-func setupAlerts(client cachex.ContextHandler) {
+func setupAlerts(client cachex.Handler) {
     go func() {
         for {
             time.Sleep(30 * time.Second)
@@ -734,7 +548,7 @@ func setupAlerts(client cachex.ContextHandler) {
 
 ```go
 type MetricsClient struct {
-    client cachex.ContextHandler
+    client cachex.Handler
     hits   int64
     misses int64
 }
@@ -764,7 +578,7 @@ func (m *MetricsClient) HitRate() float64 {
 
 ```go
 // 多级缓存提升性能
-func createLayeredCache(ctx context.Context) cachex.ContextHandler {
+func createLayeredCache(ctx context.Context) cachex.Handler {
     // L1: 快速内存缓存
     l1, _ := cachex.NewLRUClient(ctx, 1000)
     
@@ -778,7 +592,7 @@ func createLayeredCache(ctx context.Context) cachex.ContextHandler {
 }
 
 type LayeredCache struct {
-    l1, l2 cachex.ContextHandler
+    l1, l2 cachex.Handler
 }
 
 func (lc *LayeredCache) Get(ctx context.Context, key []byte) ([]byte, error) {
@@ -819,7 +633,7 @@ sessionKey := makeKey(SessionCachePrefix, "abc", 1) // "session:user:abc:v1"
 ### 8. 错误处理和重试
 
 ```go
-func getWithRetry(ctx context.Context, client cachex.ContextHandler, key []byte, maxRetries int) ([]byte, error) {
+func getWithRetry(ctx context.Context, client cachex.Handler, key []byte, maxRetries int) ([]byte, error) {
     var lastErr error
     
     for i := 0; i < maxRetries; i++ {

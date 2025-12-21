@@ -14,6 +14,7 @@
 package cachex
 
 import (
+	"context"
 	"time"
 
 	ristretto "github.com/dgraph-io/ristretto/v2"
@@ -26,35 +27,35 @@ type RistrettoHandler struct {
 
 // Config 用于定制 Ristretto 缓存的配置
 type RistrettoConfig struct {
-	NumCounters                  int64 // 计数器数量，用于跟踪访问频率
-	MaxCost                      int64 // 最大缓存成本
-	BufferItems                  int64 // Get 缓存的大小
-	Metrics                      bool  // 是否启用缓存统计
-	OnEvict                      func(item *ristretto.Item[[]byte]) // 每次驱逐时调用
-	OnReject                     func(item *ristretto.Item[[]byte]) // 每次拒绝时调用
-	OnExit                       func(val []byte) // 从缓存中移除值时调用
-	ShouldUpdate                 func(cur, prev []byte) bool // 更新时的检查函数
-	KeyToHash                    func(key []byte) (uint64, uint64) // 自定义键哈希算法
-	Cost                         func(value []byte) int64 // 计算值的成本
-	IgnoreInternalCost           bool // 是否忽略内部存储的成本
-	TtlTickerDurationInSec       int64 // TTL 过期时清理键的时间间隔 (为0时=bucketDurationSecs)
+	NumCounters            int64                              // 计数器数量，用于跟踪访问频率
+	MaxCost                int64                              // 最大缓存成本
+	BufferItems            int64                              // Get 缓存的大小
+	Metrics                bool                               // 是否启用缓存统计
+	OnEvict                func(item *ristretto.Item[[]byte]) // 每次驱逐时调用
+	OnReject               func(item *ristretto.Item[[]byte]) // 每次拒绝时调用
+	OnExit                 func(val []byte)                   // 从缓存中移除值时调用
+	ShouldUpdate           func(cur, prev []byte) bool        // 更新时的检查函数
+	KeyToHash              func(key []byte) (uint64, uint64)  // 自定义键哈希算法
+	Cost                   func(value []byte) int64           // 计算值的成本
+	IgnoreInternalCost     bool                               // 是否忽略内部存储的成本
+	TtlTickerDurationInSec int64                              // TTL 过期时清理键的时间间隔 (为0时=bucketDurationSecs)
 }
 
 // NewDefaultRistrettoConfig 创建一个新的ristretto配置实例
 func NewDefaultRistrettoConfig() *RistrettoConfig {
 	return &RistrettoConfig{
-		NumCounters: 1e7,     // 用于跟踪访问频率的键数量（1000万）
-		MaxCost:     1 << 30, // 缓存的最大成本（1GB）
-		BufferItems: 64,      // 每次 Get 请求的键数量
-		Metrics:                false, // 不启用统计
-		OnEvict:                nil,  // 不指定驱逐时的回调
-		OnReject:               nil,  // 不指定拒绝时的回调
-		OnExit:                 nil,  // 不指定移除值时的回调
-		ShouldUpdate:           nil,  // 不指定更新检查函数
-		KeyToHash:              nil,  // 使用默认哈希函数
-		Cost:                   nil,  // 不指定成本计算函数
-		IgnoreInternalCost:     false, // 不忽略内部成本
-		TtlTickerDurationInSec: 1,   // TTL 过期时间间隔（1秒）
+		NumCounters:            1e7,     // 用于跟踪访问频率的键数量（1000万）
+		MaxCost:                1 << 30, // 缓存的最大成本（1GB）
+		BufferItems:            64,      // 每次 Get 请求的键数量
+		Metrics:                false,   // 不启用统计
+		OnEvict:                nil,     // 不指定驱逐时的回调
+		OnReject:               nil,     // 不指定拒绝时的回调
+		OnExit:                 nil,     // 不指定移除值时的回调
+		ShouldUpdate:           nil,     // 不指定更新检查函数
+		KeyToHash:              nil,     // 使用默认哈希函数
+		Cost:                   nil,     // 不指定成本计算函数
+		IgnoreInternalCost:     false,   // 不忽略内部成本
+		TtlTickerDurationInSec: 1,       // TTL 过期时间间隔（1秒）
 	}
 }
 
@@ -133,18 +134,18 @@ func (c *RistrettoConfig) SetTtlTickerDurationInSec(duration int64) *RistrettoCo
 // createCache 创建 Ristretto 缓存
 func createCache(config *RistrettoConfig) (*ristretto.Cache[[]byte, []byte], error) {
 	return ristretto.NewCache(&ristretto.Config[[]byte, []byte]{
-		NumCounters:               config.NumCounters,
-		MaxCost:                   config.MaxCost,
-		BufferItems:               config.BufferItems,
-		Metrics:                   config.Metrics,
-		OnEvict:                   config.OnEvict,
-		OnReject:                  config.OnReject,
-		OnExit:                    config.OnExit,
-		ShouldUpdate:              config.ShouldUpdate,
-		KeyToHash:                 config.KeyToHash,
-		Cost:                      config.Cost,
-		IgnoreInternalCost:        config.IgnoreInternalCost,
-		TtlTickerDurationInSec:    config.TtlTickerDurationInSec,
+		NumCounters:            config.NumCounters,
+		MaxCost:                config.MaxCost,
+		BufferItems:            config.BufferItems,
+		Metrics:                config.Metrics,
+		OnEvict:                config.OnEvict,
+		OnReject:               config.OnReject,
+		OnExit:                 config.OnExit,
+		ShouldUpdate:           config.ShouldUpdate,
+		KeyToHash:              config.KeyToHash,
+		Cost:                   config.Cost,
+		IgnoreInternalCost:     config.IgnoreInternalCost,
+		TtlTickerDurationInSec: config.TtlTickerDurationInSec,
 	})
 }
 
@@ -173,8 +174,44 @@ func NewRistrettoHandler(config *RistrettoConfig) (*RistrettoHandler, error) {
 	return &RistrettoHandler{cache: cache}, nil
 }
 
-// Get 实现 Handler 接口的 Get 方法
+// ========== 简化版方法（不带context） ==========
+
+// Get 获取缓存值
 func (h *RistrettoHandler) Get(k []byte) ([]byte, error) {
+	return h.GetWithCtx(context.Background(), k)
+}
+
+// GetTTL 获取键的剩余TTL
+func (h *RistrettoHandler) GetTTL(k []byte) (time.Duration, error) {
+	return h.GetTTLWithCtx(context.Background(), k)
+}
+
+// Set 设置缓存值
+func (h *RistrettoHandler) Set(k, v []byte) error {
+	return h.SetWithCtx(context.Background(), k, v)
+}
+
+func (h *RistrettoHandler) SetWithTTL(k, v []byte, ttl time.Duration) error {
+	return h.SetWithTTLAndCtx(context.Background(), k, v, ttl)
+}
+
+func (h *RistrettoHandler) Del(k []byte) error {
+	return h.DelWithCtx(context.Background(), k)
+}
+
+func (h *RistrettoHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
+	return h.BatchGetWithCtx(context.Background(), keys)
+}
+
+func (h *RistrettoHandler) GetOrCompute(key []byte, ttl time.Duration, loader func() ([]byte, error)) ([]byte, error) {
+	ctxLoader := func(context.Context) ([]byte, error) { return loader() }
+	return h.GetOrComputeWithCtx(context.Background(), key, ttl, ctxLoader)
+}
+
+// ========== 完整版方法（带context） ==========
+
+// GetWithCtx 获取缓存值
+func (h *RistrettoHandler) GetWithCtx(ctx context.Context, k []byte) ([]byte, error) {
 	if err := ValidateBasicOp(k, h.cache != nil, false); err != nil {
 		return nil, err
 	}
@@ -186,8 +223,8 @@ func (h *RistrettoHandler) Get(k []byte) ([]byte, error) {
 	return v, nil
 }
 
-// GetTTL 实现 Handler 接口的 GetTTL 方法
-func (h *RistrettoHandler) GetTTL(k []byte) (time.Duration, error) {
+// GetTTLWithCtx 获取TTL
+func (h *RistrettoHandler) GetTTLWithCtx(ctx context.Context, k []byte) (time.Duration, error) {
 	if err := ValidateBasicOp(k, h.cache != nil, false); err != nil {
 		return 0, err
 	}
@@ -199,9 +236,9 @@ func (h *RistrettoHandler) GetTTL(k []byte) (time.Duration, error) {
 	return v, nil
 }
 
-// Set 实现 Handler 接口的 Set 方法
-func (h *RistrettoHandler) Set(k, v []byte) error {
-	if err := ValidateWriteOp(k, v, h.cache != nil, false); err != nil {
+// SetWithCtx 设置缓存
+func (h *RistrettoHandler) SetWithCtx(ctx context.Context, k, v []byte) error {
+	if err := ValidateBasicOp(k, h.cache != nil, false); err != nil {
 		return err
 	}
 
@@ -212,8 +249,8 @@ func (h *RistrettoHandler) Set(k, v []byte) error {
 	return nil
 }
 
-// SetWithTTL 实现 Handler 接口的 SetWithTTL 方法
-func (h *RistrettoHandler) SetWithTTL(k, v []byte, ttl time.Duration) error {
+// SetWithTTLAndCtx 设置带TTL的缓存
+func (h *RistrettoHandler) SetWithTTLAndCtx(ctx context.Context, k, v []byte, ttl time.Duration) error {
 	if err := ValidateWriteWithTTLOp(k, v, ttl, h.cache != nil, false); err != nil {
 		return err
 	}
@@ -236,8 +273,8 @@ func (h *RistrettoHandler) SetWithTTL(k, v []byte, ttl time.Duration) error {
 	return nil
 }
 
-// Del 实现 Handler 接口的 Del 方法
-func (h *RistrettoHandler) Del(k []byte) error {
+// DelWithCtx 删除缓存
+func (h *RistrettoHandler) DelWithCtx(ctx context.Context, k []byte) error {
 	if err := ValidateBasicOp(k, h.cache != nil, false); err != nil {
 		return err
 	}
@@ -247,8 +284,8 @@ func (h *RistrettoHandler) Del(k []byte) error {
 	return nil
 }
 
-// BatchGet 批量获取多个键的值
-func (h *RistrettoHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
+// BatchGetWithCtx 批量获取
+func (h *RistrettoHandler) BatchGetWithCtx(ctx context.Context, keys [][]byte) ([][]byte, []error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
@@ -282,48 +319,28 @@ func (h *RistrettoHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
 	return results, errors
 }
 
-// Stats 返回缓存统计信息
-func (h *RistrettoHandler) Stats() map[string]interface{} {
-	if h.cache == nil {
-		return map[string]interface{}{
-			"initialized": false,
-		}
-	}
-
-	metrics := h.cache.Metrics
-	return map[string]interface{}{
-		"hits":         metrics.Hits(),
-		"misses":       metrics.Misses(),
-		"keys_added":   metrics.KeysAdded(),
-		"keys_updated": metrics.KeysUpdated(),
-		"keys_evicted": metrics.KeysEvicted(),
-		"cost_added":   metrics.CostAdded(),
-		"cost_evicted": metrics.CostEvicted(),
-		"sets_dropped": metrics.SetsDropped(),
-		"sets_rejected": metrics.SetsRejected(),
-		"gets_dropped": metrics.GetsDropped(),
-		"gets_kept":    metrics.GetsKept(),
-		"hit_rate":     metrics.Ratio(),
-		"initialized":  true,
-	}
-}
-
-// GetOrCompute 获取缓存值，如果不存在则计算并设置
-func (h *RistrettoHandler) GetOrCompute(key []byte, ttl time.Duration, loader func() ([]byte, error)) ([]byte, error) {
+// GetOrComputeWithCtx 获取缓存值，如果不存在则计算并设置
+func (h *RistrettoHandler) GetOrComputeWithCtx(ctx context.Context, key []byte, ttl time.Duration, loader func(context.Context) ([]byte, error)) ([]byte, error) {
 	if err := ValidateBasicOp(key, h.cache != nil, false); err != nil {
 		return nil, err
 	}
 
 	// 首先尝试获取
 	if value, found := h.cache.Get(key); found {
-		// 复制数据避免外部修改
 		result := make([]byte, len(value))
 		copy(result, value)
 		return result, nil
 	}
 
+	// 检查context是否已取消
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
 	// 缓存未命中，调用loader
-	value, err := loader()
+	value, err := loader(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -340,6 +357,32 @@ func (h *RistrettoHandler) GetOrCompute(key []byte, ttl time.Duration, loader fu
 	result := make([]byte, len(value))
 	copy(result, value)
 	return result, nil
+}
+
+// Stats 返回缓存统计信息
+func (h *RistrettoHandler) Stats() map[string]interface{} {
+	if h.cache == nil {
+		return map[string]interface{}{
+			"initialized": false,
+		}
+	}
+
+	metrics := h.cache.Metrics
+	return map[string]interface{}{
+		"hits":          metrics.Hits(),
+		"misses":        metrics.Misses(),
+		"keys_added":    metrics.KeysAdded(),
+		"keys_updated":  metrics.KeysUpdated(),
+		"keys_evicted":  metrics.KeysEvicted(),
+		"cost_added":    metrics.CostAdded(),
+		"cost_evicted":  metrics.CostEvicted(),
+		"sets_dropped":  metrics.SetsDropped(),
+		"sets_rejected": metrics.SetsRejected(),
+		"gets_dropped":  metrics.GetsDropped(),
+		"gets_kept":     metrics.GetsKept(),
+		"hit_rate":      metrics.Ratio(),
+		"initialized":   true,
+	}
 }
 
 // Close 实现 Handler 接口的 Close 方法

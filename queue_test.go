@@ -13,11 +13,12 @@ package cachex
 import (
 	"context"
 	"fmt"
+	"testing"
+	"time"
+
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"testing"
-	"time"
 )
 
 func setupRedisClient(t *testing.T) *redis.Client {
@@ -252,32 +253,194 @@ func TestQueueHandler_Peek(t *testing.T) {
 
 	queue := NewQueueHandler(client, "test", config)
 	ctx := context.Background()
-	queueName := "test_peek"
 
-	// 入队几个任务
-	for i := 1; i <= 3; i++ {
-		item := &QueueItem{Data: fmt.Sprintf("任务%d", i)}
-		err := queue.Enqueue(ctx, queueName, QueueTypeFIFO, item)
+	t.Run("FIFO Peek基本功能", func(t *testing.T) {
+		queueName := "test_peek_fifo"
+
+		// 入队任务
+		for i := 1; i <= 5; i++ {
+			item := &QueueItem{Data: fmt.Sprintf("FIFO任务%d", i)}
+			err := queue.Enqueue(ctx, queueName, QueueTypeFIFO, item)
+			assert.NoError(t, err)
+		}
+
+		// Peek前2个任务（应该是最先入队的）
+		items, err := queue.Peek(ctx, queueName, QueueTypeFIFO, 2)
 		assert.NoError(t, err)
-	}
+		assert.Len(t, items, 2, "应该返回2个任务")
+		assert.Equal(t, "FIFO任务1", items[0].Data, "第一个应该是任务1")
+		assert.Equal(t, "FIFO任务2", items[1].Data, "第二个应该是任务2")
 
-	// Peek应该能看到队列头部的任务，但不移除它们
-	items, err := queue.Peek(ctx, queueName, QueueTypeFIFO, 2)
-	assert.NoError(t, err)
-	assert.Len(t, items, 2, "Peek应该返回2个任务")
+		// 队列长度不变
+		length, err := queue.Length(ctx, queueName, QueueTypeFIFO)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(5), length, "Peek不应改变队列长度")
 
-	// 队列长度应该没有变化
-	length, err := queue.Length(ctx, queueName, QueueTypeFIFO)
-	assert.NoError(t, err)
-	assert.Equal(t, int64(3), length, "Peek不应该改变队列长度")
+		// 出队一个后再Peek
+		dequeued, err := queue.Dequeue(ctx, queueName, QueueTypeFIFO)
+		assert.NoError(t, err)
+		assert.Equal(t, "FIFO任务1", dequeued.Data, "应该出队任务1")
 
-	// 出队一个任务后，Peek的结果应该改变
-	_, err = queue.Dequeue(ctx, queueName, QueueTypeFIFO)
-	assert.NoError(t, err)
+		items, err = queue.Peek(ctx, queueName, QueueTypeFIFO, 2)
+		assert.NoError(t, err)
+		assert.Len(t, items, 2)
+		assert.Equal(t, "FIFO任务2", items[0].Data, "现在第一个应该是任务2")
+		assert.Equal(t, "FIFO任务3", items[1].Data, "现在第二个应该是任务3")
 
-	items, err = queue.Peek(ctx, queueName, QueueTypeFIFO, 2)
-	assert.NoError(t, err)
-	assert.Len(t, items, 2, "出队后Peek应该返回剩余的2个任务")
+		queue.Clear(ctx, queueName, QueueTypeFIFO)
+	})
+
+	t.Run("LIFO Peek基本功能", func(t *testing.T) {
+		queueName := "test_peek_lifo"
+
+		// 入队任务
+		for i := 1; i <= 5; i++ {
+			item := &QueueItem{Data: fmt.Sprintf("LIFO任务%d", i)}
+			err := queue.Enqueue(ctx, queueName, QueueTypeLIFO, item)
+			assert.NoError(t, err)
+		}
+
+		// Peek前2个任务（应该是最后入队的）
+		items, err := queue.Peek(ctx, queueName, QueueTypeLIFO, 2)
+		assert.NoError(t, err)
+		assert.Len(t, items, 2, "应该返回2个任务")
+		assert.Equal(t, "LIFO任务5", items[0].Data, "LIFO第一个应该是最后入队的任务5")
+		assert.Equal(t, "LIFO任务4", items[1].Data, "LIFO第二个应该是任务4")
+
+		// 队列长度不变
+		length, err := queue.Length(ctx, queueName, QueueTypeLIFO)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(5), length, "Peek不应改变队列长度")
+
+		// 出队一个后再Peek
+		dequeued, err := queue.Dequeue(ctx, queueName, QueueTypeLIFO)
+		assert.NoError(t, err)
+		assert.Equal(t, "LIFO任务5", dequeued.Data, "LIFO应该出队最后入队的任务5")
+
+		items, err = queue.Peek(ctx, queueName, QueueTypeLIFO, 2)
+		assert.NoError(t, err)
+		assert.Len(t, items, 2)
+		assert.Equal(t, "LIFO任务4", items[0].Data, "LIFO现在第一个应该是任务4")
+		assert.Equal(t, "LIFO任务3", items[1].Data, "LIFO现在第二个应该是任务3")
+
+		queue.Clear(ctx, queueName, QueueTypeLIFO)
+	})
+
+	t.Run("Priority Peek优先级顺序", func(t *testing.T) {
+		queueName := "test_peek_priority"
+
+		// 乱序入队不同优先级的任务
+		items := []*QueueItem{
+			{Data: "低优先级", Priority: 1.0},
+			{Data: "高优先级", Priority: 10.0},
+			{Data: "中优先级", Priority: 5.0},
+			{Data: "超高优先级", Priority: 20.0},
+			{Data: "极低优先级", Priority: 0.5},
+		}
+		for _, item := range items {
+			err := queue.Enqueue(ctx, queueName, QueueTypePriority, item)
+			assert.NoError(t, err)
+		}
+
+		// Peek前3个（应该按优先级从高到低）
+		peeked, err := queue.Peek(ctx, queueName, QueueTypePriority, 3)
+		assert.NoError(t, err)
+		assert.Len(t, peeked, 3)
+		assert.Equal(t, "超高优先级", peeked[0].Data, "第一个应该是优先级最高的")
+		assert.Equal(t, "高优先级", peeked[1].Data, "第二个应该是优先级第二的")
+		assert.Equal(t, "中优先级", peeked[2].Data, "第三个应该是优先级第三的")
+
+		queue.Clear(ctx, queueName, QueueTypePriority)
+	})
+
+	t.Run("Delayed Peek延时队列", func(t *testing.T) {
+		queueName := "test_peek_delayed"
+
+		// 入队不同延时的任务
+		items := []*QueueItem{
+			{Data: "延时5秒", DelayTime: 5},
+			{Data: "立即执行", DelayTime: 0},
+			{Data: "延时2秒", DelayTime: 2},
+		}
+		for _, item := range items {
+			err := queue.Enqueue(ctx, queueName, QueueTypeDelayed, item)
+			assert.NoError(t, err)
+		}
+
+		// Peek应该按执行时间排序
+		peeked, err := queue.Peek(ctx, queueName, QueueTypeDelayed, 3)
+		assert.NoError(t, err)
+		assert.Len(t, peeked, 3)
+		assert.Equal(t, "立即执行", peeked[0].Data, "第一个应该是延时最短的")
+
+		queue.Clear(ctx, queueName, QueueTypeDelayed)
+	})
+
+	t.Run("Peek空队列", func(t *testing.T) {
+		queueName := "test_peek_empty"
+
+		items, err := queue.Peek(ctx, queueName, QueueTypeFIFO, 5)
+		assert.NoError(t, err)
+		assert.Empty(t, items, "空队列Peek应该返回空数组")
+	})
+
+	t.Run("Peek数量超过队列长度", func(t *testing.T) {
+		queueName := "test_peek_overflow"
+
+		// 只入队2个任务
+		for i := 1; i <= 2; i++ {
+			item := &QueueItem{Data: fmt.Sprintf("任务%d", i)}
+			err := queue.Enqueue(ctx, queueName, QueueTypeFIFO, item)
+			assert.NoError(t, err)
+		}
+
+		// 尝试Peek 10个
+		items, err := queue.Peek(ctx, queueName, QueueTypeFIFO, 10)
+		assert.NoError(t, err)
+		assert.Len(t, items, 2, "应该只返回实际存在的2个任务")
+
+		queue.Clear(ctx, queueName, QueueTypeFIFO)
+	})
+
+	t.Run("Peek单个任务", func(t *testing.T) {
+		queueName := "test_peek_single"
+
+		for i := 1; i <= 3; i++ {
+			item := &QueueItem{Data: fmt.Sprintf("任务%d", i)}
+			err := queue.Enqueue(ctx, queueName, QueueTypeFIFO, item)
+			assert.NoError(t, err)
+		}
+
+		// Peek 1个任务
+		items, err := queue.Peek(ctx, queueName, QueueTypeFIFO, 1)
+		assert.NoError(t, err)
+		assert.Len(t, items, 1)
+		assert.Equal(t, "任务1", items[0].Data, "应该返回第一个任务")
+
+		queue.Clear(ctx, queueName, QueueTypeFIFO)
+	})
+
+	t.Run("连续Peek保持一致性", func(t *testing.T) {
+		queueName := "test_peek_consistency"
+
+		for i := 1; i <= 4; i++ {
+			item := &QueueItem{Data: fmt.Sprintf("任务%d", i)}
+			err := queue.Enqueue(ctx, queueName, QueueTypeFIFO, item)
+			assert.NoError(t, err)
+		}
+
+		// 多次Peek应该返回相同结果
+		items1, err := queue.Peek(ctx, queueName, QueueTypeFIFO, 2)
+		assert.NoError(t, err)
+
+		items2, err := queue.Peek(ctx, queueName, QueueTypeFIFO, 2)
+		assert.NoError(t, err)
+
+		assert.Equal(t, items1[0].Data, items2[0].Data, "多次Peek应该返回相同的第一个任务")
+		assert.Equal(t, items1[1].Data, items2[1].Data, "多次Peek应该返回相同的第二个任务")
+
+		queue.Clear(ctx, queueName, QueueTypeFIFO)
+	})
 }
 
 func TestQueueHandler_Contains(t *testing.T) {

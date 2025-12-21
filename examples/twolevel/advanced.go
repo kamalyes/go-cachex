@@ -62,7 +62,7 @@ func demonstrateIntelligentTiering() {
 	l1l2 := cachex.NewTwoLevelHandler(l1Fast, l2Medium, true)
 	defer l1l2.Close()
 
-	threeLevel := cachex.NewTwoLevelHandler(l1l2, l3Slow, false) // L3异步写入
+	threeLevel := cachex.NewTwoLevelHandler(l1l2, l3Slow, false)
 	defer threeLevel.Close()
 
 	fmt.Printf("  L1: %d 个条目 (超快速访问)\n", 10)
@@ -147,7 +147,7 @@ func demonstrateDynamicCapacity() {
 	fmt.Println("2. 动态容量调整")
 	fmt.Println("--------------")
 
-		fmt.Println("根据系统资源和负载动态调整缓存容量:")
+	fmt.Println("根据系统资源和负载动态调整缓存容量:")
 
 	// 获取系统信息
 	numCPU := runtime.NumCPU()
@@ -173,9 +173,9 @@ func demonstrateDynamicCapacity() {
 
 	// 模拟负载变化
 	loadScenarios := []struct {
-		name         string
-		operations   int
-		description  string
+		name        string
+		operations  int
+		description string
 	}{
 		{"低负载", baseCapacity / 2, "正常运行状态"},
 		{"中等负载", baseCapacity, "业务高峰期"},
@@ -184,40 +184,40 @@ func demonstrateDynamicCapacity() {
 
 	for i, scenario := range loadScenarios {
 		fmt.Printf("\n%d) %s测试 (%s):\n", i+1, scenario.name, scenario.description)
-		
+
 		start := time.Now()
 		successCount := 0
-		
+
 		// 执行负载测试
 		for j := 0; j < scenario.operations; j++ {
 			key := []byte(fmt.Sprintf("%s_key_%d", scenario.name, j))
 			value := []byte(fmt.Sprintf("data_%d", j))
-			
+
 			if err := twoLevel.Set(key, value); err == nil {
 				successCount++
 			}
 		}
-		
+
 		elapsed := time.Since(start)
-		
+
 		fmt.Printf("   操作数: %d\n", scenario.operations)
 		fmt.Printf("   成功数: %d\n", successCount)
 		fmt.Printf("   耗时: %v\n", elapsed)
-		fmt.Printf("   吞吐量: %.0f ops/sec\n", 
+		fmt.Printf("   吞吐量: %.0f ops/sec\n",
 			float64(successCount)/elapsed.Seconds())
-		
+
 		// 模拟容量调整建议
 		if scenario.operations > baseCapacity {
 			recommendedL1 := l1Cap * 2
 			recommendedL2 := l2Cap * 2
-			fmt.Printf("   💡 建议: 考虑扩容 L1->%d, L2->%d\n", 
+			fmt.Printf("   💡 建议: 考虑扩容 L1->%d, L2->%d\n",
 				recommendedL1, recommendedL2)
 		}
 	}
 
 	// 自动调整策略演示
 	fmt.Println("\n自动调整策略:")
-	
+
 	// 监控指标
 	type CacheMetrics struct {
 		hitRate     float64
@@ -349,9 +349,9 @@ func demonstrateConcurrencyOptimization() {
 
 		fmt.Printf("   写入测试:\n")
 		fmt.Printf("     耗时: %v\n", writeTime)
-		fmt.Printf("     吞吐量: %.0f ops/sec\n", 
+		fmt.Printf("     吞吐量: %.0f ops/sec\n",
 			float64(totalOps)/writeTime.Seconds())
-		fmt.Printf("     错误数: %d (%.2f%%)\n", 
+		fmt.Printf("     错误数: %d (%.2f%%)\n",
 			writeErrorCount, float64(writeErrorCount)/float64(totalOps)*100)
 
 		// 并发读取测试
@@ -382,7 +382,7 @@ func demonstrateConcurrencyOptimization() {
 
 		fmt.Printf("   读取测试:\n")
 		fmt.Printf("     耗时: %v\n", readTime)
-		fmt.Printf("     吞吐量: %.0f ops/sec\n", 
+		fmt.Printf("     吞吐量: %.0f ops/sec\n",
 			float64(totalOps)/readTime.Seconds())
 		fmt.Printf("     命中率: %.1f%%\n", hitRate)
 		fmt.Printf("     错误数: %d\n", readErrorCount)
@@ -415,8 +415,8 @@ func demonstrateCacheWarmup() {
 
 	// 1. 预定义的热点数据
 	hotData := []struct {
-		key   string
-		value string
+		key      string
+		value    string
 		priority int // 优先级：1-高，2-中，3-低
 	}{
 		{"config:app", `{"version":"1.0","debug":false}`, 1},
@@ -430,7 +430,7 @@ func demonstrateCacheWarmup() {
 	}
 
 	fmt.Printf("\n1) 预热阶段 - 加载 %d 个预定义热点数据:\n", len(hotData))
-	
+
 	// 按优先级预热
 	for priority := 1; priority <= 3; priority++ {
 		fmt.Printf("   优先级 %d 数据:\n", priority)
@@ -448,30 +448,30 @@ func demonstrateCacheWarmup() {
 
 	// 2. 热点数据识别和自适应
 	fmt.Printf("\n2) 模拟用户访问，识别热点数据:\n")
-	
+
 	// 模拟访问统计
 	accessCount := make(map[string]int)
-	
+
 	// 随机访问模式
 	accessPatterns := []struct {
 		key    string
 		weight int // 访问权重
 	}{
-		{"config:app", 50},    // 非常频繁
-		{"user:admin", 30},    // 频繁
+		{"config:app", 50},      // 非常频繁
+		{"user:admin", 30},      // 频繁
 		{"template:header", 20}, // 较频繁
-		{"config:db", 15},     // 一般
+		{"config:db", 15},       // 一般
 		{"template:footer", 10}, // 较少
-		{"cache:stats", 5},    // 很少
+		{"cache:stats", 5},      // 很少
 	}
-	
+
 	// 执行访问测试
 	totalAccess := 200
 	for i := 0; i < totalAccess; i++ {
 		// 按权重随机选择
 		totalWeight := 130 // 所有权重之和
 		r := rand.Intn(totalWeight)
-		
+
 		var selectedKey string
 		currentWeight := 0
 		for _, pattern := range accessPatterns {
@@ -481,13 +481,13 @@ func demonstrateCacheWarmup() {
 				break
 			}
 		}
-		
+
 		if selectedKey != "" {
 			accessCount[selectedKey]++
 			cache.Get([]byte(selectedKey))
 		}
 	}
-	
+
 	// 显示访问统计
 	fmt.Printf("   访问统计 (总计 %d 次):\n", totalAccess)
 	for key, count := range accessCount {
@@ -497,11 +497,11 @@ func demonstrateCacheWarmup() {
 
 	// 3. 动态热点提升策略
 	fmt.Printf("\n3) 动态热点提升策略:\n")
-	
+
 	// 识别超级热点 (访问频率 > 15%)
 	superHotThreshold := totalAccess * 15 / 100
 	fmt.Printf("   超级热点阈值: %d 次访问\n", superHotThreshold)
-	
+
 	for key, count := range accessCount {
 		if count > superHotThreshold {
 			fmt.Printf("   🔥 识别超级热点: %s (%d次访问)\n", key, count)
@@ -514,7 +514,7 @@ func demonstrateCacheWarmup() {
 
 	// 4. 缓存刷新策略
 	fmt.Printf("\n4) 智能缓存刷新策略:\n")
-	
+
 	// 模拟数据更新场景
 	updateScenarios := []struct {
 		key      string
@@ -525,12 +525,12 @@ func demonstrateCacheWarmup() {
 		{"user:admin", "延迟刷新", "用户数据可以容忍短暂延迟"},
 		{"template:header", "定时刷新", "模板数据定期更新"},
 	}
-	
+
 	for _, scenario := range updateScenarios {
 		fmt.Printf("   数据: %s\n", scenario.key)
 		fmt.Printf("     策略: %s\n", scenario.strategy)
 		fmt.Printf("     说明: %s\n", scenario.desc)
-		
+
 		// 模拟刷新操作
 		newValue := []byte(fmt.Sprintf("updated_%s_%d", scenario.key, time.Now().Unix()))
 		err := cache.Set([]byte(scenario.key), newValue)
@@ -567,20 +567,20 @@ func demonstrateFaultTolerance() {
 
 	// 1. 正常运行状态
 	fmt.Printf("\n1) 正常运行状态测试:\n")
-	
+
 	normalData := map[string]string{
 		"service:config": "正常配置数据",
 		"user:session":   "用户会话数据",
 		"api:token":      "API访问令牌",
 	}
-	
+
 	for key, value := range normalData {
 		err := cache.Set([]byte(key), []byte(value))
 		if err == nil {
 			fmt.Printf("   ✓ 写入成功: %s\n", key)
 		}
 	}
-	
+
 	// 验证读取
 	successReads := 0
 	for key := range normalData {
@@ -588,14 +588,14 @@ func demonstrateFaultTolerance() {
 			successReads++
 		}
 	}
-	fmt.Printf("   读取成功率: %d/%d (%.1f%%)\n", 
-		successReads, len(normalData), 
+	fmt.Printf("   读取成功率: %d/%d (%.1f%%)\n",
+		successReads, len(normalData),
 		float64(successReads)/float64(len(normalData))*100)
 
 	// 2. L1 缓存故障模拟
 	fmt.Printf("\n2) L1 缓存故障模拟:\n")
 	fmt.Printf("   (模拟 L1 缓存不可用，数据回退到 L2)\n")
-	
+
 	// 在实际场景中，L1可能因为内存不足、网络分区等原因不可用
 	// 这里我们通过直接访问 L2 来模拟这种情况
 	l2ReadSuccess := 0
@@ -611,24 +611,24 @@ func demonstrateFaultTolerance() {
 
 	// 3. 部分数据损坏场景
 	fmt.Printf("\n3) 数据一致性检查和修复:\n")
-	
+
 	// 模拟数据不一致
 	inconsistentKey := []byte("test:inconsistent")
 	l1.Set(inconsistentKey, []byte("L1版本数据"))
 	l2.Set(inconsistentKey, []byte("L2版本数据"))
-	
+
 	fmt.Printf("   检测到数据不一致: test:inconsistent\n")
-	
+
 	// 通过 TwoLevel 读取 (会优先返回 L1 的数据)
 	if data, err := cache.Get(inconsistentKey); err == nil {
 		fmt.Printf("   当前读取结果: %s\n", string(data))
 	}
-	
+
 	// 修复策略：强制同步
 	correctData := []byte("修复后的正确数据")
 	if err := cache.Set(inconsistentKey, correctData); err == nil {
 		fmt.Printf("   ✓ 数据修复完成\n")
-		
+
 		// 验证修复
 		if data, err := cache.Get(inconsistentKey); err == nil {
 			fmt.Printf("   验证修复结果: %s\n", string(data))
@@ -637,61 +637,61 @@ func demonstrateFaultTolerance() {
 
 	// 4. 性能降级策略
 	fmt.Printf("\n4) 性能降级策略:\n")
-	
+
 	// 模拟高负载下的降级
 	highLoadThreshold := 1000 // 假设的高负载阈值
 	currentLoad := 1200       // 当前负载超过阈值
-	
+
 	fmt.Printf("   当前系统负载: %d (阈值: %d)\n", currentLoad, highLoadThreshold)
-	
+
 	if currentLoad > highLoadThreshold {
 		fmt.Printf("   🚨 系统负载过高，启动降级策略:\n")
-		
+
 		// 降级策略1：禁用L1，只使用L2
 		fmt.Printf("     • 策略1: 暂停L1缓存，减少内存压力\n")
-		
+
 		// 降级策略2：增加缓存过期时间，减少更新频率
 		fmt.Printf("     • 策略2: 延长缓存TTL，减少数据库压力\n")
-		
+
 		// 降级策略3：限制缓存大小
 		fmt.Printf("     • 策略3: 临时减少缓存容量\n")
-		
+
 		// 模拟降级后的性能
 		degradedSuccessCount := 0
 		testCount := 10
-		
+
 		for i := 0; i < testCount; i++ {
 			key := []byte(fmt.Sprintf("degraded_test_%d", i))
 			value := []byte("降级模式测试数据")
-			
+
 			// 在降级模式下，可能只写入L2
 			if err := l2.Set(key, value); err == nil {
 				degradedSuccessCount++
 			}
 		}
-		
-		fmt.Printf("     降级模式成功率: %d/%d (%.1f%%)\n", 
+
+		fmt.Printf("     降级模式成功率: %d/%d (%.1f%%)\n",
 			degradedSuccessCount, testCount,
 			float64(degradedSuccessCount)/float64(testCount)*100)
 	}
 
 	// 5. 自动恢复机制
 	fmt.Printf("\n5) 自动恢复机制:\n")
-	
+
 	// 模拟系统负载恢复
 	currentLoad = 800 // 负载降低
 	fmt.Printf("   系统负载降低至: %d\n", currentLoad)
-	
+
 	if currentLoad <= highLoadThreshold {
 		fmt.Printf("   ✓ 负载恢复正常，启动自动恢复流程:\n")
 		fmt.Printf("     • 重启L1缓存服务\n")
 		fmt.Printf("     • 恢复正常TTL设置\n")
 		fmt.Printf("     • 重新同步缓存数据\n")
-		
+
 		// 验证恢复后的正常功能
 		recoveryTest := []byte("recovery_test")
 		recoveryData := []byte("恢复测试数据")
-		
+
 		if err := cache.Set(recoveryTest, recoveryData); err == nil {
 			if data, err := cache.Get(recoveryTest); err == nil {
 				fmt.Printf("     ✓ 系统功能恢复正常: %s\n", string(data))
@@ -760,7 +760,7 @@ func demonstrateMonitoring() {
 
 	for _, pattern := range accessPatterns {
 		fmt.Printf("模拟 %s (%s):\n", pattern.name, pattern.desc)
-		
+
 		l1HitsBefore := int64(0)
 		l2HitsBefore := int64(0)
 		missesBefore := int64(0)
@@ -780,7 +780,7 @@ func demonstrateMonitoring() {
 				atomic.AddInt64(&stats.L1Hits, 1)
 			} else {
 				atomic.AddInt64(&stats.L1Misses, 1)
-				
+
 				// L1未命中，检查L2
 				if _, err := l2.Get(key); err == nil {
 					atomic.AddInt64(&stats.L2Hits, 1)
@@ -804,7 +804,7 @@ func demonstrateMonitoring() {
 		currentL1Hits := atomic.LoadInt64(&stats.L1Hits) - l1HitsBefore
 		currentL2Hits := atomic.LoadInt64(&stats.L2Hits) - l2HitsBefore
 		currentMisses := atomic.LoadInt64(&stats.L2Misses) - missesBefore
-		
+
 		totalCurrent := int64(pattern.accesses)
 		l1HitRate := float64(currentL1Hits) / float64(totalCurrent) * 100
 		l2HitRate := float64(currentL2Hits) / float64(totalCurrent) * 100
@@ -818,7 +818,7 @@ func demonstrateMonitoring() {
 
 	// 综合统计报告
 	fmt.Printf("=== 综合统计报告 ===\n")
-	
+
 	totalOps := atomic.LoadInt64(&stats.TotalOps)
 	l1Hits := atomic.LoadInt64(&stats.L1Hits)
 	l1Misses := atomic.LoadInt64(&stats.L1Misses)
@@ -842,7 +842,7 @@ func demonstrateMonitoring() {
 
 	// 性能指标分析
 	fmt.Printf("\n=== 性能分析 ===\n")
-	
+
 	if overallHitRate >= 95 {
 		fmt.Printf("🟢 优秀: 整体命中率 %.1f%% - 缓存效果极佳\n", overallHitRate)
 	} else if overallHitRate >= 85 {
@@ -863,15 +863,15 @@ func demonstrateMonitoring() {
 	// 趋势预测
 	fmt.Printf("\n=== 趋势分析 ===\n")
 	fmt.Printf("基于当前访问模式预测:\n")
-	
+
 	if l1HitRate > 50 {
 		fmt.Printf("  • 热点数据访问明显，L1缓存发挥良好作用\n")
 	}
-	
+
 	if float64(l2Hits)/float64(l1Misses) > 0.8 {
 		fmt.Printf("  • L2有效承接L1溢出，两级结构合理\n")
 	}
-	
+
 	if promotions > 0 {
 		fmt.Printf("  • 数据提升机制工作正常，自适应缓存生效\n")
 	}
@@ -904,9 +904,9 @@ func demonstrateComplexScenarios() {
 		"用户会话": {
 			cache: func() cachex.Handler {
 				// 用户会话：需要TTL支持
-				l1 := cachex.NewLRUHandler(200)                                 // 活跃用户
+				l1 := cachex.NewLRUHandler(200)                         // 活跃用户
 				l2 := cachex.NewExpiringHandler(100 * time.Millisecond) // 会话自动过期
-				return cachex.NewTwoLevelHandler(l1, l2, false) // 异步写入L2
+				return cachex.NewTwoLevelHandler(l1, l2, false)         // 异步写入L2
 			}(),
 			description: "活跃用户快速访问 + 会话自动过期",
 		},
@@ -937,7 +937,7 @@ func demonstrateComplexScenarios() {
 	fmt.Printf("1) 用户登录 (用户会话缓存):\n")
 	sessionCache := scenarios["用户会话"].cache
 	userSession := []byte(`{"userId":12345,"loginTime":"2024-01-01T10:00:00Z","role":"premium"}`)
-	
+
 	err := sessionCache.Set([]byte("session:user12345"), userSession)
 	if err == nil {
 		fmt.Printf("   ✓ 用户会话已缓存\n")
@@ -946,7 +946,7 @@ func demonstrateComplexScenarios() {
 	// 2. 浏览商品
 	fmt.Printf("\n2) 浏览商品信息 (商品缓存):\n")
 	productCache := scenarios["商品信息"].cache
-	
+
 	products := []struct {
 		id   string
 		info string
@@ -959,7 +959,7 @@ func demonstrateComplexScenarios() {
 	for _, prod := range products {
 		key := []byte("product:" + prod.id)
 		value := []byte(prod.info)
-		
+
 		err := productCache.Set(key, value)
 		if err == nil {
 			fmt.Printf("   ✓ 商品信息已缓存: %s\n", prod.id)
@@ -969,13 +969,13 @@ func demonstrateComplexScenarios() {
 	// 3. 获取个性化推荐
 	fmt.Printf("\n3) 获取个性化推荐 (推荐缓存):\n")
 	recommendCache := scenarios["推荐算法"].cache
-	
+
 	// 模拟为不同用户生成推荐
 	users := []string{"user12345", "user67890", "user11111"}
 	for _, user := range users {
 		recommendKey := []byte("recommend:" + user)
 		recommendData := []byte(fmt.Sprintf(`{"user":"%s","items":["prod001","prod003"],"algorithm":"collaborative","score":0.85}`, user))
-		
+
 		err := recommendCache.Set(recommendKey, recommendData)
 		if err == nil {
 			fmt.Printf("   ✓ 推荐结果已缓存: %s\n", user)
@@ -984,7 +984,7 @@ func demonstrateComplexScenarios() {
 
 	// 4. 高并发访问测试
 	fmt.Printf("\n4) 高并发访问测试:\n")
-	
+
 	var wg sync.WaitGroup
 	testResults := make(map[string]int)
 	var resultMutex sync.Mutex
@@ -994,7 +994,7 @@ func demonstrateComplexScenarios() {
 		wg.Add(1)
 		go func(moduleName string, cache cachex.Handler) {
 			defer wg.Done()
-			
+
 			successCount := 0
 			testCount := 100
 
@@ -1035,12 +1035,12 @@ func demonstrateComplexScenarios() {
 
 	// 5. 缓存一致性验证
 	fmt.Printf("\n5) 缓存一致性验证:\n")
-	
+
 	// 模拟商品库存更新
 	fmt.Printf("   模拟商品库存更新...\n")
 	productKey := []byte("product:prod001")
 	updatedProduct := []byte(`{"name":"iPhone 15","price":7999,"stock":45}`) // 库存减少
-	
+
 	err = productCache.Set(productKey, updatedProduct)
 	if err == nil {
 		if data, err := productCache.Get(productKey); err == nil {
@@ -1050,12 +1050,12 @@ func demonstrateComplexScenarios() {
 
 	// 6. 性能监控报告
 	fmt.Printf("\n6) 系统性能概览:\n")
-	
+
 	performanceMetrics := []struct {
-		module    string
-		metric    string
-		value     string
-		status    string
+		module string
+		metric string
+		value  string
+		status string
 	}{
 		{"商品信息", "平均响应时间", "2.3ms", "正常"},
 		{"商品信息", "命中率", "94.5%", "优秀"},
@@ -1070,7 +1070,7 @@ func demonstrateComplexScenarios() {
 		if metric.status == "可优化" {
 			statusIcon = "⚠"
 		}
-		fmt.Printf("   %s %s - %s: %s (%s)\n", 
+		fmt.Printf("   %s %s - %s: %s (%s)\n",
 			statusIcon, metric.module, metric.metric, metric.value, metric.status)
 	}
 

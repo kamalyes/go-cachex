@@ -19,6 +19,7 @@
 package cachex
 
 import (
+	"context"
 	"hash/fnv"
 	"sync"
 	"sync/atomic"
@@ -241,13 +242,134 @@ func (s *lruShard) isExpired(expiry int64) bool {
 	return expiry > 0 && fastNow() > expiry
 }
 
-// Set 实现 Handler.Set
-func (h *LRUOptimizedHandler) Set(key, value []byte) error {
-	return h.SetWithTTL(key, value, -1)
+// ========== 简化版方法（不带context） ==========
+
+// Get 获取缓存值
+func (h *LRUOptimizedHandler) Get(key []byte) ([]byte, error) {
+	return h.GetWithCtx(context.Background(), key)
 }
 
-// SetWithTTL 实现 Handler.SetWithTTL
+// GetTTL 获取键的剩余TTL
+func (h *LRUOptimizedHandler) GetTTL(key []byte) (time.Duration, error) {
+	return h.GetTTLWithCtx(context.Background(), key)
+}
+
+// Set 设置缓存值
+func (h *LRUOptimizedHandler) Set(key, value []byte) error {
+	return h.SetWithCtx(context.Background(), key, value)
+}
+
 func (h *LRUOptimizedHandler) SetWithTTL(key, value []byte, ttl time.Duration) error {
+	return h.SetWithTTLAndCtx(context.Background(), key, value, ttl)
+}
+
+func (h *LRUOptimizedHandler) Del(key []byte) error {
+	return h.DelWithCtx(context.Background(), key)
+}
+
+func (h *LRUOptimizedHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
+	return h.BatchGetWithCtx(context.Background(), keys)
+}
+
+// ========== 完整版方法（带context） ==========
+
+// GetWithCtx 获取缓存值（支持context）
+func (h *LRUOptimizedHandler) GetWithCtx(ctx context.Context, key []byte) ([]byte, error) {
+	if key == nil {
+		return nil, ErrInvalidKey
+	}
+	if atomic.LoadInt32(&h.closed) != 0 {
+		return nil, ErrClosed
+	}
+
+	shard := h.getShard(key)
+	sk := zeroAllocByteToString(key)
+
+	// 先用读锁查找
+	shard.mu.RLock()
+	entry, exists := shard.cache[sk]
+	if !exists {
+		shard.mu.RUnlock()
+		atomic.AddInt64(&shard.misses, 1)
+		return nil, ErrNotFound
+	}
+
+	// 快速检查过期
+	if shard.isExpired(entry.expiry) {
+		shard.mu.RUnlock()
+
+		// 升级到写锁进行清理
+		shard.mu.Lock()
+		if entry, exists := shard.cache[sk]; exists && shard.isExpired(entry.expiry) {
+			delete(shard.cache, sk)
+			shard.removeEntry(entry)
+			atomic.AddInt32(&shard.size, -1)
+			shard.putEntry(entry)
+		}
+		shard.mu.Unlock()
+		atomic.AddInt64(&shard.misses, 1)
+		return nil, ErrNotFound
+	}
+
+	// 复制数据
+	result := make([]byte, len(entry.value))
+	copy(result, entry.value)
+	shard.mu.RUnlock()
+
+	// 升级到写锁更新LRU位置
+	shard.mu.Lock()
+	if entry, exists := shard.cache[sk]; exists && !shard.isExpired(entry.expiry) {
+		shard.moveToHead(entry)
+	}
+	shard.mu.Unlock()
+
+	atomic.AddInt64(&shard.hits, 1)
+	return result, nil
+}
+
+// GetTTLWithCtx 获取键的剩余TTL（支持context）
+func (h *LRUOptimizedHandler) GetTTLWithCtx(ctx context.Context, key []byte) (time.Duration, error) {
+	if key == nil {
+		return 0, ErrInvalidKey
+	}
+	if atomic.LoadInt32(&h.closed) != 0 {
+		return 0, ErrClosed
+	}
+
+	shard := h.getShard(key)
+	sk := zeroAllocByteToString(key)
+
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+
+	entry, exists := shard.cache[sk]
+	if !exists {
+		return 0, ErrNotFound
+	}
+
+	if shard.isExpired(entry.expiry) {
+		return 0, ErrNotFound
+	}
+
+	if entry.expiry == 0 {
+		return 0, nil // 永不过期
+	}
+
+	remaining := entry.expiry - fastNow()
+	if remaining <= 0 {
+		return 0, ErrNotFound
+	}
+
+	return time.Duration(remaining), nil
+}
+
+// SetWithCtx 设置缓存（支持context）
+func (h *LRUOptimizedHandler) SetWithCtx(ctx context.Context, key, value []byte) error {
+	return h.SetWithTTLAndCtx(ctx, key, value, -1)
+}
+
+// SetWithTTLAndCtx 设置带TTL的缓存（支持context）
+func (h *LRUOptimizedHandler) SetWithTTLAndCtx(ctx context.Context, key, value []byte, ttl time.Duration) error {
 	if key == nil {
 		return ErrInvalidKey
 	}
@@ -314,98 +436,8 @@ func (h *LRUOptimizedHandler) SetWithTTL(key, value []byte, ttl time.Duration) e
 	return nil
 }
 
-// Get 实现 Handler.Get
-func (h *LRUOptimizedHandler) Get(key []byte) ([]byte, error) {
-	if key == nil {
-		return nil, ErrInvalidKey
-	}
-	if atomic.LoadInt32(&h.closed) != 0 {
-		return nil, ErrClosed
-	}
-
-	shard := h.getShard(key)
-	sk := zeroAllocByteToString(key)
-
-	// 先用读锁查找
-	shard.mu.RLock()
-	entry, exists := shard.cache[sk]
-	if !exists {
-		shard.mu.RUnlock()
-		atomic.AddInt64(&shard.misses, 1)
-		return nil, ErrNotFound
-	}
-
-	// 快速检查过期
-	if shard.isExpired(entry.expiry) {
-		shard.mu.RUnlock()
-
-		// 升级到写锁进行清理
-		shard.mu.Lock()
-		if entry, exists := shard.cache[sk]; exists && shard.isExpired(entry.expiry) {
-			delete(shard.cache, sk)
-			shard.removeEntry(entry)
-			atomic.AddInt32(&shard.size, -1)
-			shard.putEntry(entry)
-		}
-		shard.mu.Unlock()
-		atomic.AddInt64(&shard.misses, 1)
-		return nil, ErrNotFound
-	}
-
-	// 复制数据
-	result := make([]byte, len(entry.value))
-	copy(result, entry.value)
-	shard.mu.RUnlock()
-
-	// 升级到写锁更新LRU位置
-	shard.mu.Lock()
-	if entry, exists := shard.cache[sk]; exists && !shard.isExpired(entry.expiry) {
-		shard.moveToHead(entry)
-	}
-	shard.mu.Unlock()
-
-	atomic.AddInt64(&shard.hits, 1)
-	return result, nil
-}
-
-// GetTTL 实现 Handler.GetTTL
-func (h *LRUOptimizedHandler) GetTTL(key []byte) (time.Duration, error) {
-	if key == nil {
-		return 0, ErrInvalidKey
-	}
-	if atomic.LoadInt32(&h.closed) != 0 {
-		return 0, ErrClosed
-	}
-
-	shard := h.getShard(key)
-	sk := zeroAllocByteToString(key)
-
-	shard.mu.RLock()
-	defer shard.mu.RUnlock()
-
-	entry, exists := shard.cache[sk]
-	if !exists {
-		return 0, ErrNotFound
-	}
-
-	if shard.isExpired(entry.expiry) {
-		return 0, ErrNotFound
-	}
-
-	if entry.expiry == 0 {
-		return 0, nil // 永不过期
-	}
-
-	remaining := entry.expiry - fastNow()
-	if remaining <= 0 {
-		return 0, ErrNotFound
-	}
-
-	return time.Duration(remaining), nil
-}
-
-// Del 实现 Handler.Del
-func (h *LRUOptimizedHandler) Del(key []byte) error {
+// DelWithCtx 实现Handler.Del
+func (h *LRUOptimizedHandler) DelWithCtx(ctx context.Context, key []byte) error {
 	if key == nil {
 		return ErrInvalidKey
 	}
@@ -450,8 +482,8 @@ func (h *LRUOptimizedHandler) Close() error {
 	return nil
 }
 
-// BatchGet 批量获取，减少锁开销
-func (h *LRUOptimizedHandler) BatchGet(keys [][]byte) ([][]byte, []error) {
+// BatchGetWithCtx 批量获取，减少锁开销
+func (h *LRUOptimizedHandler) BatchGetWithCtx(ctx context.Context, keys [][]byte) ([][]byte, []error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
@@ -567,15 +599,27 @@ func (h *LRUOptimizedHandler) Stats() map[string]interface{} {
 }
 
 // GetOrCompute 获取缓存值，如果不存在则计算并设置
-// GetOrCompute 获取或计算值(使用singleflight防止并发重复计算)
 func (h *LRUOptimizedHandler) GetOrCompute(key []byte, ttl time.Duration, loader func() ([]byte, error)) ([]byte, error) {
+	ctxLoader := func(context.Context) ([]byte, error) { return loader() }
+	return h.GetOrComputeWithCtx(context.Background(), key, ttl, ctxLoader)
+}
+
+// GetOrComputeWithCtx 获取或计算值(使用singleflight防止并发重复计算，支持context)
+func (h *LRUOptimizedHandler) GetOrComputeWithCtx(ctx context.Context, key []byte, ttl time.Duration, loader func(context.Context) ([]byte, error)) ([]byte, error) {
 	if len(key) == 0 {
 		return nil, ErrInvalidKey
 	}
 
 	// 首先尝试获取
-	if value, err := h.Get(key); err == nil {
+	if value, err := h.GetWithCtx(ctx, key); err == nil {
 		return value, nil
+	}
+
+	// 检查context是否已取消
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
 	}
 
 	// 使用singleflight模式防止并发重复计算
@@ -623,7 +667,7 @@ func (h *LRUOptimizedHandler) GetOrCompute(key []byte, ttl time.Duration, loader
 	}()
 
 	// 再次检查缓存(double-check)
-	if value, err := h.Get(key); err == nil {
+	if value, err := h.GetWithCtx(ctx, key); err == nil {
 		call.val = value
 		// 返回拷贝
 		result := make([]byte, len(value))
@@ -631,8 +675,16 @@ func (h *LRUOptimizedHandler) GetOrCompute(key []byte, ttl time.Duration, loader
 		return result, nil
 	}
 
+	// 再次检查context
+	select {
+	case <-ctx.Done():
+		call.err = ctx.Err()
+		return nil, ctx.Err()
+	default:
+	}
+
 	// 缓存未命中，调用loader
-	value, err := loader()
+	value, err := loader(ctx)
 	if err != nil {
 		call.err = err
 		return nil, err
@@ -640,9 +692,9 @@ func (h *LRUOptimizedHandler) GetOrCompute(key []byte, ttl time.Duration, loader
 
 	// 将结果写入缓存
 	if ttl <= 0 {
-		h.Set(key, value)
+		h.SetWithCtx(ctx, key, value)
 	} else {
-		h.SetWithTTL(key, value, ttl)
+		h.SetWithTTLAndCtx(ctx, key, value, ttl)
 	}
 
 	// 保存结果

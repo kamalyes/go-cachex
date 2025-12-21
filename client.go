@@ -31,27 +31,27 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// 确保 Client 实现了 ContextHandler 接口
-var _ ContextHandler = (*Client)(nil)
+// 确保 Client 实现了 Handler 接口
+var _ Handler = (*Client)(nil)
 
 // CacheType 定义支持的缓存类型
 type CacheType string
 
 const (
-	CacheLRU           CacheType = "lru"
-	CacheLRUOptimized  CacheType = "lru_optimized"
-	CacheRistretto     CacheType = "ristretto"
-	CacheRedis         CacheType = "redis"
-	CacheExpiring      CacheType = "expiring"
+	CacheLRU          CacheType = "lru"
+	CacheLRUOptimized CacheType = "lru_optimized"
+	CacheRistretto    CacheType = "ristretto"
+	CacheRedis        CacheType = "redis"
+	CacheExpiring     CacheType = "expiring"
 )
 
 // ClientConfig 用于统一配置入口
 type ClientConfig struct {
-	Type             CacheType
-	Capacity         int                 // for lru/expiring/ristretto
-	CleanupInterval  time.Duration       // for expiring cache
-	RedisConfig      *redis.Options      // for redis
-	RistrettoConfig  *RistrettoConfig    // for ristretto
+	Type            CacheType
+	Capacity        int              // for lru/expiring/ristretto
+	CleanupInterval time.Duration    // for expiring cache
+	RedisConfig     *redis.Options   // for redis
+	RistrettoConfig *RistrettoConfig // for ristretto
 }
 
 // Client 是支持 context 的缓存客户端
@@ -111,46 +111,78 @@ func NewClient(ctx context.Context, cfg *ClientConfig) (*Client, error) {
 	return client, nil
 }
 
-// Get 从缓存中获取值
-func (c *Client) Get(ctx context.Context, key []byte) ([]byte, error) {
+// ========== Handler接口实现（简化版方法） ==========
+
+// Get 实现Handler.Get
+func (c *Client) Get(key []byte) ([]byte, error) {
+	return c.ctxCache.Get(context.Background(), key)
+}
+
+// GetTTL 实现Handler.GetTTL
+func (c *Client) GetTTL(key []byte) (time.Duration, error) {
+	return c.ctxCache.GetTTL(context.Background(), key)
+}
+
+// Set 实现Handler.Set
+func (c *Client) Set(key, value []byte) error {
+	return c.ctxCache.Set(context.Background(), key, value)
+}
+
+// SetWithTTL 实现Handler.SetWithTTL
+func (c *Client) SetWithTTL(key, value []byte, ttl time.Duration) error {
+	return c.ctxCache.SetWithTTL(context.Background(), key, value, ttl)
+}
+
+// Del 实现Handler.Del
+func (c *Client) Del(key []byte) error {
+	return c.ctxCache.Del(context.Background(), key)
+}
+
+// BatchGet 实现Handler.BatchGet
+func (c *Client) BatchGet(keys [][]byte) ([][]byte, []error) {
+	return c.ctxCache.BatchGet(context.Background(), keys)
+}
+
+// GetOrCompute 实现Handler.GetOrCompute
+func (c *Client) GetOrCompute(key []byte, ttl time.Duration, loader func() ([]byte, error)) ([]byte, error) {
+	ctxLoader := func(ctx context.Context) ([]byte, error) { return loader() }
+	return c.ctxCache.GetOrCompute(context.Background(), key, ttl, ctxLoader)
+}
+
+// ========== 带Context的完整版方法 ==========
+
+// GetWithCtx 从缓存中获取值（支持context）
+func (c *Client) GetWithCtx(ctx context.Context, key []byte) ([]byte, error) {
 	return c.ctxCache.Get(ctx, key)
 }
 
-// Set 设置缓存值
-func (c *Client) Set(ctx context.Context, key, value []byte) error {
+// SetWithCtx 设置缓存值（支持context）
+func (c *Client) SetWithCtx(ctx context.Context, key, value []byte) error {
 	return c.ctxCache.Set(ctx, key, value)
 }
 
-// SetWithTTL 设置带TTL的缓存值
-func (c *Client) SetWithTTL(ctx context.Context, key, value []byte, ttl time.Duration) error {
+// SetWithTTLAndCtx 设置带TTL的缓存值（支持context）
+func (c *Client) SetWithTTLAndCtx(ctx context.Context, key, value []byte, ttl time.Duration) error {
 	return c.ctxCache.SetWithTTL(ctx, key, value, ttl)
 }
 
-// Del 删除缓存键
-func (c *Client) Del(ctx context.Context, key []byte) error {
+// DelWithCtx 删除缓存键（支持context）
+func (c *Client) DelWithCtx(ctx context.Context, key []byte) error {
 	return c.ctxCache.Del(ctx, key)
 }
 
-// GetTTL 获取键的剩余TTL
-func (c *Client) GetTTL(ctx context.Context, key []byte) (time.Duration, error) {
-	if err := ValidateBasicOp(key, c.ctxCache != nil && c.ctxCache.handler != nil, false); err != nil {
-		return 0, err
-	}
-	select {
-	case <-ctx.Done():
-		return 0, ctx.Err()
-	default:
-		return c.ctxCache.handler.GetTTL(key)
-	}
+// GetTTLWithCtx 获取键的剩余TTL（支持context）
+func (c *Client) GetTTLWithCtx(ctx context.Context, key []byte) (time.Duration, error) {
+	return c.ctxCache.GetTTL(ctx, key)
 }
 
-// GetOrCompute 获取或计算缓存值（带去重）
-func (c *Client) GetOrCompute(ctx context.Context, key []byte, ttl time.Duration, loader func(context.Context) ([]byte, error)) ([]byte, error) {
+// GetOrComputeWithCtx 获取或计算缓存值（带去重，支持context）
+func (c *Client) GetOrComputeWithCtx(ctx context.Context, key []byte, ttl time.Duration, loader func(context.Context) ([]byte, error)) ([]byte, error) {
 	return c.ctxCache.GetOrCompute(ctx, key, ttl, loader)
 }
 
-// BatchGet 批量获取多个键的值
-func (c *Client) BatchGet(ctx context.Context, keys [][]byte) ([][]byte, []error) {
+// BatchGetWithCtx 批量获取多个键的值（支持context）
+func (c *Client) BatchGetWithCtx(ctx context.Context, keys [][]byte) ([][]byte, []error) {
 	select {
 	case <-ctx.Done():
 		errors := make([]error, len(keys))
@@ -169,19 +201,11 @@ func (c *Client) BatchGet(ctx context.Context, keys [][]byte) ([][]byte, []error
 		return make([][]byte, len(keys)), errors
 	}
 
-	return c.ctxCache.BatchGet(keys)
+	return c.ctxCache.BatchGet(ctx, keys)
 }
 
-// Stats 返回缓存统计信息
-func (c *Client) Stats(ctx context.Context) map[string]interface{} {
-	select {
-	case <-ctx.Done():
-		return map[string]interface{}{
-			"error": ctx.Err().Error(),
-		}
-	default:
-	}
-
+// Stats 实现Handler.Stats（不带context）
+func (c *Client) Stats() map[string]interface{} {
 	if c.ctxCache == nil {
 		return map[string]interface{}{
 			"error": ErrNotInitialized.Error(),
@@ -195,7 +219,20 @@ func (c *Client) Stats(ctx context.Context) map[string]interface{} {
 	return stats
 }
 
-// Close 关闭客户端
+// StatsWithCtx 返回缓存统计信息（支持context）
+func (c *Client) StatsWithCtx(ctx context.Context) map[string]interface{} {
+	select {
+	case <-ctx.Done():
+		return map[string]interface{}{
+			"error": ctx.Err().Error(),
+		}
+	default:
+	}
+
+	return c.Stats()
+}
+
+// Close 实现Handler.Close
 func (c *Client) Close() error {
 	if c.ctxCache != nil {
 		return c.ctxCache.Close()
