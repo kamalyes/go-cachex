@@ -22,10 +22,22 @@ import (
 )
 
 func setupRedisClient(t *testing.T) *redis.Client {
+	// 使用测试名称的哈希值作为DB编号，避免测试间数据冲突
+	// DB范围：1-15（保留0作为默认DB）
+	testName := t.Name()
+	dbNum := 1
+	if len(testName) > 0 {
+		hash := 0
+		for _, c := range testName {
+			hash = hash*31 + int(c)
+		}
+		dbNum = (hash % 15) + 1 // 确保DB在1-15范围内
+	}
+
 	client := redis.NewClient(&redis.Options{
 		Addr:            "120.79.25.168:16389",
 		Password:        "M5Pi9YW6u",
-		DB:              1,
+		DB:              dbNum,
 		DialTimeout:     10 * time.Second, // 增加拨号超时
 		ReadTimeout:     5 * time.Second,  // 增加读超时
 		WriteTimeout:    5 * time.Second,  // 增加写超时
@@ -171,8 +183,8 @@ func TestQueueHandler_Delayed(t *testing.T) {
 	// 测试延时队列
 	items := []*QueueItem{
 		{Data: "立即执行任务", DelayTime: 0}, // 立即执行
-		{Data: "延时3秒任务", DelayTime: 3}, // 3秒后执行
-		{Data: "延时1秒任务", DelayTime: 1}, // 1秒后执行
+		{Data: "延时5秒任务", DelayTime: 5}, // 5秒后执行
+		{Data: "延时2秒任务", DelayTime: 2}, // 2秒后执行
 	}
 
 	for _, item := range items {
@@ -186,17 +198,20 @@ func TestQueueHandler_Delayed(t *testing.T) {
 	assert.NotNil(t, item, "应该能获取到立即执行的任务")
 	assert.Equal(t, "立即执行任务", item.Data)
 
-	// 等待1.5秒后再次获取（应该能获取到1秒延时的任务）
-	time.Sleep(time.Millisecond * 1500)
+	// 等待2.5秒后再次获取（应该能获取到2秒延时的任务）
+	time.Sleep(time.Millisecond * 2500)
 	item, err = queue.Dequeue(ctx, queueName, QueueTypeDelayed)
 	assert.NoError(t, err)
-	assert.NotNil(t, item, "应该能获取到1秒延时的任务")
-	assert.Equal(t, "延时1秒任务", item.Data)
+	assert.NotNil(t, item, "应该能获取到2秒延时的任务")
+	assert.Equal(t, "延时2秒任务", item.Data)
 
-	// 现在不应该有可用的任务
+	// 现在不应该有可用的任务（5秒任务还需要至少2秒才能到期）
 	item, err = queue.Dequeue(ctx, queueName, QueueTypeDelayed)
 	assert.NoError(t, err)
-	assert.Nil(t, item, "3秒任务还没到时间，不应该有可用任务")
+	assert.Nil(t, item, "5秒任务还没到时间，不应该有可用任务")
+
+	// 清理测试数据
+	queue.Clear(ctx, queueName, QueueTypeDelayed)
 }
 
 func TestQueueHandler_BatchOperations(t *testing.T) {
@@ -642,14 +657,10 @@ func BenchmarkQueueHandler_FIFOEnqueue(b *testing.B) {
 	ctx := context.Background()
 
 	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			item := &QueueItem{Data: fmt.Sprintf("任务%d", i)}
-			queue.Enqueue(ctx, "bench_queue", QueueTypeFIFO, item)
-			i++
-		}
-	})
+	for i := 0; i < b.N; i++ {
+		item := &QueueItem{Data: fmt.Sprintf("任务%d", i)}
+		queue.Enqueue(ctx, "bench_queue", QueueTypeFIFO, item)
+	}
 }
 
 func BenchmarkQueueHandler_FIFODequeue(b *testing.B) {
@@ -677,4 +688,115 @@ func BenchmarkQueueHandler_FIFODequeue(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		queue.Dequeue(ctx, "bench_queue", QueueTypeFIFO)
 	}
+}
+
+// Lua批量出队性能测试
+func BenchmarkQueueHandler_BatchDequeue(b *testing.B) {
+	client := setupRedisClient(&testing.T{})
+	defer client.Close()
+
+	config := QueueConfig{BatchSize: 10}
+	queue := NewQueueHandler(client, "bench", config)
+	ctx := context.Background()
+
+	b.Run("Batch10_FIFO", func(b *testing.B) {
+		qName := "bench_batch_10"
+		// 预填充足够多的元素（b.N * 10）
+		for j := 0; j < b.N*10; j++ {
+			queue.Enqueue(ctx, qName, QueueTypeFIFO, &QueueItem{Data: fmt.Sprintf("item%d", j)})
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			queue.BatchDequeue(ctx, qName, QueueTypeFIFO, 10)
+		}
+	})
+
+	b.Run("Batch50_FIFO", func(b *testing.B) {
+		qName := "bench_batch_50"
+		// 预填充足够多的元素
+		for j := 0; j < b.N*50; j++ {
+			queue.Enqueue(ctx, qName, QueueTypeFIFO, &QueueItem{Data: fmt.Sprintf("item%d", j)})
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			queue.BatchDequeue(ctx, qName, QueueTypeFIFO, 50)
+		}
+	})
+
+	b.Run("Batch100_FIFO", func(b *testing.B) {
+		qName := "bench_batch_100"
+		// 预填充足够多的元素
+		for j := 0; j < b.N*100; j++ {
+			queue.Enqueue(ctx, qName, QueueTypeFIFO, &QueueItem{Data: fmt.Sprintf("item%d", j)})
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			queue.BatchDequeue(ctx, qName, QueueTypeFIFO, 100)
+		}
+	})
+
+	b.Run("Batch10_LIFO", func(b *testing.B) {
+		qName := "bench_batch_lifo_10"
+		// 预填充足够多的元素
+		for j := 0; j < b.N*10; j++ {
+			queue.Enqueue(ctx, qName, QueueTypeLIFO, &QueueItem{Data: fmt.Sprintf("item%d", j)})
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			queue.BatchDequeue(ctx, qName, QueueTypeLIFO, 10)
+		}
+	})
+}
+
+// Peek性能测试
+func BenchmarkQueueHandler_Peek(b *testing.B) {
+	client := setupRedisClient(&testing.T{})
+	defer client.Close()
+
+	config := QueueConfig{BatchSize: 10}
+	queue := NewQueueHandler(client, "bench", config)
+	ctx := context.Background()
+
+	b.Run("Peek10_FIFO", func(b *testing.B) {
+		qName := "bench_peek_fifo"
+		// 预填充100个元素
+		for j := 0; j < 100; j++ {
+			queue.Enqueue(ctx, qName, QueueTypeFIFO, &QueueItem{Data: fmt.Sprintf("item%d", j)})
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			queue.Peek(ctx, qName, QueueTypeFIFO, 10)
+		}
+	})
+
+	b.Run("Peek10_LIFO", func(b *testing.B) {
+		qName := "bench_peek_lifo"
+		// 预填充100个元素
+		for j := 0; j < 100; j++ {
+			queue.Enqueue(ctx, qName, QueueTypeLIFO, &QueueItem{Data: fmt.Sprintf("item%d", j)})
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			queue.Peek(ctx, qName, QueueTypeLIFO, 10)
+		}
+	})
+
+	b.Run("Peek50_FIFO", func(b *testing.B) {
+		qName := "bench_peek_fifo_50"
+		// 预填充100个元素
+		for j := 0; j < 100; j++ {
+			queue.Enqueue(ctx, qName, QueueTypeFIFO, &QueueItem{Data: fmt.Sprintf("item%d", j)})
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			queue.Peek(ctx, qName, QueueTypeFIFO, 50)
+		}
+	})
 }

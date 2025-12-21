@@ -257,9 +257,15 @@ func (q *QueueHandler) BatchDequeue(ctx context.Context, queueName string, queue
 		count = q.config.BatchSize
 	}
 
-	items := make([]*QueueItem, 0, count)
+	queueKey := q.getQueueKey(queueName, queueType)
 
-	// 使用非阻塞操作提高效率
+	// 对于FIFO和LIFO，使用Lua脚本一次性批量出队，提升性能
+	if queueType == QueueTypeFIFO || queueType == QueueTypeLIFO {
+		return q.batchDequeueLua(ctx, queueKey, queueType, count)
+	}
+
+	// 其他队列类型使用原有逻辑
+	items := make([]*QueueItem, 0, count)
 	for i := 0; i < count; i++ {
 		item, err := q.DequeueNonBlocking(ctx, queueName, queueType)
 		if err != nil {
@@ -269,6 +275,62 @@ func (q *QueueHandler) BatchDequeue(ctx context.Context, queueName string, queue
 			break // 队列为空
 		}
 		items = append(items, item)
+	}
+
+	return items, nil
+}
+
+// batchDequeueLua 使用Lua脚本批量出队
+func (q *QueueHandler) batchDequeueLua(ctx context.Context, queueKey string, queueType QueueType, count int) ([]*QueueItem, error) {
+	// Lua脚本：一次性弹出多个元素
+	luaScript := `
+		local key = KEYS[1]
+		local count = tonumber(ARGV[1])
+		local pop_cmd = ARGV[2]  -- "LPOP" 或 "RPOP"
+		
+		local results = {}
+		for i = 1, count do
+			local value = redis.call(pop_cmd, key)
+			if not value then
+				break
+			end
+			table.insert(results, value)
+		end
+		return results
+	`
+
+	// 根据队列类型选择弹出命令
+	popCmd := "LPOP"
+	if queueType == QueueTypeFIFO {
+		popCmd = "LPOP" // FIFO: 从左边弹出
+	} else if queueType == QueueTypeLIFO {
+		popCmd = "LPOP" // LIFO: 也从左边弹出
+	}
+
+	// 执行Lua脚本
+	result, err := q.client.Eval(ctx, luaScript, []string{queueKey}, count, popCmd).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	// 解析结果
+	resultSlice, ok := result.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("unexpected lua result type")
+	}
+
+	items := make([]*QueueItem, 0, len(resultSlice))
+	for _, data := range resultSlice {
+		dataStr, ok := data.(string)
+		if !ok {
+			continue
+		}
+
+		var item QueueItem
+		if err := json.Unmarshal([]byte(dataStr), &item); err != nil {
+			continue // 跳过无效数据
+		}
+		items = append(items, &item)
 	}
 
 	return items, nil
