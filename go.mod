@@ -5,7 +5,7 @@ go 1.23.0
 require (
 	github.com/alicebob/miniredis/v2 v2.35.0
 	github.com/dgraph-io/ristretto/v2 v2.3.0
-	github.com/kamalyes/go-toolbox v0.11.87-0.20251224022415-a8febf1a7c90
+	github.com/kamalyes/go-toolbox v0.11.87-0.20260105035322-c22ba1550a26
 	github.com/redis/go-redis/v9 v9.16.0
 	github.com/stretchr/testify v1.11.1
 )
