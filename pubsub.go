@@ -14,10 +14,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/redis/go-redis/v9"
 	"log"
 	"sync"
 	"time"
+
+	"github.com/kamalyes/go-toolbox/pkg/mathx"
+	"github.com/redis/go-redis/v9"
 )
 
 // MessageHandler 消息处理器接口
@@ -443,11 +445,67 @@ func (s *Subscriber) handleMessage(msg *redis.Message) {
 	}
 }
 
-// Stop 停止订阅
+// Stop 停止订阅（不从注册表中移除）
 func (s *Subscriber) Stop() {
 	s.once.Do(func() {
 		close(s.stopChan)
 	})
+}
+
+// Unsubscribe 取消订阅并从注册表中移除
+func (s *Subscriber) Unsubscribe() error {
+	// 先停止接收消息
+	s.Stop()
+
+	// 选择要移除的 key 列表（patterns 或 channels）
+	keysToRemove := mathx.IF(s.isPattern, s.patterns, s.channels)
+
+	// 批量从注册表中移除
+	s.pubsub.mu.Lock()
+	for _, key := range keysToRemove {
+		delete(s.pubsub.subscribers, key)
+	}
+	s.pubsub.mu.Unlock()
+
+	if s.config.EnableLogging {
+		log.Printf("Unsubscribed from %d %s", len(keysToRemove),
+			mathx.IF(s.isPattern, "patterns", "channels"))
+	}
+
+	return nil
+}
+
+// GetSubscriptionInfo 获取订阅信息
+func (s *Subscriber) GetSubscriptionInfo() *SubscriptionInfo {
+	return &SubscriptionInfo{
+		IsPattern:    s.isPattern,
+		IsActive:     s.IsActive(),
+		Channels:     mathx.IF(s.isPattern, s.patterns, s.channels),
+		ChannelCount: mathx.IF(s.isPattern, len(s.patterns), len(s.channels)),
+		Config:       s.config,
+	}
+}
+
+// Resubscribe 重新订阅（如果已停止）
+func (s *Subscriber) Resubscribe() error {
+	if s.IsActive() {
+		return fmt.Errorf("subscriber is already active")
+	}
+
+	// 重置 stopChan（需要新的 once）
+	s.stopChan = make(chan struct{})
+	s.once = sync.Once{}
+
+	// 重新注册
+	s.pubsub.mu.Lock()
+	keysToRegister := mathx.IF(s.isPattern, s.patterns, s.channels)
+	for _, key := range keysToRegister {
+		s.pubsub.subscribers[key] = s
+	}
+	s.pubsub.mu.Unlock()
+
+	// 重新启动订阅
+	return s.start()
 }
 
 // IsActive 检查订阅是否活跃
@@ -473,6 +531,15 @@ type PubSubStats struct {
 	ActiveSubscribers int      `json:"active_subscribers"`
 	Channels          []string `json:"channels"`
 	Patterns          []string `json:"patterns"`
+}
+
+// SubscriptionInfo 订阅信息
+type SubscriptionInfo struct {
+	IsPattern    bool         `json:"is_pattern"`
+	IsActive     bool         `json:"is_active"`
+	Channels     []string     `json:"channels"`
+	ChannelCount int          `json:"channel_count"`
+	Config       PubSubConfig `json:"config"`
 }
 
 // GetStats 获取统计信息

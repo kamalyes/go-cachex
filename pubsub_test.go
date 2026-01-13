@@ -13,11 +13,12 @@ package cachex
 import (
 	"context"
 	"fmt"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestPubSub_BasicPublishSubscribe(t *testing.T) {
@@ -313,6 +314,376 @@ func TestPubSub_Unsubscribe(t *testing.T) {
 
 	// 验证订阅者已停止
 	assert.False(t, subscriber.IsActive(), "取消订阅后订阅者应该不活跃")
+}
+
+func TestSubscriber_Unsubscribe(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	config := PubSubConfig{
+		Namespace:     "subscriber_unsub_test",
+		MaxRetries:    2,
+		RetryDelay:    time.Millisecond * 50,
+		BufferSize:    10,
+		EnableLogging: true,
+		PingInterval:  time.Second,
+	}
+
+	pubsub := NewPubSub(client, config)
+	defer pubsub.Close()
+
+	messageCount := 0
+	var mu sync.Mutex
+
+	handler := func(ctx context.Context, channel string, message string) error {
+		mu.Lock()
+		messageCount++
+		mu.Unlock()
+		return nil
+	}
+
+	// 订阅多个频道
+	subscriber, err := pubsub.Subscribe([]string{"sub_test1", "sub_test2"}, handler)
+	assert.NoError(t, err)
+	require.NotNil(t, subscriber)
+
+	// 验证订阅者活跃
+	assert.True(t, subscriber.IsActive(), "订阅者应该处于活跃状态")
+
+	// 验证已注册
+	assert.Equal(t, 2, pubsub.GetSubscribers(), "应该有2个频道订阅")
+
+	// 等待订阅生效
+	time.Sleep(time.Millisecond * 100)
+
+	// 发布消息到两个频道
+	err = pubsub.Publish(ctx, "sub_test1", "消息1")
+	assert.NoError(t, err)
+	err = pubsub.Publish(ctx, "sub_test2", "消息2")
+	assert.NoError(t, err)
+	time.Sleep(time.Millisecond * 200)
+
+	// 验证收到消息
+	mu.Lock()
+	beforeCount := messageCount
+	mu.Unlock()
+	assert.Equal(t, 2, beforeCount, "应该收到2条消息")
+
+	// 调用 Subscriber.Unsubscribe()
+	err = subscriber.Unsubscribe()
+	assert.NoError(t, err)
+
+	// 验证订阅者已停止
+	assert.False(t, subscriber.IsActive(), "取消订阅后订阅者应该不活跃")
+
+	// 验证从注册表中移除
+	assert.Equal(t, 0, pubsub.GetSubscribers(), "应该没有活跃订阅者")
+
+	// 等待取消订阅生效
+	time.Sleep(time.Millisecond * 100)
+
+	// 再次发布消息（不应该收到）
+	err = pubsub.Publish(ctx, "sub_test1", "消息3")
+	assert.NoError(t, err)
+	err = pubsub.Publish(ctx, "sub_test2", "消息4")
+	assert.NoError(t, err)
+	time.Sleep(time.Millisecond * 200)
+
+	// 验证没有收到新消息
+	mu.Lock()
+	finalCount := messageCount
+	mu.Unlock()
+	assert.Equal(t, beforeCount, finalCount, "取消订阅后不应该收到新消息")
+}
+
+func TestSubscriber_UnsubscribePattern(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	config := PubSubConfig{
+		Namespace:     "pattern_unsub_test",
+		MaxRetries:    2,
+		RetryDelay:    time.Millisecond * 50,
+		BufferSize:    10,
+		EnableLogging: true,
+		PingInterval:  time.Second,
+	}
+
+	pubsub := NewPubSub(client, config)
+	defer pubsub.Close()
+
+	messageCount := 0
+	var mu sync.Mutex
+
+	handler := func(ctx context.Context, channel string, message string) error {
+		mu.Lock()
+		messageCount++
+		mu.Unlock()
+		return nil
+	}
+
+	// 订阅模式
+	subscriber, err := pubsub.SubscribePattern([]string{"pattern.*", "test.*"}, handler)
+	assert.NoError(t, err)
+	require.NotNil(t, subscriber)
+
+	// 等待订阅生效
+	time.Sleep(time.Millisecond * 100)
+
+	// 发布匹配消息
+	err = pubsub.Publish(ctx, "pattern.1", "消息1")
+	assert.NoError(t, err)
+	err = pubsub.Publish(ctx, "test.2", "消息2")
+	assert.NoError(t, err)
+	time.Sleep(time.Millisecond * 200)
+
+	// 验证收到消息
+	mu.Lock()
+	beforeCount := messageCount
+	mu.Unlock()
+	assert.Equal(t, 2, beforeCount, "应该收到2条模式匹配消息")
+
+	// 取消模式订阅
+	err = subscriber.Unsubscribe()
+	assert.NoError(t, err)
+
+	// 验证订阅者已停止
+	assert.False(t, subscriber.IsActive(), "取消订阅后订阅者应该不活跃")
+
+	// 等待取消订阅生效
+	time.Sleep(time.Millisecond * 100)
+
+	// 再次发布匹配消息（不应该收到）
+	err = pubsub.Publish(ctx, "pattern.3", "消息3")
+	assert.NoError(t, err)
+	err = pubsub.Publish(ctx, "test.4", "消息4")
+	assert.NoError(t, err)
+	time.Sleep(time.Millisecond * 200)
+
+	// 验证没有收到新消息
+	mu.Lock()
+	finalCount := messageCount
+	mu.Unlock()
+	assert.Equal(t, beforeCount, finalCount, "取消订阅后不应该收到新消息")
+}
+
+func TestSubscriber_GetSubscriptionInfo(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	config := PubSubConfig{
+		Namespace:     "info_test",
+		MaxRetries:    2,
+		RetryDelay:    time.Millisecond * 50,
+		BufferSize:    10,
+		EnableLogging: false,
+		PingInterval:  time.Second,
+	}
+
+	pubsub := NewPubSub(client, config)
+	defer pubsub.Close()
+
+	handler := func(ctx context.Context, channel string, message string) error {
+		return nil
+	}
+
+	// 测试普通频道订阅信息
+	subscriber1, err := pubsub.Subscribe([]string{"info_ch1", "info_ch2", "info_ch3"}, handler)
+	assert.NoError(t, err)
+	defer subscriber1.Stop()
+
+	info1 := subscriber1.GetSubscriptionInfo()
+	assert.NotNil(t, info1)
+	assert.False(t, info1.IsPattern, "应该不是模式订阅")
+	assert.True(t, info1.IsActive, "应该处于活跃状态")
+	assert.Equal(t, 3, info1.ChannelCount, "应该有3个频道")
+	assert.Len(t, info1.Channels, 3, "频道列表应该有3个元素")
+	assert.Contains(t, info1.Channels, "info_ch1")
+	assert.Contains(t, info1.Channels, "info_ch2")
+	assert.Contains(t, info1.Channels, "info_ch3")
+	assert.Equal(t, config.Namespace, info1.Config.Namespace, "配置应该匹配")
+
+	// 测试模式订阅信息
+	subscriber2, err := pubsub.SubscribePattern([]string{"pattern.*", "test.*"}, handler)
+	assert.NoError(t, err)
+	defer subscriber2.Stop()
+
+	info2 := subscriber2.GetSubscriptionInfo()
+	assert.NotNil(t, info2)
+	assert.True(t, info2.IsPattern, "应该是模式订阅")
+	assert.True(t, info2.IsActive, "应该处于活跃状态")
+	assert.Equal(t, 2, info2.ChannelCount, "应该有2个模式")
+	assert.Len(t, info2.Channels, 2, "模式列表应该有2个元素")
+	assert.Contains(t, info2.Channels, "pattern.*")
+	assert.Contains(t, info2.Channels, "test.*")
+
+	// 停止订阅后检查信息
+	subscriber1.Stop()
+	time.Sleep(time.Millisecond * 100)
+
+	info3 := subscriber1.GetSubscriptionInfo()
+	assert.False(t, info3.IsActive, "停止后应该不活跃")
+	assert.Equal(t, 3, info3.ChannelCount, "频道数不变")
+}
+
+func TestSubscriber_Resubscribe(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	config := PubSubConfig{
+		Namespace:     "resubscribe_test",
+		MaxRetries:    2,
+		RetryDelay:    time.Millisecond * 50,
+		BufferSize:    10,
+		EnableLogging: true,
+		PingInterval:  time.Second,
+	}
+
+	pubsub := NewPubSub(client, config)
+	defer pubsub.Close()
+
+	messageCount := 0
+	var mu sync.Mutex
+
+	handler := func(ctx context.Context, channel string, message string) error {
+		mu.Lock()
+		messageCount++
+		mu.Unlock()
+		return nil
+	}
+
+	// 初始订阅
+	subscriber, err := pubsub.Subscribe([]string{"resub_test"}, handler)
+	assert.NoError(t, err)
+	assert.True(t, subscriber.IsActive(), "初始订阅应该活跃")
+
+	// 等待订阅生效
+	time.Sleep(time.Millisecond * 100)
+
+	// 发送第一条消息
+	err = pubsub.Publish(ctx, "resub_test", "消息1")
+	assert.NoError(t, err)
+	time.Sleep(time.Millisecond * 200)
+
+	// 验证收到消息
+	mu.Lock()
+	firstCount := messageCount
+	mu.Unlock()
+	assert.Equal(t, 1, firstCount, "应该收到第一条消息")
+
+	// 停止订阅
+	subscriber.Stop()
+	time.Sleep(time.Millisecond * 100)
+	assert.False(t, subscriber.IsActive(), "停止后应该不活跃")
+
+	// 尝试在活跃时重新订阅（应该失败）
+	// 先重新订阅
+	err = subscriber.Resubscribe()
+	assert.NoError(t, err)
+	assert.True(t, subscriber.IsActive(), "重新订阅后应该活跃")
+
+	// 再次尝试重新订阅（应该失败）
+	err = subscriber.Resubscribe()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "already active")
+
+	// 等待重新订阅生效
+	time.Sleep(time.Millisecond * 100)
+
+	// 发送第二条消息
+	err = pubsub.Publish(ctx, "resub_test", "消息2")
+	assert.NoError(t, err)
+	time.Sleep(time.Millisecond * 200)
+
+	// 验证重新订阅后收到消息
+	mu.Lock()
+	finalCount := messageCount
+	mu.Unlock()
+	assert.Equal(t, 2, finalCount, "重新订阅后应该收到第二条消息")
+
+	// 清理
+	subscriber.Stop()
+}
+
+func TestSubscriber_ResubscribePattern(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	config := PubSubConfig{
+		Namespace:     "resubscribe_pattern_test",
+		MaxRetries:    2,
+		RetryDelay:    time.Millisecond * 50,
+		BufferSize:    10,
+		EnableLogging: true,
+		PingInterval:  time.Second,
+	}
+
+	pubsub := NewPubSub(client, config)
+	defer pubsub.Close()
+
+	messageCount := 0
+	var mu sync.Mutex
+
+	handler := func(ctx context.Context, channel string, message string) error {
+		mu.Lock()
+		messageCount++
+		mu.Unlock()
+		return nil
+	}
+
+	// 模式订阅
+	subscriber, err := pubsub.SubscribePattern([]string{"resubpat.*"}, handler)
+	assert.NoError(t, err)
+	assert.True(t, subscriber.IsActive(), "初始订阅应该活跃")
+
+	// 等待订阅生效
+	time.Sleep(time.Millisecond * 100)
+
+	// 发送匹配消息
+	err = pubsub.Publish(ctx, "resubpat.1", "消息1")
+	assert.NoError(t, err)
+	time.Sleep(time.Millisecond * 200)
+
+	mu.Lock()
+	firstCount := messageCount
+	mu.Unlock()
+	assert.Equal(t, 1, firstCount, "应该收到第一条消息")
+
+	// 停止并重新订阅
+	subscriber.Stop()
+	time.Sleep(time.Millisecond * 100)
+
+	err = subscriber.Resubscribe()
+	assert.NoError(t, err)
+	assert.True(t, subscriber.IsActive(), "重新订阅后应该活跃")
+
+	// 等待重新订阅生效
+	time.Sleep(time.Millisecond * 100)
+
+	// 发送第二条匹配消息
+	err = pubsub.Publish(ctx, "resubpat.2", "消息2")
+	assert.NoError(t, err)
+	time.Sleep(time.Millisecond * 200)
+
+	mu.Lock()
+	finalCount := messageCount
+	mu.Unlock()
+	assert.Equal(t, 2, finalCount, "重新订阅后应该收到第二条消息")
+
+	// 验证订阅信息
+	info := subscriber.GetSubscriptionInfo()
+	assert.True(t, info.IsPattern, "应该是模式订阅")
+	assert.True(t, info.IsActive, "应该活跃")
+
+	subscriber.Stop()
 }
 
 func TestPubSub_BroadcastMessage(t *testing.T) {
