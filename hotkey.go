@@ -14,17 +14,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/redis/go-redis/v9"
 	"sync"
 	"time"
+
+	"github.com/kamalyes/go-logger"
+	"github.com/kamalyes/go-toolbox/pkg/mathx"
+	"github.com/kamalyes/go-toolbox/pkg/syncx"
+	"github.com/redis/go-redis/v9"
 )
 
 // HotKeyConfig 热key配置
 type HotKeyConfig struct {
-	DefaultTTL        time.Duration // 默认TTL
-	RefreshInterval   time.Duration // 刷新间隔
-	EnableAutoRefresh bool          // 是否启用自动刷新
-	Namespace         string        // 命名空间
+	DefaultTTL        time.Duration  // 默认TTL
+	RefreshInterval   time.Duration  // 刷新间隔
+	EnableAutoRefresh bool           // 是否启用自动刷新
+	Namespace         string         // 命名空间
+	Logger            logger.ILogger // 日志记录器（可选，不设置则使用 NoOpLogger）
 }
 
 // DataLoader 数据加载器接口
@@ -52,6 +57,7 @@ type HotKeyCache[K comparable, V any] struct {
 	lastRefreshTime time.Time
 	stopChan        chan struct{}
 	once            sync.Once
+	logger          logger.ILogger
 }
 
 // NewHotKeyCache 创建热key缓存
@@ -61,15 +67,10 @@ func NewHotKeyCache[K comparable, V any](
 	loader DataLoader[K, V],
 	config HotKeyConfig,
 ) *HotKeyCache[K, V] {
-	if config.DefaultTTL == 0 {
-		config.DefaultTTL = time.Hour
-	}
-	if config.RefreshInterval == 0 {
-		config.RefreshInterval = time.Minute * 10
-	}
-	if config.Namespace == "" {
-		config.Namespace = "hotkey"
-	}
+	config.DefaultTTL = mathx.IfNotZero(config.DefaultTTL, time.Hour)
+	config.RefreshInterval = mathx.IfNotZero(config.RefreshInterval, time.Minute*10)
+	config.Namespace = mathx.IfNotEmpty(config.Namespace, "hotkey")
+	config.Logger = mathx.IfEmpty(config.Logger, NewDefaultCachexLogger())
 
 	cache := &HotKeyCache[K, V]{
 		client:     client,
@@ -78,11 +79,16 @@ func NewHotKeyCache[K comparable, V any](
 		keyName:    keyName,
 		localCache: make(map[K]V),
 		stopChan:   make(chan struct{}),
+		logger:     config.Logger,
 	}
 
 	// 启动自动刷新
 	if config.EnableAutoRefresh {
-		go cache.autoRefresh()
+		syncx.Go().
+			OnPanic(func(r interface{}) {
+				cache.config.Logger.Errorf("Panic in autoRefresh: %v", r)
+			}).
+			Exec(cache.autoRefresh)
 	}
 
 	return cache
@@ -314,7 +320,7 @@ func (h *HotKeyCache[K, V]) autoRefresh() {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute*5)
 			if err := h.Refresh(ctx); err != nil {
 				// 记录错误日志，但不停止刷新
-				fmt.Printf("HotKeyCache auto refresh failed: %v\n", err)
+				h.logger.Warnf("HotKeyCache auto refresh failed: %v", err)
 			}
 			cancel()
 		case <-h.stopChan:

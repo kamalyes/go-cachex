@@ -14,6 +14,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/kamalyes/go-toolbox/pkg/syncx"
 )
 
 // ExpiringHandler 是一个简单的基于 map 的线程安全内存缓存，支持 TTL 和后台清理
@@ -43,7 +45,7 @@ func NewExpiringHandler(cleanupInterval time.Duration) *ExpiringHandler {
 		stop:   make(chan struct{}),
 	}
 	h.wg.Add(1)
-	go h.cleanupLoop()
+	syncx.Go().OnPanic(nil).Exec(h.cleanupLoop)
 	return h
 }
 

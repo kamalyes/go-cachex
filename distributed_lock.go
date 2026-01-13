@@ -16,9 +16,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/redis/go-redis/v9"
 	"sync"
 	"time"
+
+	"github.com/kamalyes/go-logger"
+	"github.com/kamalyes/go-toolbox/pkg/mathx"
+	"github.com/kamalyes/go-toolbox/pkg/syncx"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
@@ -30,43 +34,42 @@ var (
 
 // LockConfig 锁配置
 type LockConfig struct {
-	TTL              time.Duration // 锁的TTL
-	RetryInterval    time.Duration // 重试间隔
-	MaxRetries       int           // 最大重试次数
-	Namespace        string        // 命名空间
-	EnableWatchdog   bool          // 是否启用看门狗自动续期
-	WatchdogInterval time.Duration // 看门狗检查间隔
+	TTL              time.Duration  // 锁的TTL
+	RetryInterval    time.Duration  // 重试间隔
+	MaxRetries       int            // 最大重试次数
+	Namespace        string         // 命名空间
+	EnableWatchdog   bool           // 是否启用看门狗自动续期
+	WatchdogInterval time.Duration  // 看门狗检查间隔
+	Logger           logger.ILogger // 日志记录器
 }
 
 // DistributedLock 分布式锁
 type DistributedLock struct {
 	client     *redis.Client
 	config     LockConfig
-	key        string        // 锁的键名
-	token      string        // 锁的令牌（用于确保只有持锁者能释放锁）
-	acquired   bool          // 是否已获取锁
-	expireTime time.Time     // 锁的过期时间
-	stopChan   chan struct{} // 停止看门狗的通道
-	mu         sync.Mutex    // 保护锁状态的互斥锁
+	key        string         // 锁的键名
+	token      string         // 锁的令牌（用于确保只有持锁者能释放锁）
+	acquired   bool           // 是否已获取锁
+	expireTime time.Time      // 锁的过期时间
+	stopChan   chan struct{}  // 停止看门狗的通道
+	mu         sync.Mutex     // 保护锁状态的互斥锁
+	logger     logger.ILogger // 日志记录器
+}
+
+// WithLogger 设置日志记录器
+func (c *DistributedLock) WithLogger(logger logger.ILogger) *DistributedLock {
+	c.logger = logger
+	return c
 }
 
 // NewDistributedLock 创建分布式锁
 func NewDistributedLock(client *redis.Client, key string, config LockConfig) *DistributedLock {
-	if config.TTL == 0 {
-		config.TTL = time.Minute * 5
-	}
-	if config.RetryInterval == 0 {
-		config.RetryInterval = time.Millisecond * 100
-	}
-	if config.MaxRetries == 0 {
-		config.MaxRetries = 10
-	}
-	if config.Namespace == "" {
-		config.Namespace = "lock"
-	}
-	if config.WatchdogInterval == 0 {
-		config.WatchdogInterval = config.TTL / 3
-	}
+	config.TTL = mathx.IfNotZero(config.TTL, time.Minute*5)
+	config.RetryInterval = mathx.IfNotZero(config.RetryInterval, time.Millisecond*100)
+	config.MaxRetries = mathx.IfNotZero(config.MaxRetries, 10)
+	config.Namespace = mathx.IfNotEmpty(config.Namespace, "lock")
+	config.WatchdogInterval = mathx.IfNotZero(config.WatchdogInterval, config.TTL/3)
+	config.Logger = mathx.IfEmpty(config.Logger, NewDefaultCachexLogger())
 
 	lockKey := fmt.Sprintf("%s:%s", config.Namespace, key)
 
@@ -74,6 +77,7 @@ func NewDistributedLock(client *redis.Client, key string, config LockConfig) *Di
 		client: client,
 		config: config,
 		key:    lockKey,
+		logger: config.Logger,
 		// token将在TryLock时生成
 		stopChan: nil, // 将在获取锁时创建
 	}
@@ -101,18 +105,26 @@ func (l *DistributedLock) TryLock(ctx context.Context) (bool, error) {
 	// 使用SET命令的NX和EX选项原子性地设置锁
 	result, err := l.client.SetNX(ctx, l.key, l.token, l.config.TTL).Result()
 	if err != nil {
+		l.logger.Errorf("failed to acquire lock for key %s: %v", l.key, err)
 		return false, fmt.Errorf("failed to acquire lock: %w", err)
 	}
 
 	if result {
 		l.acquired = true
 		l.expireTime = time.Now().Add(l.config.TTL)
+		l.logger.Debugf("lock acquired for key %s, token: %s, ttl: %v", l.key, l.token, l.config.TTL)
 
 		// 启动看门狗
 		if l.config.EnableWatchdog {
 			// 重新创建停止通道确保看门狗能正常工作
 			l.stopChan = make(chan struct{})
-			go l.watchdog(ctx)
+			syncx.Go(ctx).
+				OnPanic(func(r interface{}) {
+					if l.logger != nil {
+						l.logger.Errorf("Panic in watchdog: %v", r)
+					}
+				}).
+				Exec(func() { l.watchdog(ctx) })
 		}
 
 		return true, nil
@@ -190,9 +202,11 @@ func (l *DistributedLock) Unlock(ctx context.Context) error {
 	// 检查是否成功释放
 	if result.(int64) == 1 {
 		l.acquired = false
+		l.logger.Debugf("lock released for key %s", l.key)
 		return nil
 	}
 
+	l.logger.Warnf("failed to release lock for key %s: not owned by this instance", l.key)
 	return ErrLockNotOwned
 }
 
@@ -226,11 +240,13 @@ func (l *DistributedLock) Extend(ctx context.Context, ttl time.Duration) error {
 
 	if result.(int64) == 1 {
 		l.expireTime = time.Now().Add(ttl)
+		l.logger.Debugf("lock extended for key %s, new ttl: %v", l.key, ttl)
 		return nil
 	}
 
 	// 延长失败，可能锁已经丢失
 	l.acquired = false
+	l.logger.Warnf("failed to extend lock for key %s: lock may have been lost", l.key)
 	return ErrLockNotOwned
 }
 
@@ -299,16 +315,19 @@ func (l *DistributedLock) watchdog(ctx context.Context) {
 			locked, err := l.IsLocked(watchdogCtx)
 			if err != nil {
 				// 发生错误时继续尝试，不立即退出
+				l.logger.Warnf("watchdog failed to check lock status for key %s: %v", l.key, err)
 				continue
 			}
 			if !locked {
 				// 锁已丢失，退出看门狗
+				l.logger.Warnf("watchdog detected lock lost for key %s, stopping", l.key)
 				return
 			}
 
 			// 续期锁
 			if err := l.Extend(watchdogCtx, l.config.TTL); err != nil {
 				// 续期失败，继续尝试而不是立即退出
+				l.logger.Warnf("watchdog failed to extend lock for key %s: %v", l.key, err)
 				continue
 			}
 		case <-l.stopChan:
@@ -374,12 +393,17 @@ func (m *LockManager) ReleaseLock(ctx context.Context, key string) error {
 	lock, exists := m.locks[key]
 	if !exists {
 		m.mu.Unlock()
+		m.config.Logger.Warnf("attempted to release non-existent lock: %s", key)
 		return ErrLockNotFound
 	}
 	delete(m.locks, key)
 	m.mu.Unlock()
 
-	return lock.Unlock(ctx)
+	err := lock.Unlock(ctx)
+	if err == nil {
+		m.config.Logger.Debugf("lock manager released lock: %s", key)
+	}
+	return err
 }
 
 // ReleaseAllLocks 释放所有锁
@@ -394,11 +418,17 @@ func (m *LockManager) ReleaseAllLocks(ctx context.Context) error {
 	m.mu.Unlock()
 
 	var lastErr error
+	releasedCount := 0
 	for key, lock := range locks {
 		if err := lock.Unlock(ctx); err != nil {
 			lastErr = fmt.Errorf("failed to release lock %s: %w", key, err)
+			m.config.Logger.Errorf("failed to release lock %s: %v", key, err)
+		} else {
+			releasedCount++
 		}
 	}
+
+	m.config.Logger.Infof("released %d/%d locks", releasedCount, len(locks))
 
 	return lastErr
 }
@@ -486,7 +516,7 @@ func LockWithRetry(ctx context.Context, client *redis.Client, key string, config
 	defer func() {
 		if unlockErr := lock.Unlock(ctx); unlockErr != nil {
 			// 记录解锁错误，但不覆盖原始错误
-			fmt.Printf("failed to unlock: %v\n", unlockErr)
+			lock.logger.Warnf("failed to unlock: %v", unlockErr)
 		}
 	}()
 

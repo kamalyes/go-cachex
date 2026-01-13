@@ -13,11 +13,12 @@ package cachex
 import (
 	"context"
 	"fmt"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDistributedLock_TryLock(t *testing.T) {
@@ -97,7 +98,9 @@ func TestDistributedLock_Lock(t *testing.T) {
 	case err := <-done:
 		// 由于超时，应该返回错误
 		assert.Error(t, err, "阻塞锁在超时后应该返回错误")
-		assert.Contains(t, err.Error(), "context deadline exceeded", "应该是超时错误")
+		if err != nil {
+			assert.Contains(t, err.Error(), "context deadline exceeded", "应该是超时错误")
+		}
 	case <-time.After(time.Second):
 		t.Fatal("测试超时")
 	}

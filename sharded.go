@@ -17,6 +17,8 @@ import (
 	"fmt"
 	"hash/fnv"
 	"time"
+
+	"github.com/kamalyes/go-toolbox/pkg/syncx"
 )
 
 // ShardedHandler 将缓存分成多个 shard，每个 shard 使用独立的 Handler 实例
@@ -133,7 +135,9 @@ func (h *ShardedHandler) BatchGetWithCtx(ctx context.Context, keys [][]byte) ([]
 	resultChan := make(chan shardResult, len(shardGroups))
 
 	for shardIdx, indices := range shardGroups {
-		go func(sIdx int, idxs []int) {
+		sIdx := shardIdx // 避免闭包捕获循环变量
+		idxs := indices
+		syncx.Go().OnPanic(nil).Exec(func() {
 			shardKeys := make([][]byte, len(idxs))
 			for i, idx := range idxs {
 				shardKeys[i] = keys[idx]
@@ -146,7 +150,7 @@ func (h *ShardedHandler) BatchGetWithCtx(ctx context.Context, keys [][]byte) ([]
 				errors:   shardErrors,
 				indices:  idxs,
 			}
-		}(shardIdx, indices)
+		})
 	}
 
 	// 收集结果

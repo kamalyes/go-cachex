@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/kamalyes/go-toolbox/pkg/mathx"
+	"github.com/kamalyes/go-toolbox/pkg/syncx"
 	"github.com/kamalyes/go-toolbox/pkg/validator"
 	"github.com/kamalyes/go-toolbox/pkg/zipx"
 	"github.com/redis/go-redis/v9"
@@ -644,7 +645,9 @@ func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T
 
 		// 如果启用了异步更新，则在后台更新缓存
 		if options.UseAsync {
-			go updateCache(client, key, cacheData, expiration, options)
+			syncx.Go().OnPanic(nil).Exec(func() {
+				updateCache(client, key, cacheData, expiration, options)
+			})
 			return result, nil
 		}
 
@@ -693,7 +696,7 @@ func updateCache(client *redis.Client, key string, cacheData string, expiration 
 	if err == nil {
 		// 第二次删除（延迟执行）：防止并发写入导致的缓存不一致
 		// 启动异步goroutine执行延迟删除和重新设置
-		go func() {
+		syncx.Go().OnPanic(nil).Exec(func() {
 			// 延迟100ms等待可能的并发操作完成
 			time.Sleep(100 * time.Millisecond)
 
@@ -702,6 +705,6 @@ func updateCache(client *redis.Client, key string, cacheData string, expiration 
 
 			// 重新设置最新的缓存数据，确保缓存的最终一致性
 			client.Set(context.Background(), key, cacheData, expiration)
-		}()
+		})
 	}
 }

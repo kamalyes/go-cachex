@@ -19,6 +19,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kamalyes/go-logger"
+	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -37,6 +39,7 @@ type AdvancedCacheConfig struct {
 	DefaultTTL         time.Duration   // 默认TTL
 	Namespace          string          // 命名空间
 	EnableMetrics      bool            // 是否启用指标统计
+	Logger             logger.ILogger  // 日志记录器（可选，不设置则使用 NoOpLogger）
 }
 
 // CacheMetrics 缓存指标
@@ -58,24 +61,21 @@ type AdvancedCache[T any] struct {
 	queue   *QueueHandler
 	hotkey  *HotKeyManager
 	lockMgr *LockManager
+	logger  logger.ILogger
 }
 
 // NewAdvancedCache 创建高级缓存
 func NewAdvancedCache[T any](client *redis.Client, config AdvancedCacheConfig) *AdvancedCache[T] {
-	if config.MinSizeForCompress == 0 {
-		config.MinSizeForCompress = 1024 // 1KB
-	}
-	if config.DefaultTTL == 0 {
-		config.DefaultTTL = time.Hour
-	}
-	if config.Namespace == "" {
-		config.Namespace = "cache"
-	}
+	config.MinSizeForCompress = mathx.IfNotZero(config.MinSizeForCompress, 1024) // 1KB
+	config.DefaultTTL = mathx.IfNotZero(config.DefaultTTL, time.Hour)
+	config.Namespace = mathx.IfNotEmpty(config.Namespace, "cache")
+	config.Logger = mathx.IfEmpty(config.Logger, NewDefaultCachexLogger())
 
 	cache := &AdvancedCache[T]{
 		client:  client,
 		config:  config,
 		metrics: &CacheMetrics{},
+		logger:  config.Logger,
 	}
 
 	// 初始化队列
@@ -127,10 +127,12 @@ func (c *AdvancedCache[T]) compress(data []byte) ([]byte, error) {
 
 	if _, err := writer.Write(data); err != nil {
 		writer.Close()
+		c.logger.Errorf("failed to write compressed data: %v", err)
 		return nil, err
 	}
 
 	if err := writer.Close(); err != nil {
+		c.logger.Errorf("failed to close gzip writer: %v", err)
 		return nil, err
 	}
 
@@ -189,6 +191,7 @@ func (c *AdvancedCache[T]) Set(ctx context.Context, key string, value T, ttl ...
 	fullKey := c.getKey(key)
 	err = c.client.SetEx(ctx, fullKey, compressedData, cacheTTL).Err()
 	if err != nil {
+		c.logger.Errorf("failed to set cache for key %s: %v", key, err)
 		return err
 	}
 
@@ -213,6 +216,7 @@ func (c *AdvancedCache[T]) Get(ctx context.Context, key string) (T, bool, error)
 			}
 			return zero, false, nil
 		}
+		c.logger.Errorf("failed to get cache for key %s: %v", key, err)
 		return zero, false, err
 	}
 
@@ -247,6 +251,7 @@ func (c *AdvancedCache[T]) GetOrSet(ctx context.Context, key string, fn func() (
 
 	if err := lock.Lock(ctx); err != nil {
 		// 如果获取锁失败，直接执行函数
+		c.logger.Warnf("failed to acquire lock for key %s, executing function directly: %v", key, err)
 		return fn()
 	}
 	defer lock.Unlock(ctx)
@@ -265,7 +270,7 @@ func (c *AdvancedCache[T]) GetOrSet(ctx context.Context, key string, fn func() (
 	// 设置缓存
 	if setErr := c.Set(ctx, key, value, ttl...); setErr != nil {
 		// 记录错误但不影响返回结果
-		fmt.Printf("failed to set cache: %v\n", setErr)
+		c.logger.Warnf("failed to set cache: %v", setErr)
 	}
 
 	return value, nil
@@ -284,6 +289,7 @@ func (c *AdvancedCache[T]) Delete(ctx context.Context, keys ...string) error {
 
 	err := c.client.Del(ctx, fullKeys...).Err()
 	if err != nil {
+		c.logger.Errorf("failed to delete %d keys: %v", len(keys), err)
 		return err
 	}
 
@@ -432,9 +438,11 @@ func (c *AdvancedCache[T]) BatchGet(ctx context.Context, keys []string) (map[str
 
 	_, err := pipe.Exec(ctx)
 	if err != nil && err != redis.Nil {
+		c.logger.Errorf("failed to batch get %d keys: %v", len(keys), err)
 		return nil, err
 	}
 
+	c.logger.Debugf("batch getting %d keys", len(keys))
 	result := make(map[string]T)
 
 	for i, cmd := range cmds {
@@ -476,14 +484,19 @@ func (c *AdvancedCache[T]) BatchSet(ctx context.Context, items map[string]T, ttl
 
 	pipe := c.client.Pipeline()
 
+	skippedCount := 0
 	for key, value := range items {
 		data, err := json.Marshal(value)
 		if err != nil {
+			c.logger.Warnf("failed to marshal value for key %s: %v", key, err)
+			skippedCount++
 			continue
 		}
 
 		compressedData, err := c.compress(data)
 		if err != nil {
+			c.logger.Warnf("failed to compress data for key %s: %v", key, err)
+			skippedCount++
 			continue
 		}
 
@@ -491,6 +504,10 @@ func (c *AdvancedCache[T]) BatchSet(ctx context.Context, items map[string]T, ttl
 		pipe.SetEx(ctx, fullKey, compressedData, cacheTTL)
 	}
 
+	c.logger.Debugf("batch setting %d keys (skipped %d)", len(items)-skippedCount, skippedCount)
 	_, err := pipe.Exec(ctx)
+	if err != nil {
+		c.logger.Errorf("failed to batch set %d keys: %v", len(items), err)
+	}
 	return err
 }

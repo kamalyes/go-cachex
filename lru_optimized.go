@@ -25,6 +25,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"github.com/kamalyes/go-toolbox/pkg/syncx"
 )
 
 const (
@@ -45,13 +47,13 @@ var (
 // 初始化时间戳缓存
 func init() {
 	updateCachedTimestamp()
-	go func() {
+	syncx.Go().OnPanic(nil).Exec(func() {
 		ticker := time.NewTicker(time.Millisecond * timestampCacheInterval)
 		defer ticker.Stop()
 		for range ticker.C {
 			updateCachedTimestamp()
 		}
-	}()
+	})
 }
 
 func updateCachedTimestamp() {
@@ -534,7 +536,8 @@ func (h *LRUOptimizedHandler) BatchGetWithCtx(ctx context.Context, keys [][]byte
 	var wg sync.WaitGroup
 	for _, batch := range batches {
 		wg.Add(1)
-		go func(b *shardBatch) {
+		b := batch // 避免闭包捕获循环变量
+		syncx.Go().OnPanic(nil).Exec(func() {
 			defer wg.Done()
 
 			b.shard.mu.RLock()
@@ -557,7 +560,7 @@ func (h *LRUOptimizedHandler) BatchGetWithCtx(ctx context.Context, keys [][]byte
 				results[idx] = make([]byte, len(entry.value))
 				copy(results[idx], entry.value)
 			}
-		}(batch)
+		})
 	}
 
 	wg.Wait()
