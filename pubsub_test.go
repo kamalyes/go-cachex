@@ -323,12 +323,11 @@ func TestSubscriber_Unsubscribe(t *testing.T) {
 	ctx := context.Background()
 
 	config := PubSubConfig{
-		Namespace:     "subscriber_unsub_test",
-		MaxRetries:    2,
-		RetryDelay:    time.Millisecond * 50,
-		BufferSize:    10,
-		EnableLogging: true,
-		PingInterval:  time.Second,
+		Namespace:    "subscriber_unsub_test",
+		MaxRetries:   2,
+		RetryDelay:   time.Millisecond * 50,
+		BufferSize:   10,
+		PingInterval: time.Second,
 	}
 
 	pubsub := NewPubSub(client, config)
@@ -405,12 +404,11 @@ func TestSubscriber_UnsubscribePattern(t *testing.T) {
 	ctx := context.Background()
 
 	config := PubSubConfig{
-		Namespace:     "pattern_unsub_test",
-		MaxRetries:    2,
-		RetryDelay:    time.Millisecond * 50,
-		BufferSize:    10,
-		EnableLogging: true,
-		PingInterval:  time.Second,
+		Namespace:    "pattern_unsub_test",
+		MaxRetries:   2,
+		RetryDelay:   time.Millisecond * 50,
+		BufferSize:   10,
+		PingInterval: time.Second,
 	}
 
 	pubsub := NewPubSub(client, config)
@@ -476,12 +474,11 @@ func TestSubscriber_GetSubscriptionInfo(t *testing.T) {
 	defer client.Close()
 
 	config := PubSubConfig{
-		Namespace:     "info_test",
-		MaxRetries:    2,
-		RetryDelay:    time.Millisecond * 50,
-		BufferSize:    10,
-		EnableLogging: false,
-		PingInterval:  time.Second,
+		Namespace:    "info_test",
+		MaxRetries:   2,
+		RetryDelay:   time.Millisecond * 50,
+		BufferSize:   10,
+		PingInterval: time.Second,
 	}
 
 	pubsub := NewPubSub(client, config)
@@ -537,12 +534,11 @@ func TestSubscriber_Resubscribe(t *testing.T) {
 	ctx := context.Background()
 
 	config := PubSubConfig{
-		Namespace:     "resubscribe_test",
-		MaxRetries:    2,
-		RetryDelay:    time.Millisecond * 50,
-		BufferSize:    10,
-		EnableLogging: true,
-		PingInterval:  time.Second,
+		Namespace:    "resubscribe_test",
+		MaxRetries:   2,
+		RetryDelay:   time.Millisecond * 50,
+		BufferSize:   10,
+		PingInterval: time.Second,
 	}
 
 	pubsub := NewPubSub(client, config)
@@ -618,12 +614,11 @@ func TestSubscriber_ResubscribePattern(t *testing.T) {
 	ctx := context.Background()
 
 	config := PubSubConfig{
-		Namespace:     "resubscribe_pattern_test",
-		MaxRetries:    2,
-		RetryDelay:    time.Millisecond * 50,
-		BufferSize:    10,
-		EnableLogging: true,
-		PingInterval:  time.Second,
+		Namespace:    "resubscribe_pattern_test",
+		MaxRetries:   2,
+		RetryDelay:   time.Millisecond * 50,
+		BufferSize:   10,
+		PingInterval: time.Second,
 	}
 
 	pubsub := NewPubSub(client, config)
@@ -808,12 +803,11 @@ func TestPubSub_Stats(t *testing.T) {
 
 	// 创建单独的PubSub实例避免与其他测试冲突
 	config := PubSubConfig{
-		Namespace:     "stats_test",
-		MaxRetries:    2,
-		RetryDelay:    time.Millisecond * 50,
-		BufferSize:    10,
-		EnableLogging: true,
-		PingInterval:  time.Second,
+		Namespace:    "stats_test",
+		MaxRetries:   2,
+		RetryDelay:   time.Millisecond * 50,
+		BufferSize:   10,
+		PingInterval: time.Second,
 	}
 
 	pubsub := NewPubSub(client, config)
@@ -864,7 +858,6 @@ func TestPubSub_ErrorHandling(t *testing.T) {
 		MaxRetries:    2,
 		RetryDelay:    time.Millisecond * 50,
 		BufferSize:    10,
-		EnableLogging: false, // 禁用日志避免测试输出混乱
 		PingInterval:  time.Second,
 	}
 

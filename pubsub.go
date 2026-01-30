@@ -43,7 +43,6 @@ type PubSubConfig struct {
 	MaxRetries         int            // 最大重试次数
 	RetryDelay         time.Duration  // 重试延迟
 	BufferSize         int            // 消息缓冲区大小
-	EnableLogging      bool           // 是否启用日志
 	Logger             logger.ILogger // 日志记录器（可选，不设置则使用 NoOpLogger）
 	PingInterval       time.Duration  // 心跳间隔
 	EnableCompression  bool           // 是否启用消息压缩（使用 gzip）
@@ -57,7 +56,6 @@ func DefaultPubSubConfig() PubSubConfig {
 		MaxRetries:         2,                      // 减少重试次数
 		RetryDelay:         time.Millisecond * 100, // 大幅减少重试延迟
 		BufferSize:         100,
-		EnableLogging:      false,                    // 默认关闭日志避免额外开销
 		Logger:             NewDefaultCachexLogger(), // 默认使用空日志器
 		PingInterval:       time.Second * 10,         // 减少心跳间隔
 		EnableCompression:  false,                    // 默认关闭压缩
@@ -74,6 +72,7 @@ type PubSub struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
+	logger      logger.ILogger
 }
 
 // NewPubSub 创建发布订阅实例
@@ -89,13 +88,6 @@ func NewPubSub(redisClient redis.UniversalClient, config ...PubSubConfig) *PubSu
 		cfg = config[0]
 	}
 
-	// 根据 EnableLogging 设置日志器
-	if cfg.Logger == logger.NoLogger {
-		cfg.Logger = NewDefaultCachexLogger()
-	} else if !cfg.EnableLogging {
-		cfg.Logger = logger.NoLogger
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &PubSub{
@@ -104,6 +96,7 @@ func NewPubSub(redisClient redis.UniversalClient, config ...PubSubConfig) *PubSu
 		subscribers: make(map[string]*Subscriber),
 		ctx:         ctx,
 		cancel:      cancel,
+		logger:      mathx.IfEmpty(cfg.Logger, NewDefaultCachexLogger()),
 	}
 }
 
@@ -137,11 +130,11 @@ func (p *PubSub) Publish(ctx context.Context, channel string, message interface{
 	if p.config.EnableCompression && len(data) >= p.config.CompressionMinSize {
 		compressed, err := zipx.GzipCompressWithPrefix([]byte(data))
 		if err != nil {
-			p.config.Logger.Warnf("Failed to compress message: %v, sending uncompressed", err)
+			p.logger.Warnf("Failed to compress message: %v, sending uncompressed", err)
 		} else {
 			originalLen := len(data)
 			data = string(compressed)
-			p.config.Logger.Debugf("Compressed message from %d to %d bytes (%.1f%% reduction)",
+			p.logger.Debugf("Compressed message from %d to %d bytes (%.1f%% reduction)",
 				originalLen, len(compressed)-CompressionPrefixLen,
 				100.0*(1-float64(len(compressed)-CompressionPrefixLen)/float64(originalLen)))
 		}
@@ -156,9 +149,9 @@ func (p *PubSub) Publish(ctx context.Context, channel string, message interface{
 		SetCaller(fmt.Sprintf("PubSub.Publish(%s)", channel))
 
 	retrier.SetErrCallback(func(nowAttemptCount, remainCount int, err error, funcName ...string) {
-		p.config.Logger.Warnf("Publish attempt %d failed for channel %s: %v", nowAttemptCount, channel, err)
+		p.logger.Warnf("Publish attempt %d failed for channel %s: %v", nowAttemptCount, channel, err)
 	}).SetSuccessCallback(func(funcName ...string) {
-		p.config.Logger.Debugf("Publish succeeded for channel %s", channel)
+		p.logger.Debugf("Publish succeeded for channel %s", channel)
 	})
 
 	return retrier.Do(func() error {
@@ -222,7 +215,7 @@ func SubscribeJSON[T any](p *PubSub, channels []string, handler TypedMessageHand
 	jsonHandler := func(ctx context.Context, channel string, message string) error {
 		var data T
 		if err := json.Unmarshal([]byte(message), &data); err != nil {
-			p.config.Logger.Errorf("Failed to unmarshal message from channel %s: %v", channel, err)
+			p.logger.Errorf("Failed to unmarshal message from channel %s: %v", channel, err)
 			return err
 		}
 		return handler(ctx, channel, data)
@@ -629,7 +622,7 @@ func (p *PubSub) BroadcastMessage(ctx context.Context, channels []string, messag
 	for _, channel := range channels {
 		if err := p.Publish(ctx, channel, message); err != nil {
 			lastErr = err
-			p.config.Logger.Errorf("Failed to broadcast to channel %s: %v", channel, err)
+			p.logger.Errorf("Failed to broadcast to channel %s: %v", channel, err)
 		}
 	}
 	return lastErr
@@ -670,4 +663,13 @@ func (p *PubSub) RequestResponse(ctx context.Context, requestChannel, responseCh
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
+}
+
+// ============================================================================
+// Redis 客户端访问和常用操作
+// ============================================================================
+
+// GetClient 获取底层 Redis 客户端（用于高级操作）
+func (p *PubSub) GetClient() *redis.Client {
+	return p.client
 }
