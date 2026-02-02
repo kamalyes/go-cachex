@@ -3,7 +3,7 @@ module github.com/kamalyes/go-cachex
 go 1.24.0
 
 require (
-	github.com/alicebob/miniredis/v2 v2.35.0
+	github.com/alicebob/miniredis/v2 v2.36.1
 	github.com/dgraph-io/ristretto/v2 v2.3.0
 	github.com/kamalyes/go-logger v0.4.6-0.20260202105416-2913809239fa
 	github.com/kamalyes/go-toolbox v0.11.87-0.20260130052916-b1a1dedd2346
