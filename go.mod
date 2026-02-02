@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/alicebob/miniredis/v2 v2.35.0
-	github.com/dgraph-io/ristretto/v2 v2.3.0
+	github.com/dgraph-io/ristretto/v2 v2.4.0
 	github.com/kamalyes/go-logger v0.4.6-0.20260202033902-78b0b957f6ea
 	github.com/kamalyes/go-toolbox v0.11.87-0.20260130052916-b1a1dedd2346
 	github.com/redis/go-redis/v9 v9.16.0
