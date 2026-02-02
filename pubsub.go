@@ -56,10 +56,9 @@ func DefaultPubSubConfig() PubSubConfig {
 		MaxRetries:         2,                      // 减少重试次数
 		RetryDelay:         time.Millisecond * 100, // 大幅减少重试延迟
 		BufferSize:         100,
-		Logger:             NewDefaultCachexLogger(), // 默认使用空日志器
-		PingInterval:       time.Second * 10,         // 减少心跳间隔
-		EnableCompression:  false,                    // 默认关闭压缩
-		CompressionMinSize: 1024,                     // 默认1KB以上才压缩
+		PingInterval:       time.Second * 10, // 减少心跳间隔
+		EnableCompression:  false,            // 默认关闭压缩
+		CompressionMinSize: 1024,             // 默认1KB以上才压缩
 	}
 }
 
