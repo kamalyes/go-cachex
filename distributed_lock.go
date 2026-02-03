@@ -12,14 +12,13 @@ package cachex
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/kamalyes/go-logger"
+	"github.com/kamalyes/go-toolbox/pkg/idgen"
 	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/kamalyes/go-toolbox/pkg/syncx"
 	"github.com/redis/go-redis/v9"
@@ -69,7 +68,6 @@ func NewDistributedLock(client *redis.Client, key string, config LockConfig) *Di
 	config.MaxRetries = mathx.IfNotZero(config.MaxRetries, 10)
 	config.Namespace = mathx.IfNotEmpty(config.Namespace, "lock")
 	config.WatchdogInterval = mathx.IfNotZero(config.WatchdogInterval, config.TTL/3)
-	config.Logger = mathx.IfEmpty(config.Logger, NewDefaultCachexLogger())
 
 	lockKey := fmt.Sprintf("%s:%s", config.Namespace, key)
 
@@ -77,17 +75,10 @@ func NewDistributedLock(client *redis.Client, key string, config LockConfig) *Di
 		client: client,
 		config: config,
 		key:    lockKey,
-		logger: config.Logger,
+		logger: mathx.IfEmpty(config.Logger, NewDefaultCachexLogger()),
 		// token将在TryLock时生成
 		stopChan: nil, // 将在获取锁时创建
 	}
-}
-
-// generateToken 生成唯一令牌
-func generateToken() string {
-	bytes := make([]byte, 16)
-	rand.Read(bytes)
-	return hex.EncodeToString(bytes)
 }
 
 // TryLock 尝试获取锁（非阻塞）
@@ -100,7 +91,7 @@ func (l *DistributedLock) TryLock(ctx context.Context) (bool, error) {
 	}
 
 	// 重新生成token确保每次获取锁都有唯一标识
-	l.token = generateToken()
+	l.token = idgen.NewDefaultIDGenerator().GenerateTraceID()
 
 	// 使用SET命令的NX和EX选项原子性地设置锁
 	result, err := l.client.SetNX(ctx, l.key, l.token, l.config.TTL).Result()
@@ -120,9 +111,7 @@ func (l *DistributedLock) TryLock(ctx context.Context) (bool, error) {
 			l.stopChan = make(chan struct{})
 			syncx.Go(ctx).
 				OnPanic(func(r interface{}) {
-					if l.logger != nil {
-						l.logger.Errorf("Panic in watchdog: %v", r)
-					}
+					l.logger.Errorf("Panic in watchdog: %v", r)
 				}).
 				Exec(func() { l.watchdog(ctx) })
 		}
@@ -344,6 +333,7 @@ type LockManager struct {
 	config LockConfig
 	locks  map[string]*DistributedLock
 	mu     sync.RWMutex
+	logger logger.ILogger // 日志记录器
 }
 
 // NewLockManager 创建锁管理器
@@ -370,6 +360,7 @@ func NewLockManager(redisClient redis.UniversalClient, config ...LockConfig) *Lo
 		client: client,
 		config: cfg,
 		locks:  make(map[string]*DistributedLock),
+		logger: mathx.IfEmpty(cfg.Logger, NewDefaultCachexLogger()),
 	}
 }
 
@@ -393,7 +384,7 @@ func (m *LockManager) ReleaseLock(ctx context.Context, key string) error {
 	lock, exists := m.locks[key]
 	if !exists {
 		m.mu.Unlock()
-		m.config.Logger.Warnf("attempted to release non-existent lock: %s", key)
+		m.logger.Warnf("attempted to release non-existent lock: %s", key)
 		return ErrLockNotFound
 	}
 	delete(m.locks, key)
@@ -401,7 +392,7 @@ func (m *LockManager) ReleaseLock(ctx context.Context, key string) error {
 
 	err := lock.Unlock(ctx)
 	if err == nil {
-		m.config.Logger.Debugf("lock manager released lock: %s", key)
+		m.logger.Debugf("lock manager released lock: %s", key)
 	}
 	return err
 }
@@ -422,13 +413,13 @@ func (m *LockManager) ReleaseAllLocks(ctx context.Context) error {
 	for key, lock := range locks {
 		if err := lock.Unlock(ctx); err != nil {
 			lastErr = fmt.Errorf("failed to release lock %s: %w", key, err)
-			m.config.Logger.Errorf("failed to release lock %s: %v", key, err)
+			m.logger.Errorf("failed to release lock %s: %v", key, err)
 		} else {
 			releasedCount++
 		}
 	}
 
-	m.config.Logger.Infof("released %d/%d locks", releasedCount, len(locks))
+	m.logger.Infof("released %d/%d locks", releasedCount, len(locks))
 
 	return lastErr
 }

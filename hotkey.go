@@ -70,7 +70,6 @@ func NewHotKeyCache[K comparable, V any](
 	config.DefaultTTL = mathx.IfNotZero(config.DefaultTTL, time.Hour)
 	config.RefreshInterval = mathx.IfNotZero(config.RefreshInterval, time.Minute*10)
 	config.Namespace = mathx.IfNotEmpty(config.Namespace, "hotkey")
-	config.Logger = mathx.IfEmpty(config.Logger, NewDefaultCachexLogger())
 
 	cache := &HotKeyCache[K, V]{
 		client:     client,
@@ -79,14 +78,14 @@ func NewHotKeyCache[K comparable, V any](
 		keyName:    keyName,
 		localCache: make(map[K]V),
 		stopChan:   make(chan struct{}),
-		logger:     config.Logger,
+		logger:     mathx.IfEmpty(config.Logger, NewDefaultCachexLogger()),
 	}
 
 	// 启动自动刷新
 	if config.EnableAutoRefresh {
 		syncx.Go().
 			OnPanic(func(r interface{}) {
-				cache.config.Logger.Errorf("Panic in autoRefresh: %v", r)
+				cache.logger.Errorf("Panic in autoRefresh: %v", r)
 			}).
 			Exec(cache.autoRefresh)
 	}

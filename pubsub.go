@@ -365,14 +365,14 @@ func (s *Subscriber) start() error {
 	s.pubsub.wg.Add(1)
 	syncx.Go(s.pubsub.ctx).
 		OnPanic(func(r interface{}) {
-			s.config.Logger.Errorf("Panic in messageLoop: %v", r)
+			s.pubsub.logger.Errorf("Panic in messageLoop: %v", r)
 		}).
 		Exec(s.messageLoop)
 
 	if s.isPattern {
-		s.config.Logger.Infof("Started pattern subscription for: %v", s.patterns)
+		s.pubsub.logger.Infof("Started pattern subscription for: %v", s.patterns)
 	} else {
-		s.config.Logger.Infof("Started subscription for channels: %v", s.channels)
+		s.pubsub.logger.Infof("Started subscription for channels: %v", s.channels)
 	}
 
 	return nil
@@ -393,7 +393,7 @@ func (s *Subscriber) messageLoop() {
 		select {
 		case msg, ok := <-ch:
 			if !ok {
-				s.config.Logger.Info("Subscription channel closed")
+				s.pubsub.logger.Info("Subscription channel closed")
 				return
 			}
 
@@ -404,16 +404,16 @@ func (s *Subscriber) messageLoop() {
 			// 在单独的goroutine中处理消息，避免阻塞
 			syncx.Go(s.pubsub.ctx).
 				OnPanic(func(r interface{}) {
-					s.config.Logger.Errorf("Panic in handleMessage: %v", r)
+					s.pubsub.logger.Errorf("Panic in handleMessage: %v", r)
 				}).
 				Exec(func() { s.handleMessage(msg) })
 
 		case <-s.stopChan:
-			s.config.Logger.Info("Subscription stopped")
+			s.pubsub.logger.Info("Subscription stopped")
 			return
 
 		case <-s.pubsub.ctx.Done():
-			s.config.Logger.Info("PubSub context cancelled")
+			s.pubsub.logger.Info("PubSub context cancelled")
 			return
 		}
 	}
@@ -440,11 +440,11 @@ func (s *Subscriber) handleMessage(msg *redis.Message) {
 	if zipx.IsGzipCompressed(payloadBytes) {
 		decompressed, err := zipx.GzipDecompressWithPrefix(payloadBytes)
 		if err != nil {
-			s.config.Logger.Warnf("Failed to decompress message from channel %s: %v", channel, err)
+			s.pubsub.logger.Warnf("Failed to decompress message from channel %s: %v", channel, err)
 			// 解压失败，使用原始消息
 		} else {
 			payload = string(decompressed)
-			s.config.Logger.Debugf("Decompressed message from %d to %d bytes", len(payloadBytes)-CompressionPrefixLen, len(payload))
+			s.pubsub.logger.Debugf("Decompressed message from %d to %d bytes", len(payloadBytes)-CompressionPrefixLen, len(payload))
 		}
 	}
 
@@ -459,15 +459,15 @@ func (s *Subscriber) handleMessage(msg *redis.Message) {
 		SetCaller(fmt.Sprintf("Subscriber.handleMessage(%s)", channel))
 
 	retrier.SetErrCallback(func(nowAttemptCount, remainCount int, err error, funcName ...string) {
-		s.config.Logger.Warnf("Message handler failed (attempt %d) for channel %s: %v", nowAttemptCount, channel, err)
+		s.pubsub.logger.Warnf("Message handler failed (attempt %d) for channel %s: %v", nowAttemptCount, channel, err)
 	}).SetSuccessCallback(func(funcName ...string) {
-		s.config.Logger.Debugf("Message handled successfully for channel %s", channel)
+		s.pubsub.logger.Debugf("Message handled successfully for channel %s", channel)
 	})
 
 	if err := retrier.Do(func() error {
 		return s.handler(ctx, channel, payload)
 	}); err != nil {
-		s.config.Logger.Errorf("Failed to handle message for channel %s after all retries: %v", channel, err)
+		s.pubsub.logger.Errorf("Failed to handle message for channel %s after all retries: %v", channel, err)
 	}
 }
 
@@ -493,7 +493,7 @@ func (s *Subscriber) Unsubscribe() error {
 	}
 	s.pubsub.mu.Unlock()
 
-	s.config.Logger.Infof("Unsubscribed from %d %s", len(keysToRemove),
+	s.pubsub.logger.Infof("Unsubscribed from %d %s", len(keysToRemove),
 		mathx.IF(s.isPattern, "patterns", "channels"))
 
 	return nil
