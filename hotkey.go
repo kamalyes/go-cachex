@@ -368,10 +368,7 @@ func (h *HotKeyCache[K, V]) cleanupExpired() {
 			// 如果超过最大限制，执行 LRU 驱逐
 			if cacheSize > h.config.MaxLocalCacheSize {
 				// 计算需要驱逐的数量（驱逐 20% 的数据）
-				toEvict := cacheSize / 5
-				if toEvict < 1 {
-					toEvict = 1
-				}
+				toEvict := mathx.IfClamp(cacheSize/5, 1, cacheSize)
 
 				// 从访问顺序列表中移除最旧的条目
 				h.accessOrderMu.Lock()

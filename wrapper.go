@@ -26,6 +26,7 @@ package cachex
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"math/rand"
 	"time"
 
@@ -145,9 +146,7 @@ func WithAsyncUpdate() CacheOption {
 func WithRetry(times int) CacheOption {
 	return func(opts *CacheOptions) {
 		opts.RetryOnError = true
-		if times <= 0 {
-			times = 1
-		}
+		times = mathx.IfClamp(times, 1, math.MaxInt)
 		opts.RetryTimes = times
 	}
 }
@@ -463,9 +462,7 @@ func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T
 			jitter := rand.Int63n(int64(jitterRange*2)) - int64(jitterRange)
 			expiration = expiration + time.Duration(jitter)
 			// 确保 TTL 不会为负数
-			if expiration < 0 {
-				expiration = time.Second
-			}
+			expiration = mathx.IfClamp(expiration, time.Second, math.MaxInt64*time.Nanosecond)
 		}
 
 		// 如果设置了强制刷新，直接跳转到数据加载逻辑

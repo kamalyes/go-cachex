@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -105,7 +106,7 @@ func (b *CacheBuilder) WithPubSub() *CacheBuilder {
 
 // WithRefreshThreshold 设置自动刷新阈值
 func (b *CacheBuilder) WithRefreshThreshold(threshold float64) *CacheBuilder {
-	if threshold > 0 && threshold < 1 {
+	if threshold := mathx.IfClamp(threshold, 0.0, 1.0); threshold > 0 {
 		b.strategy.RefreshThreshold = threshold
 	}
 	return b
