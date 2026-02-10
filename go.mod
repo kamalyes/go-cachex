@@ -5,8 +5,8 @@ go 1.24.0
 require (
 	github.com/alicebob/miniredis/v2 v2.35.0
 	github.com/dgraph-io/ristretto/v2 v2.3.0
-	github.com/kamalyes/go-logger v0.4.6-0.20260203085022-0f0923bdc1b1
-	github.com/kamalyes/go-toolbox v0.11.87-0.20260203051032-5f35aa1388aa
+	github.com/kamalyes/go-logger v0.4.6-0.20260210100423-0aa6538a2cd7
+	github.com/kamalyes/go-toolbox v0.11.87-0.20260210115301-40d6debb7cb1
 	github.com/redis/go-redis/v9 v9.16.0
 	github.com/stretchr/testify v1.11.1
 )
@@ -32,7 +32,7 @@ require (
 	github.com/yuin/gopher-lua v1.1.1 // indirect
 	golang.org/x/arch v0.23.0 // indirect
 	golang.org/x/crypto v0.47.0 // indirect
-	golang.org/x/sys v0.40.0 // indirect
+	golang.org/x/sys v0.41.0 // indirect
 	google.golang.org/grpc v1.78.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

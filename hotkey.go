@@ -30,6 +30,7 @@ type HotKeyConfig struct {
 	EnableAutoRefresh bool           // 是否启用自动刷新
 	Namespace         string         // 命名空间
 	Logger            logger.ILogger // 日志记录器（可选，不设置则使用 NoOpLogger）
+	MaxLocalCacheSize int            // 本地缓存最大条目数，防止无界增长，默认 10000
 }
 
 // DataLoader 数据加载器接口
@@ -58,6 +59,10 @@ type HotKeyCache[K comparable, V any] struct {
 	stopChan        chan struct{}
 	once            sync.Once
 	logger          logger.ILogger
+	// 防止本地缓存无界增长
+	accessOrder   []K          // 访问顺序，用于 LRU 驱逐
+	accessOrderMu sync.Mutex   // 保护 accessOrder
+	cleanupTicker *time.Ticker // 定期清理过期数据
 }
 
 // NewHotKeyCache 创建热key缓存
@@ -70,15 +75,19 @@ func NewHotKeyCache[K comparable, V any](
 	config.DefaultTTL = mathx.IfNotZero(config.DefaultTTL, time.Hour)
 	config.RefreshInterval = mathx.IfNotZero(config.RefreshInterval, time.Minute*10)
 	config.Namespace = mathx.IfNotEmpty(config.Namespace, "hotkey")
+	// 防止本地缓存无界增长：设置最大条目数
+	config.MaxLocalCacheSize = mathx.IF(config.MaxLocalCacheSize > 0, config.MaxLocalCacheSize, 10000)
 
 	cache := &HotKeyCache[K, V]{
-		client:     client,
-		config:     config,
-		loader:     loader,
-		keyName:    keyName,
-		localCache: make(map[K]V),
-		stopChan:   make(chan struct{}),
-		logger:     mathx.IfEmpty(config.Logger, NewDefaultCachexLogger()),
+		client:        client,
+		config:        config,
+		loader:        loader,
+		keyName:       keyName,
+		localCache:    make(map[K]V),
+		accessOrder:   make([]K, 0),
+		stopChan:      make(chan struct{}),
+		logger:        mathx.IfEmpty(config.Logger, NewDefaultCachexLogger()),
+		cleanupTicker: time.NewTicker(time.Minute), // 每分钟清理一次
 	}
 
 	// 启动自动刷新
@@ -89,6 +98,13 @@ func NewHotKeyCache[K comparable, V any](
 			}).
 			Exec(cache.autoRefresh)
 	}
+
+	// 启动定期清理
+	syncx.Go().
+		OnPanic(func(r interface{}) {
+			cache.logger.Errorf("Panic in cleanup: %v", r)
+		}).
+		Exec(cache.cleanupExpired)
 
 	return cache
 }
@@ -328,12 +344,50 @@ func (h *HotKeyCache[K, V]) autoRefresh() {
 	}
 }
 
-// Stop 停止自动刷新
+// Stop 停止自动刷新和清理
 func (h *HotKeyCache[K, V]) Stop() {
 	h.once.Do(func() {
-		// 停止自动刷新
+		// 停止自动刷新和清理
 		close(h.stopChan)
+		if h.cleanupTicker != nil {
+			h.cleanupTicker.Stop()
+		}
 	})
+}
+
+// cleanupExpired 定期清理过期数据，防止本地缓存无界增长
+func (h *HotKeyCache[K, V]) cleanupExpired() {
+	for {
+		select {
+		case <-h.stopChan:
+			return
+		case <-h.cleanupTicker.C:
+			h.mu.Lock()
+			cacheSize := len(h.localCache)
+
+			// 如果超过最大限制，执行 LRU 驱逐
+			if cacheSize > h.config.MaxLocalCacheSize {
+				// 计算需要驱逐的数量（驱逐 20% 的数据）
+				toEvict := cacheSize / 5
+				if toEvict < 1 {
+					toEvict = 1
+				}
+
+				// 从访问顺序列表中移除最旧的条目
+				h.accessOrderMu.Lock()
+				for i := 0; i < toEvict && len(h.accessOrder) > 0; i++ {
+					key := h.accessOrder[0]
+					h.accessOrder = h.accessOrder[1:]
+					delete(h.localCache, key)
+				}
+				h.accessOrderMu.Unlock()
+
+				h.logger.Warnf("HotKeyCache %s evicted %d entries (size: %d -> %d)",
+					h.keyName, toEvict, cacheSize, len(h.localCache))
+			}
+			h.mu.Unlock()
+		}
+	}
 }
 
 // GetStats 获取统计信息
@@ -431,6 +485,21 @@ func (m *HotKeyManager) RefreshAll(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// Register 注册热key缓存
+func (m *HotKeyManager) Register(name string, cache interface{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.caches[name] = cache
+}
+
+// Get 获取热key缓存
+func (m *HotKeyManager) Get(name string) (interface{}, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cache, exists := m.caches[name]
+	return cache, exists
 }
 
 // StopAll 停止所有自动刷新

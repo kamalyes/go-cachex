@@ -14,9 +14,10 @@ package cachex
 import (
 	"context"
 	"fmt"
-	"github.com/redis/go-redis/v9"
 	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // CacheStrategy 缓存策略
@@ -193,42 +194,40 @@ type singleCall struct {
 
 // doCall 执行单次调用(singleflight模式) - 优化版无竞争
 func (c *SmartCache) doCall(key string, fn func() (interface{}, error)) (interface{}, error) {
-	for {
-		// 快速路径:检查是否已有进行中的调用
-		if v, loaded := c.loadGroup.Load(key); loaded {
-			sc := v.(*singleCall)
-			sc.wg.Wait()
-			return sc.val, sc.err
-		}
-
-		// 创建新的调用并预先设置wg
-		call := &singleCall{}
-		call.wg.Add(1)
-
-		// 尝试存储(竞争条件处理)
-		actual, loaded := c.loadGroup.LoadOrStore(key, call)
-		if loaded {
-			// 其他goroutine已经开始调用,等待结果
-			sc := actual.(*singleCall)
-			sc.wg.Wait()
-			return sc.val, sc.err
-		}
-
-		// 当前goroutine负责执行调用
-		// 使用defer确保即使panic也能清理
-		func() {
-			defer func() {
-				call.wg.Done()
-				// 延迟删除,确保等待的goroutine都能获取结果
-				time.AfterFunc(time.Millisecond*10, func() {
-					c.loadGroup.Delete(key)
-				})
-			}()
-			call.val, call.err = fn()
-		}()
-
-		return call.val, call.err
+	// 快速路径:检查是否已有进行中的调用
+	if v, loaded := c.loadGroup.Load(key); loaded {
+		sc := v.(*singleCall)
+		sc.wg.Wait()
+		return sc.val, sc.err
 	}
+
+	// 创建新的调用并预先设置wg
+	call := &singleCall{}
+	call.wg.Add(1)
+
+	// 尝试存储(竞争条件处理)
+	actual, loaded := c.loadGroup.LoadOrStore(key, call)
+	if loaded {
+		// 其他goroutine已经开始调用,等待结果
+		sc := actual.(*singleCall)
+		sc.wg.Wait()
+		return sc.val, sc.err
+	}
+
+	// 当前goroutine负责执行调用
+	// 使用defer确保即使panic也能清理
+	func() {
+		defer func() {
+			call.wg.Done()
+			// 延迟删除,确保等待的goroutine都能获取结果
+			time.AfterFunc(time.Millisecond*10, func() {
+				c.loadGroup.Delete(key)
+			})
+		}()
+		call.val, call.err = fn()
+	}()
+
+	return call.val, call.err
 }
 
 // Get 获取缓存(支持自动加载和刷新)

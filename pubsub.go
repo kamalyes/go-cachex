@@ -47,6 +47,8 @@ type PubSubConfig struct {
 	PingInterval       time.Duration  // 心跳间隔
 	EnableCompression  bool           // 是否启用消息压缩（使用 gzip）
 	CompressionMinSize int            // 压缩阈值（字节），小于此值不压缩，默认 1KB
+	MaxWorkers         int            // 消息处理 worker 数量，防止 goroutine 泄漏，默认 20
+	WorkerQueueSize    int            // worker 队列大小，默认 100
 }
 
 // DefaultPubSubConfig 默认配置
@@ -59,6 +61,8 @@ func DefaultPubSubConfig() PubSubConfig {
 		PingInterval:       time.Second * 10, // 减少心跳间隔
 		EnableCompression:  false,            // 默认关闭压缩
 		CompressionMinSize: 1024,             // 默认1KB以上才压缩
+		MaxWorkers:         20,               // 默认 20 个 worker 处理消息
+		WorkerQueueSize:    100,              // 默认队列大小 100
 	}
 }
 
@@ -339,6 +343,7 @@ type Subscriber struct {
 	isPattern   bool
 	pubSubConn  *redis.PubSub
 	once        sync.Once
+	pool        *syncx.WorkerPool // Worker 池，用于限制消息处理的并发数
 }
 
 // start 启动订阅
@@ -360,6 +365,9 @@ func (s *Subscriber) start() error {
 		s.pubSubConn.Close()
 		return fmt.Errorf("failed to subscribe: %w", err)
 	}
+
+	// 创建 Worker 池处理消息，防止 goroutine 无限增长
+	s.pool = syncx.NewWorkerPool(s.config.MaxWorkers, s.config.WorkerQueueSize)
 
 	// 启动消息接收goroutine
 	s.pubsub.wg.Add(1)
@@ -385,6 +393,10 @@ func (s *Subscriber) messageLoop() {
 		if s.pubSubConn != nil {
 			s.pubSubConn.Close()
 		}
+		// 关闭 Worker 池，等待所有消息处理完成
+		if s.pool != nil {
+			s.pool.Close()
+		}
 	}()
 
 	ch := s.pubSubConn.Channel()
@@ -401,12 +413,13 @@ func (s *Subscriber) messageLoop() {
 				continue
 			}
 
-			// 在单独的goroutine中处理消息，避免阻塞
-			syncx.Go(s.pubsub.ctx).
-				OnPanic(func(r interface{}) {
-					s.pubsub.logger.Errorf("Panic in handleMessage: %v", r)
-				}).
-				Exec(func() { s.handleMessage(msg) })
+			// 使用 Worker 池处理消息，避免无限创建 goroutine
+			// 如果队列满，会阻塞直到有空位
+			if err := s.pool.Submit(s.pubsub.ctx, func() {
+				s.handleMessage(msg)
+			}); err != nil {
+				s.pubsub.logger.Warnf("Failed to submit message to worker pool: %v", err)
+			}
 
 		case <-s.stopChan:
 			s.pubsub.logger.Info("Subscription stopped")
@@ -514,6 +527,12 @@ func (s *Subscriber) GetSubscriptionInfo() *SubscriptionInfo {
 func (s *Subscriber) Resubscribe() error {
 	if s.IsActive() {
 		return fmt.Errorf("subscriber is already active")
+	}
+
+	// 关闭旧的 pool
+	if s.pool != nil {
+		s.pool.Close()
+		s.pool = nil
 	}
 
 	// 重置 stopChan（需要新的 once）

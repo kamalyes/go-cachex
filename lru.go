@@ -17,6 +17,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/kamalyes/go-toolbox/pkg/mathx"
 )
 
 // LRUHandler 是一个简单的线程安全 LRU 缓存实现，满足 Handler 接口
@@ -37,8 +39,13 @@ type lruEntry struct {
 	expiry time.Time // zero 表示不过期
 }
 
-// NewLRUHandler 创建一个新的 LRUHandler，maxEntries<=0 表示无限容量
+// 防止无界内存增长：强制设置最小容量
+const DefaultMaxEntries = 10000
+
+// NewLRUHandler 创建一个新的 LRUHandler，maxEntries<=0 时使用默认容量
 func NewLRUHandler(maxEntries int) *LRUHandler {
+	maxEntries = mathx.IF(maxEntries > 0, maxEntries, DefaultMaxEntries)
+
 	return &LRUHandler{
 		maxEntries: maxEntries,
 		ll:         list.New(),
@@ -46,10 +53,19 @@ func NewLRUHandler(maxEntries int) *LRUHandler {
 	}
 }
 
+// copyBytes 复制字节切片，防止大数据导致内存溢出
+// 最大值大小限制为 100MB，超过此限制将返回 nil
 func copyBytes(b []byte) []byte {
 	if b == nil {
 		return nil
 	}
+
+	// 防止超大数据复制导致 OOM
+	const MaxValueSize = 100 * 1024 * 1024 // 100MB
+	if len(b) > MaxValueSize {
+		return nil
+	}
+
 	nb := make([]byte, len(b))
 	copy(nb, b)
 	return nb
