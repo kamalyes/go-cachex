@@ -61,21 +61,21 @@ func DefaultPubSubConfig() PubSubConfig {
 		PingInterval:       time.Second * 10, // 减少心跳间隔
 		EnableCompression:  false,            // 默认关闭压缩
 		CompressionMinSize: 1024,             // 默认1KB以上才压缩
-		MaxWorkers:         20,               // 默认 20 个 worker 处理消息
-		WorkerQueueSize:    100,              // 默认队列大小 100
+		MaxWorkers:         50,               // 默认 50 个 worker 处理消息
+		WorkerQueueSize:    200,              // 默认队列大小 200
 	}
 }
 
 // PubSub Redis发布订阅封装
 type PubSub struct {
-	client      *redis.Client
-	config      PubSubConfig
-	subscribers map[string]*Subscriber
-	mu          sync.RWMutex
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-	logger      logger.ILogger
+	client      *redis.Client          // Redis 客户端
+	config      PubSubConfig           // 发布订阅配置
+	subscribers map[string]*Subscriber // 订阅者注册表，key 为频道或模式名
+	mu          sync.RWMutex           // 保护 subscribers 的读写锁
+	ctx         context.Context        // 全局上下文
+	cancel      context.CancelFunc     // 取消函数，用于关闭所有订阅
+	wg          sync.WaitGroup         // 等待所有 goroutine 结束
+	logger      logger.ILogger         // 日志记录器
 }
 
 // NewPubSub 创建发布订阅实例
@@ -112,7 +112,7 @@ func (p *PubSub) getChannelKey(channel string) string {
 }
 
 // Publish 发布消息
-func (p *PubSub) Publish(ctx context.Context, channel string, message interface{}) error {
+func (p *PubSub) Publish(ctx context.Context, channel string, message any) error {
 	var data string
 
 	switch v := message.(type) {
@@ -193,20 +193,20 @@ func (p *PubSub) Subscribe(channels []string, handler MessageHandler) (*Subscrib
 	}
 
 	// 注册订阅者
-	p.mu.Lock()
-	for _, channel := range channels {
-		p.subscribers[channel] = subscriber
-	}
-	p.mu.Unlock()
+	syncx.WithLock(&p.mu, func() {
+		for _, channel := range channels {
+			p.subscribers[channel] = subscriber
+		}
+	})
 
 	// 启动订阅
 	if err := subscriber.start(); err != nil {
 		// 清理注册的订阅者
-		p.mu.Lock()
-		for _, channel := range channels {
-			delete(p.subscribers, channel)
-		}
-		p.mu.Unlock()
+		syncx.WithLock(&p.mu, func() {
+			for _, channel := range channels {
+				delete(p.subscribers, channel)
+			}
+		})
 		return nil, err
 	}
 
@@ -254,20 +254,20 @@ func (p *PubSub) SubscribePattern(patterns []string, handler MessageHandler) (*S
 	}
 
 	// 注册订阅者
-	p.mu.Lock()
-	for _, pattern := range patterns {
-		p.subscribers[pattern] = subscriber
-	}
-	p.mu.Unlock()
+	syncx.WithLock(&p.mu, func() {
+		for _, pattern := range patterns {
+			p.subscribers[pattern] = subscriber
+		}
+	})
 
 	// 启动订阅
 	if err := subscriber.start(); err != nil {
 		// 清理注册的订阅者
-		p.mu.Lock()
-		for _, pattern := range patterns {
-			delete(p.subscribers, pattern)
-		}
-		p.mu.Unlock()
+		syncx.WithLock(&p.mu, func() {
+			for _, pattern := range patterns {
+				delete(p.subscribers, pattern)
+			}
+		})
 		return nil, err
 	}
 
@@ -280,14 +280,21 @@ func (p *PubSub) Unsubscribe(channels ...string) error {
 		return nil
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for _, channel := range channels {
-		if subscriber, exists := p.subscribers[channel]; exists {
-			subscriber.Stop()
-			delete(p.subscribers, channel)
+	// 收集唯一的订阅者并删除，避免重复 Stop
+	uniqueSubscribers := syncx.WithLockReturnValue(&p.mu, func() map[*Subscriber]bool {
+		uniqueSubscribers := make(map[*Subscriber]bool)
+		for _, channel := range channels {
+			if subscriber, exists := p.subscribers[channel]; exists {
+				uniqueSubscribers[subscriber] = true
+				delete(p.subscribers, channel)
+			}
 		}
+		return uniqueSubscribers
+	})
+
+	// 只 Stop 一次每个订阅者
+	for subscriber := range uniqueSubscribers {
+		subscriber.Stop()
 	}
 
 	return nil
@@ -295,21 +302,20 @@ func (p *PubSub) Unsubscribe(channels ...string) error {
 
 // GetSubscribers 获取活跃的订阅者数量
 func (p *PubSub) GetSubscribers() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return len(p.subscribers)
+	return syncx.WithRLockReturnValue(&p.mu, func() int {
+		return len(p.subscribers)
+	})
 }
 
 // GetChannels 获取已订阅的频道列表
 func (p *PubSub) GetChannels() []string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	channels := make([]string, 0, len(p.subscribers))
-	for channel := range p.subscribers {
-		channels = append(channels, channel)
-	}
-	return channels
+	return syncx.WithRLockReturnValue(&p.mu, func() []string {
+		channels := make([]string, 0, len(p.subscribers))
+		for channel := range p.subscribers {
+			channels = append(channels, channel)
+		}
+		return channels
+	})
 }
 
 // Close 关闭发布订阅
@@ -317,12 +323,12 @@ func (p *PubSub) Close() error {
 	p.cancel()
 
 	// 停止所有订阅者
-	p.mu.Lock()
-	for _, subscriber := range p.subscribers {
-		subscriber.Stop()
-	}
-	p.subscribers = make(map[string]*Subscriber)
-	p.mu.Unlock()
+	syncx.WithLock(&p.mu, func() {
+		for _, subscriber := range p.subscribers {
+			subscriber.Stop()
+		}
+		p.subscribers = make(map[string]*Subscriber)
+	})
 
 	// 等待所有goroutine结束
 	p.wg.Wait()
@@ -332,18 +338,20 @@ func (p *PubSub) Close() error {
 
 // Subscriber 订阅者
 type Subscriber struct {
-	pubsub      *PubSub
-	channels    []string
-	patterns    []string
-	channelKeys []string
-	patternKeys []string
-	handler     MessageHandler
-	stopChan    chan struct{}
-	config      PubSubConfig
-	isPattern   bool
-	pubSubConn  *redis.PubSub
-	once        sync.Once
+	pubsub      *PubSub           // 所属的 PubSub 实例
+	channels    []string          // 订阅的频道列表（原始名称，不含命名空间）
+	patterns    []string          // 订阅的模式列表（原始名称，不含命名空间）
+	channelKeys []string          // 带命名空间的频道名列表
+	patternKeys []string          // 带命名空间的模式名列表
+	handler     MessageHandler    // 消息处理器
+	stopChan    chan struct{}     // 停止信号通道
+	config      PubSubConfig      // 订阅配置
+	isPattern   bool              // 是否为模式订阅
+	pubSubConn  *redis.PubSub     // Redis 订阅连接
+	once        sync.Once         // 确保 Stop 只执行一次
 	pool        *syncx.WorkerPool // Worker 池，用于限制消息处理的并发数
+	mu          sync.RWMutex      // 保护状态字段
+	isActive    bool              // 明确的活跃状态标记
 }
 
 // start 启动订阅
@@ -369,6 +377,11 @@ func (s *Subscriber) start() error {
 	// 创建 Worker 池处理消息，防止 goroutine 无限增长
 	s.pool = syncx.NewWorkerPool(s.config.MaxWorkers, s.config.WorkerQueueSize)
 
+	// 标记为活跃
+	syncx.WithLock(&s.mu, func() {
+		s.isActive = true
+	})
+
 	// 启动消息接收goroutine
 	s.pubsub.wg.Add(1)
 	syncx.Go(s.pubsub.ctx).
@@ -377,11 +390,9 @@ func (s *Subscriber) start() error {
 		}).
 		Exec(s.messageLoop)
 
-	if s.isPattern {
-		s.pubsub.logger.Infof("Started pattern subscription for: %v", s.patterns)
-	} else {
-		s.pubsub.logger.Infof("Started subscription for channels: %v", s.channels)
-	}
+	s.pubsub.logger.Infof("Started subscription for %s: %v",
+		mathx.IF(s.isPattern, "patterns", "channels"),
+		mathx.IF(s.isPattern, s.patterns, s.channels))
 
 	return nil
 }
@@ -487,6 +498,9 @@ func (s *Subscriber) handleMessage(msg *redis.Message) {
 // Stop 停止订阅（不从注册表中移除）
 func (s *Subscriber) Stop() {
 	s.once.Do(func() {
+		syncx.WithLock(&s.mu, func() {
+			s.isActive = false
+		})
 		close(s.stopChan)
 	})
 }
@@ -500,11 +514,11 @@ func (s *Subscriber) Unsubscribe() error {
 	keysToRemove := mathx.IF(s.isPattern, s.patterns, s.channels)
 
 	// 批量从注册表中移除
-	s.pubsub.mu.Lock()
-	for _, key := range keysToRemove {
-		delete(s.pubsub.subscribers, key)
-	}
-	s.pubsub.mu.Unlock()
+	syncx.WithLock(&s.pubsub.mu, func() {
+		for _, key := range keysToRemove {
+			delete(s.pubsub.subscribers, key)
+		}
+	})
 
 	s.pubsub.logger.Infof("Unsubscribed from %d %s", len(keysToRemove),
 		mathx.IF(s.isPattern, "patterns", "channels"))
@@ -525,40 +539,58 @@ func (s *Subscriber) GetSubscriptionInfo() *SubscriptionInfo {
 
 // Resubscribe 重新订阅（如果已停止）
 func (s *Subscriber) Resubscribe() error {
-	if s.IsActive() {
+	// 检查状态并立即标记为活跃，防止并发重复订阅
+	alreadyActive := syncx.WithLockReturnValue(&s.mu, func() bool {
+		if s.isActive {
+			return true
+		}
+
+		// 立即标记为活跃，防止其他 goroutine 重复订阅
+		s.isActive = true
+
+		// 关闭旧的 pool
+		if s.pool != nil {
+			s.pool.Close()
+			s.pool = nil
+		}
+
+		// 重置 stopChan（需要新的 once）
+		s.stopChan = make(chan struct{})
+		s.once = sync.Once{}
+
+		return false
+	})
+
+	if alreadyActive {
 		return fmt.Errorf("subscriber is already active")
 	}
 
-	// 关闭旧的 pool
-	if s.pool != nil {
-		s.pool.Close()
-		s.pool = nil
-	}
-
-	// 重置 stopChan（需要新的 once）
-	s.stopChan = make(chan struct{})
-	s.once = sync.Once{}
-
 	// 重新注册
-	s.pubsub.mu.Lock()
-	keysToRegister := mathx.IF(s.isPattern, s.patterns, s.channels)
-	for _, key := range keysToRegister {
-		s.pubsub.subscribers[key] = s
-	}
-	s.pubsub.mu.Unlock()
+	syncx.WithLock(&s.pubsub.mu, func() {
+		keysToRegister := mathx.IF(s.isPattern, s.patterns, s.channels)
+		for _, key := range keysToRegister {
+			s.pubsub.subscribers[key] = s
+		}
+	})
 
 	// 重新启动订阅
-	return s.start()
+	err := s.start()
+	if err != nil {
+		// 如果启动失败，恢复状态
+		syncx.WithLock(&s.mu, func() {
+			s.isActive = false
+		})
+		return err
+	}
+
+	return nil
 }
 
 // IsActive 检查订阅是否活跃
 func (s *Subscriber) IsActive() bool {
-	select {
-	case <-s.stopChan:
-		return false
-	default:
-		return true
-	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.isActive
 }
 
 // GetChannels 获取订阅的频道
@@ -587,30 +619,38 @@ type SubscriptionInfo struct {
 
 // GetStats 获取统计信息
 func (p *PubSub) GetStats() *PubSubStats {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	// 先收集所有唯一订阅者
+	uniqueSubscribers := syncx.WithRLockReturnValue(&p.mu, func() []*Subscriber {
+		uniqueSubscribers := make([]*Subscriber, 0)
+		seen := make(map[*Subscriber]bool)
+		for _, subscriber := range p.subscribers {
+			if !seen[subscriber] {
+				seen[subscriber] = true
+				uniqueSubscribers = append(uniqueSubscribers, subscriber)
+			}
+		}
+		return uniqueSubscribers
+	})
 
-	// 使用set来避免重复计算订阅者
-	uniqueSubscribers := make(map[*Subscriber]bool)
+	// 过滤出活跃的订阅者
+	activeSubscribers := mathx.FilterSlice(uniqueSubscribers, func(s *Subscriber) bool {
+		return s.IsActive()
+	})
+
+	// 收集频道和模式
 	channels := make([]string, 0)
 	patterns := make([]string, 0)
 
-	for _, subscriber := range p.subscribers {
-		uniqueSubscribers[subscriber] = true
-	}
-
-	for subscriber := range uniqueSubscribers {
-		if subscriber.IsActive() {
-			if subscriber.isPattern {
-				patterns = append(patterns, subscriber.patterns...)
-			} else {
-				channels = append(channels, subscriber.channels...)
-			}
+	for _, subscriber := range activeSubscribers {
+		if subscriber.isPattern {
+			patterns = append(patterns, subscriber.patterns...)
+		} else {
+			channels = append(channels, subscriber.channels...)
 		}
 	}
 
 	stats := &PubSubStats{
-		ActiveSubscribers: len(uniqueSubscribers),
+		ActiveSubscribers: len(activeSubscribers),
 		Channels:          channels,
 		Patterns:          patterns,
 	}
@@ -621,7 +661,7 @@ func (p *PubSub) GetStats() *PubSubStats {
 // 便利函数
 
 // SimplePublish 简单发布消息
-func SimplePublish(client *redis.Client, channel string, message interface{}) error {
+func SimplePublish(client *redis.Client, channel string, message any) error {
 	pubsub := NewPubSub(client)
 	defer pubsub.Close()
 
@@ -629,13 +669,23 @@ func SimplePublish(client *redis.Client, channel string, message interface{}) er
 }
 
 // SimpleSubscribe 简单订阅消息
-func SimpleSubscribe(client *redis.Client, channel string, handler MessageHandler) (*Subscriber, error) {
+//
+// 警告：此函数创建的 PubSub 实例需要手动管理生命周期
+// 返回 PubSub 实例和 Subscriber，使用完毕后需要调用 pubsub.Close()
+//
+// 推荐使用 NewPubSub() + Subscribe() 以便更好地管理生命周期
+func SimpleSubscribe(client *redis.Client, channel string, handler MessageHandler) (*PubSub, *Subscriber, error) {
 	pubsub := NewPubSub(client)
-	return pubsub.Subscribe([]string{channel}, handler)
+	subscriber, err := pubsub.Subscribe([]string{channel}, handler)
+	if err != nil {
+		pubsub.Close()
+		return nil, nil, err
+	}
+	return pubsub, subscriber, nil
 }
 
 // BroadcastMessage 广播消息到多个频道
-func (p *PubSub) BroadcastMessage(ctx context.Context, channels []string, message interface{}) error {
+func (p *PubSub) BroadcastMessage(ctx context.Context, channels []string, message any) error {
 	var lastErr error
 	for _, channel := range channels {
 		if err := p.Publish(ctx, channel, message); err != nil {
@@ -647,7 +697,7 @@ func (p *PubSub) BroadcastMessage(ctx context.Context, channels []string, messag
 }
 
 // RequestResponse 请求-响应模式（基于发布订阅）
-func (p *PubSub) RequestResponse(ctx context.Context, requestChannel, responseChannel string, request interface{}, timeout time.Duration) (string, error) {
+func (p *PubSub) RequestResponse(ctx context.Context, requestChannel, responseChannel string, request any, timeout time.Duration) (string, error) {
 	// 创建响应接收器
 	responseChan := make(chan string, 1)
 	var subscriber *Subscriber
@@ -665,7 +715,8 @@ func (p *PubSub) RequestResponse(ctx context.Context, requestChannel, responseCh
 	if err != nil {
 		return "", fmt.Errorf("failed to subscribe to response channel: %w", err)
 	}
-	defer subscriber.Stop()
+	// 使用 Unsubscribe 而不是 Stop，确保从注册表中移除
+	defer subscriber.Unsubscribe()
 
 	// 发送请求
 	if err := p.Publish(ctx, requestChannel, request); err != nil {
