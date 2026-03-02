@@ -5,8 +5,8 @@ go 1.24.0
 require (
 	github.com/alicebob/miniredis/v2 v2.35.0
 	github.com/dgraph-io/ristretto/v2 v2.3.0
-	github.com/kamalyes/go-logger v0.4.6-0.20260225023232-4e3265b5f0ad
-	github.com/kamalyes/go-toolbox v0.11.87-0.20260225023120-3d068cdb1fd5
+	github.com/kamalyes/go-logger v0.4.6-0.20260303010150-040eded512ad
+	github.com/kamalyes/go-toolbox v0.11.87-0.20260302021321-cec71eef735a
 	github.com/redis/go-redis/v9 v9.16.0
 	github.com/stretchr/testify v1.11.1
 )
