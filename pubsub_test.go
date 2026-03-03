@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1477,27 +1478,27 @@ func TestPubSub_WorkerPoolLimit(t *testing.T) {
 	pubsub := NewPubSub(client, config)
 	defer pubsub.Close()
 
-	var processing sync.WaitGroup
-	var mu sync.Mutex
-	activeWorkers := 0
-	maxActiveWorkers := 0
+	// 使用 channel 来追踪并发执行的 handler 数量
+	activeSignal := make(chan struct{}, 100)
+	var maxConcurrent int32
 
 	handler := func(ctx context.Context, channel string, message string) error {
-		mu.Lock()
-		activeWorkers++
-		if activeWorkers > maxActiveWorkers {
-			maxActiveWorkers = activeWorkers
-		}
-		mu.Unlock()
+		// 进入处理
+		activeSignal <- struct{}{}
 
-		processing.Add(1)
+		// 更新最大并发数
+		current := int32(len(activeSignal))
+		for {
+			max := atomic.LoadInt32(&maxConcurrent)
+			if current <= max || atomic.CompareAndSwapInt32(&maxConcurrent, max, current) {
+				break
+			}
+		}
+
 		time.Sleep(time.Millisecond * 100) // 模拟处理时间
 
-		mu.Lock()
-		activeWorkers--
-		mu.Unlock()
-
-		processing.Done()
+		// 离开处理
+		<-activeSignal
 		return nil
 	}
 
@@ -1513,15 +1514,14 @@ func TestPubSub_WorkerPoolLimit(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
-	// 等待所有消息处理完成
-	processing.Wait()
+	// 等待所有消息处理完成（等待 channel 为空）
+	time.Sleep(time.Second * 2)
 
-	mu.Lock()
-	max := maxActiveWorkers
-	mu.Unlock()
+	// 读取最大并发数
+	max := atomic.LoadInt32(&maxConcurrent)
 
 	// 验证并发 worker 数量不超过限制
-	assert.LessOrEqual(t, max, 2, "并发 worker 数量不应超过限制")
+	assert.LessOrEqual(t, max, int32(2), "并发 worker 数量不应超过限制")
 }
 
 // TestSubscriber_GetChannelsPattern 测试模式订阅的 GetChannels

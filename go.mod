@@ -1,12 +1,12 @@
 module github.com/kamalyes/go-cachex
 
-go 1.24.0
+go 1.25.0
 
 require (
 	github.com/alicebob/miniredis/v2 v2.35.0
 	github.com/dgraph-io/ristretto/v2 v2.3.0
-	github.com/kamalyes/go-logger v0.4.6-0.20260225023232-4e3265b5f0ad
-	github.com/kamalyes/go-toolbox v0.11.87-0.20260225023120-3d068cdb1fd5
+	github.com/kamalyes/go-logger v0.4.6-0.20260303071637-d3db0a7544df
+	github.com/kamalyes/go-toolbox v0.11.87-0.20260302021321-cec71eef735a
 	github.com/redis/go-redis/v9 v9.16.0
 	github.com/stretchr/testify v1.11.1
 )
@@ -30,8 +30,8 @@ require (
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/yuin/gopher-lua v1.1.1 // indirect
-	golang.org/x/arch v0.23.0 // indirect
-	golang.org/x/crypto v0.47.0 // indirect
+	golang.org/x/arch v0.24.0 // indirect
+	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect
 	google.golang.org/grpc v1.79.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect

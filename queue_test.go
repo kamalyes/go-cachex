@@ -38,18 +38,18 @@ func setupRedisClient(t *testing.T) *redis.Client {
 		Addr:            "120.79.25.168:16389",
 		Password:        "M5Pi9YW6u",
 		DB:              dbNum,
-		DialTimeout:     10 * time.Second, // 增加拨号超时
-		ReadTimeout:     5 * time.Second,  // 增加读超时
-		WriteTimeout:    5 * time.Second,  // 增加写超时
-		PoolTimeout:     10 * time.Second, // 增加池超时
-		PoolSize:        10,               // 恢复正常连接池大小
-		MinIdleConns:    2,                // 最小空闲连接
-		MaxRetries:      3,                // 增加重试次数
+		DialTimeout:     3 * time.Second, // 减少拨号超时
+		ReadTimeout:     3 * time.Second, // 减少读超时
+		WriteTimeout:    3 * time.Second, // 减少写超时
+		PoolTimeout:     5 * time.Second, // 减少池超时
+		PoolSize:        10,              // 连接池大小
+		MinIdleConns:    0,               // 不预创建空闲连接，避免初始化阻塞
+		MaxRetries:      1,               // 减少重试次数，快速失败
 		DisableIdentity: true,
 	})
 
-	// 增加连接测试超时
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// 减少连接测试超时
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	// 测试连接

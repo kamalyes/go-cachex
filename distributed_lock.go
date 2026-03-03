@@ -163,15 +163,15 @@ func (l *DistributedLock) Unlock(ctx context.Context) error {
 		return ErrLockNotFound
 	}
 
-	// 停止看门狗
+	// 停止看门狗（只发送信号，不关闭 channel 避免竞争）
 	if l.config.EnableWatchdog && l.stopChan != nil {
 		select {
 		case l.stopChan <- struct{}{}:
 		default:
+			// channel 已满或已关闭，忽略
 		}
-		// 关闭通道避免goroutine泄漏
-		close(l.stopChan)
-		l.stopChan = nil
+		// 不关闭 channel，让 watchdog goroutine 自然退出
+		// 避免与 watchdog 的 select 语句产生竞争
 	}
 
 	// 使用Lua脚本确保只有持锁者能释放锁

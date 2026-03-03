@@ -236,23 +236,28 @@ func WithCachePenetration[T any](defaultValue T) CacheOption {
 //	WithDistributedLock(&CacheDistributedLock{EnableWatchdog: false})
 func WithDistributedLock(lock *CacheDistributedLock) CacheOption {
 	return func(opts *CacheOptions) {
+		// 创建副本避免并发修改
+		lockCopy := &CacheDistributedLock{}
+
 		if lock == nil {
 			// 使用默认配置
-			lock = &CacheDistributedLock{
-				Timeout:        500 * time.Millisecond,
-				Expiration:     5 * time.Second,
-				EnableWatchdog: true,
-			}
+			lockCopy.Timeout = 500 * time.Millisecond
+			lockCopy.Expiration = 5 * time.Second
+			lockCopy.EnableWatchdog = true
 		} else {
-			// 填充零值字段的默认值
-			if lock.Timeout == 0 {
-				lock.Timeout = 500 * time.Millisecond
+			// 复制配置并填充零值字段的默认值
+			lockCopy.Timeout = lock.Timeout
+			lockCopy.Expiration = lock.Expiration
+			lockCopy.EnableWatchdog = lock.EnableWatchdog
+
+			if lockCopy.Timeout == 0 {
+				lockCopy.Timeout = 500 * time.Millisecond
 			}
-			if lock.Expiration == 0 {
-				lock.Expiration = 5 * time.Second
+			if lockCopy.Expiration == 0 {
+				lockCopy.Expiration = 5 * time.Second
 			}
 		}
-		opts.CacheDistributedLock = lock
+		opts.CacheDistributedLock = lockCopy
 	}
 }
 
@@ -446,9 +451,12 @@ func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T
 			opt(options)
 		}
 
+		// 计算实际的过期时间（使用局部变量避免并发修改闭包捕获的 expiration）
+		actualExpiration := expiration
+
 		// 应用 TTL 覆盖选项
 		if options.TTLOverride != nil {
-			expiration = *options.TTLOverride
+			actualExpiration = *options.TTLOverride
 		}
 
 		// 应用 TTL 随机抖动，避免缓存雪崩
@@ -457,12 +465,12 @@ func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T
 			jitterPercent = *options.JitterPercent
 		}
 		if jitterPercent > 0 {
-			// 计算抖动范围：expiration * (1 ± jitterPercent)
-			jitterRange := float64(expiration) * jitterPercent
+			// 计算抖动范围：actualExpiration * (1 ± jitterPercent)
+			jitterRange := float64(actualExpiration) * jitterPercent
 			jitter := rand.Int63n(int64(jitterRange*2)) - int64(jitterRange)
-			expiration = expiration + time.Duration(jitter)
+			actualExpiration = actualExpiration + time.Duration(jitter)
 			// 确保 TTL 不会为负数
-			expiration = mathx.IfClamp(expiration, time.Second, math.MaxInt64*time.Nanosecond)
+			actualExpiration = mathx.IfClamp(actualExpiration, time.Second, math.MaxInt64*time.Nanosecond)
 		}
 
 		// 如果设置了强制刷新，直接跳转到数据加载逻辑
@@ -608,7 +616,7 @@ func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T
 				})
 
 				// 递归调用，让缓存逻辑处理默认值的序列化、压缩和存储
-				return CacheWrapper(client, key, defaultLoader, expiration, recursiveOpts...)(ctx)
+				return CacheWrapper(client, key, defaultLoader, actualExpiration, recursiveOpts...)(ctx)
 			}
 		}
 
@@ -642,6 +650,8 @@ func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T
 
 		// 如果启用了异步更新，则在后台更新缓存
 		if options.UseAsync {
+			// 创建局部副本避免闭包捕获导致的竞争
+			expiration := actualExpiration
 			syncx.Go().OnPanic(nil).Exec(func() {
 				updateCache(client, key, cacheData, expiration, options)
 			})
@@ -649,7 +659,7 @@ func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T
 		}
 
 		// 同步更新缓存
-		updateCache(client, key, cacheData, expiration, options)
+		updateCache(client, key, cacheData, actualExpiration, options)
 
 		// 返回加载的数据
 		return result, nil
@@ -691,6 +701,11 @@ func updateCache(client *redis.Client, key string, cacheData string, expiration 
 
 	// 如果设置成功，执行延迟双删
 	if err == nil {
+		// 创建局部副本避免闭包捕获导致的竞争
+		delayedKey := key
+		delayedData := cacheData
+		delayedExpiration := expiration
+
 		// 第二次删除（延迟执行）：防止并发写入导致的缓存不一致
 		// 启动异步goroutine执行延迟删除和重新设置
 		syncx.Go().OnPanic(nil).Exec(func() {
@@ -698,10 +713,10 @@ func updateCache(client *redis.Client, key string, cacheData string, expiration 
 			time.Sleep(100 * time.Millisecond)
 
 			// 再次删除缓存，清除可能由并发操作产生的不一致数据
-			client.Del(context.Background(), key)
+			client.Del(context.Background(), delayedKey)
 
 			// 重新设置最新的缓存数据，确保缓存的最终一致性
-			client.Set(context.Background(), key, cacheData, expiration)
+			client.Set(context.Background(), delayedKey, delayedData, delayedExpiration)
 		})
 	}
 }

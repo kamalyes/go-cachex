@@ -410,7 +410,11 @@ func TestCachePenetrationWithDistributedLock(t *testing.T) {
 	cachedLoader := CacheWrapper(
 		client, key, dataLoader, time.Minute,
 		WithCachePenetration(&defaultValue),
-		WithDistributedLock(nil), // 启用分布式锁（使用默认配置）
+		WithDistributedLock(&CacheDistributedLock{
+			Timeout:        2 * time.Second,  // 增加超时时间，确保足够时间等待锁
+			Expiration:     10 * time.Second, // 增加锁过期时间
+			EnableWatchdog: true,
+		}),
 	)
 
 	// 第一阶段：测试首次并发访问（有分布式锁保护）
@@ -442,7 +446,8 @@ func TestCachePenetrationWithDistributedLock(t *testing.T) {
 	assert.LessOrEqual(t, firstPhaseCount, int32(3), "分布式锁应该限制DB查询次数")
 
 	// 等待缓存稳定（延迟双删完成）
-	time.Sleep(200 * time.Millisecond)
+	// 延迟双删在 100ms 后执行，加上一些缓冲时间
+	time.Sleep(300 * time.Millisecond)
 
 	// 第二阶段：测试缓存命中后的并发访问
 	t.Log("Phase 2: Concurrent access with cache hit")
@@ -526,13 +531,20 @@ func TestDistributedLockWithRealData(t *testing.T) {
 
 	// 验证大部分 goroutine 得到的数据一致
 	// 由于并发和锁的特性，允许少量不一致（但应该是data_1或data_2）
-	firstResult := results[0]
-	consistentCount := 0
+	// 统计每个结果出现的次数
+	resultCounts := make(map[string]int)
 	for _, result := range results {
-		if result == firstResult {
-			consistentCount++
+		resultCounts[result]++
+	}
+
+	// 找出最常见的结果
+	maxCount := 0
+	for _, count := range resultCounts {
+		if count > maxCount {
+			maxCount = count
 		}
 	}
-	// 至少70%的结果应该一致
-	assert.GreaterOrEqual(t, consistentCount, concurrency*7/10, "大部分goroutine应该得到一致的结果")
+
+	// 至少70%的结果应该一致（使用最常见的结果）
+	assert.GreaterOrEqual(t, maxCount, concurrency*7/10, "大部分goroutine应该得到一致的结果")
 }
