@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -51,15 +52,10 @@ type MultiLevelCache[T any] struct {
 
 // NewMultiLevelCache 创建多级缓存
 func NewMultiLevelCache[T any](redisClient redis.UniversalClient, config MultiLevelConfig) *MultiLevelCache[T] {
-	if config.L1Size == 0 {
-		config.L1Size = 1000
-	}
-	if config.L1TTL == 0 {
-		config.L1TTL = time.Minute * 5
-	}
-	if config.L2TTL == 0 {
-		config.L2TTL = time.Hour
-	}
+	// 使用 mathx.IfLeZero 设置默认值
+	config.L1Size = mathx.IfLeZero(config.L1Size, 1000)
+	config.L1TTL = mathx.IfLeZero(config.L1TTL, time.Minute*5)
+	config.L2TTL = mathx.IfLeZero(config.L2TTL, time.Hour)
 
 	// 创建L1本地缓存
 	l1Cache := NewLRUOptimizedHandler(config.L1Size)

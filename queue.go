@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -58,21 +59,12 @@ type QueueHandler struct {
 
 // NewQueueHandler 创建队列处理器
 func NewQueueHandler(client *redis.Client, namespace string, config QueueConfig) *QueueHandler {
-	if config.MaxRetries == 0 {
-		config.MaxRetries = 3
-	}
-	if config.RetryDelay == 0 {
-		config.RetryDelay = time.Second * 5
-	}
-	if config.BatchSize == 0 {
-		config.BatchSize = 10
-	}
-	if config.LockTimeout == 0 {
-		config.LockTimeout = time.Minute * 5
-	}
-	if config.CleanupInterval == 0 {
-		config.CleanupInterval = time.Minute * 10
-	}
+	// 使用 mathx.IfLeZero 设置默认值
+	config.MaxRetries = mathx.IfLeZero(config.MaxRetries, 3)
+	config.RetryDelay = mathx.IfLeZero(config.RetryDelay, time.Second*5)
+	config.BatchSize = mathx.IfLeZero(config.BatchSize, 10)
+	config.LockTimeout = mathx.IfLeZero(config.LockTimeout, time.Minute*5)
+	config.CleanupInterval = mathx.IfLeZero(config.CleanupInterval, time.Minute*10)
 
 	return &QueueHandler{
 		client:    client,
