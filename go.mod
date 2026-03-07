@@ -4,10 +4,10 @@ go 1.25.0
 
 require (
 	github.com/alicebob/miniredis/v2 v2.35.0
-	github.com/dgraph-io/ristretto/v2 v2.3.0
-	github.com/kamalyes/go-logger v0.4.6-0.20260306121709-f21436aafd71
-	github.com/kamalyes/go-toolbox v0.11.87-0.20260306133713-2d2ef3f17525
-	github.com/redis/go-redis/v9 v9.16.0
+	github.com/dgraph-io/ristretto/v2 v2.4.0
+	github.com/kamalyes/go-logger v0.4.6-0.20260309105634-86ce25421507
+	github.com/kamalyes/go-toolbox v0.11.87-0.20260309105502-59bc4a28077a
+	github.com/redis/go-redis/v9 v9.18.0
 	github.com/stretchr/testify v1.11.1
 )
 
@@ -20,8 +20,9 @@ require (
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/yuin/gopher-lua v1.1.1 // indirect
+	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
-	golang.org/x/sys v0.41.0 // indirect
+	golang.org/x/sys v0.42.0 // indirect
 	google.golang.org/grpc v1.79.2 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
