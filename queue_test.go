@@ -21,10 +21,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func setupRedisClient(t *testing.T) *redis.Client {
+func setupRedisClient(tb testing.TB) *redis.Client {
 	// 使用测试名称的哈希值作为DB编号，避免测试间数据冲突
 	// DB范围：1-15（保留0作为默认DB）
-	testName := t.Name()
+	testName := tb.Name()
 	dbNum := 1
 	if len(testName) > 0 {
 		hash := 0
@@ -56,7 +56,7 @@ func setupRedisClient(t *testing.T) *redis.Client {
 	err := client.Ping(ctx).Err()
 	if err != nil {
 		client.Close()
-		t.Skipf("Redis不可用，跳过测试: %v", err)
+		tb.Skipf("Redis不可用，跳过测试: %v", err)
 		return nil
 	}
 
