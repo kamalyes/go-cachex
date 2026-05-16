@@ -30,9 +30,9 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/kamalyes/go-argus"
 	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/kamalyes/go-toolbox/pkg/syncx"
-	"github.com/kamalyes/go-toolbox/pkg/validator"
 	"github.com/kamalyes/go-toolbox/pkg/zipx"
 	"github.com/redis/go-redis/v9"
 )
