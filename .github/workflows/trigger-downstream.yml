@@ -1,0 +1,28 @@
+name: Trigger Downstream
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  actions: write
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        repo:
+          - kamalyes/go-wsc
+          - kamalyes/go-casbin-redis-adapter
+          - kamalyes/go-rpc-gateway
+    steps:
+      - name: Dispatch to ${{ matrix.repo }}
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.GH_GPA_TOKEN }}
+          repository: ${{ matrix.repo }}
+          event-type: upstream-updated
+          client-payload: >-
+            {"module": "github.com/kamalyes/go-cachex", "version": "${{ github.ref_name }}", "sha": "${{ github.sha }}"}

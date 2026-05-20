@@ -1,0 +1,36 @@
+﻿name: Bump Upstream
+
+on:
+  repository_dispatch:
+    types: [upstream-updated]
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Bump upstream dependency
+        run: |
+          MODULE="${{ github.event.client_payload.module }}"
+          VERSION="${{ github.event.client_payload.version }}"
+          echo "Bumping ${MODULE} to ${VERSION}"
+          go get "${MODULE}@${VERSION}"
+          go mod tidy
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add go.mod go.sum
+          git diff --cached --quiet || git commit -m "chore: bump ${{ github.event.client_payload.module }} to ${{ github.event.client_payload.version }}"
+          git push
