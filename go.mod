@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/alicebob/miniredis/v2 v2.35.0
 	github.com/dgraph-io/ristretto/v2 v2.4.0
-	github.com/kamalyes/go-argus v0.1.0
+	github.com/kamalyes/go-argus v0.2.0
 	github.com/kamalyes/go-logger v0.5.0
 	github.com/kamalyes/go-toolbox v0.15.0
 	github.com/redis/go-redis/v9 v9.18.0
