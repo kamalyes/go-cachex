@@ -52,7 +52,6 @@ jobs:
       matrix:
         repo:
           - kamalyes/go-casbin-redis-adapter
-          - kamalyes/go-rpc-gateway
           - kamalyes/go-wsc
     steps:
       - name: Dispatch to ${{ matrix.repo }}
