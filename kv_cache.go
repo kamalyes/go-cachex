@@ -166,7 +166,11 @@ func NewKVCache[K comparable, V any](
 	config.Namespace = mathx.IfNotEmpty(config.Namespace, "kv")
 	config.MaxLocalCacheSize = mathx.IF(config.MaxLocalCacheSize > 0, config.MaxLocalCacheSize, 10000)
 	if config.Logger == nil {
-		config.Logger = NewDefaultCachexLogger()
+		if globalLogger != nil {
+			config.Logger = globalLogger
+		} else {
+			config.Logger = NewDefaultCachexLogger()
+		}
 	}
 
 	cache := &KVCache[K, V]{
@@ -221,6 +225,7 @@ func (c *KVCache[K, V]) startInvalidationSubscriber() {
 		if msg.Sender == c.instanceID {
 			return nil
 		}
+		c.logger.Debugf("KVCache %s received invalidation: op=%s keys=%v", c.name, msg.Op, msg.Keys)
 		switch msg.Op {
 		case "clear":
 			c.mu.Lock()
@@ -256,6 +261,7 @@ func (c *KVCache[K, V]) publishInvalidation(op string, keys []string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+	c.logger.Debugf("KVCache %s publish invalidation: op=%s keys=%v", c.name, op, keys)
 	if err := c.pubsub.Publish(ctx, c.invalidateCh, string(data)); err != nil {
 		c.logger.Warnf("KVCache %s publish invalidation failed: %v", c.name, err)
 	}
@@ -313,6 +319,7 @@ func (c *KVCache[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	c.mu.RLock()
 	if v, ok := c.localCache[key]; ok {
 		c.mu.RUnlock()
+		c.logger.Debugf("KVCache %s Get local hit: key=%v", c.name, key)
 		return v, true, nil
 	}
 	c.mu.RUnlock()
@@ -328,6 +335,7 @@ func (c *KVCache[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 			}
 			c.localCache[key] = v
 			c.mu.Unlock()
+			c.logger.Debugf("KVCache %s Get redis hit: key=%v", c.name, key)
 			return v, true, nil
 		}
 	} else if err != redis.Nil {
@@ -335,6 +343,7 @@ func (c *KVCache[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	}
 
 	// 3. miss 触发全量预热（保证本地缓存可用）
+	c.logger.Debugf("KVCache %s Get miss, triggering LoadAll: key=%v", c.name, key)
 	if _, err := c.LoadAll(ctx); err != nil {
 		return zero, false, err
 	}
@@ -431,6 +440,7 @@ func (c *KVCache[K, V]) Set(ctx context.Context, key K, value V) error {
 
 	// 广播失效消息给其他节点（异步不阻塞）
 	c.publishInvalidation("invalidate", []string{c.encodeKey(key)})
+	c.logger.Debugf("KVCache %s Set: key=%v", c.name, key)
 	return nil
 }
 
@@ -469,6 +479,7 @@ func (c *KVCache[K, V]) SetMany(ctx context.Context, items map[K]V) error {
 
 	// 广播失效消息
 	c.publishInvalidation("invalidate", keys)
+	c.logger.Debugf("KVCache %s SetMany: count=%d", c.name, len(items))
 	return nil
 }
 
@@ -482,6 +493,7 @@ func (c *KVCache[K, V]) Delete(ctx context.Context, key K) error {
 		return err
 	}
 	c.publishInvalidation("invalidate", []string{c.encodeKey(key)})
+	c.logger.Debugf("KVCache %s Delete: key=%v", c.name, key)
 	return nil
 }
 
@@ -505,6 +517,7 @@ func (c *KVCache[K, V]) DeleteMany(ctx context.Context, keys []K) error {
 		return err
 	}
 	c.publishInvalidation("invalidate", fields)
+	c.logger.Debugf("KVCache %s DeleteMany: count=%d", c.name, len(keys))
 	return nil
 }
 
@@ -571,6 +584,7 @@ func (c *KVCache[K, V]) loadFromSource(ctx context.Context) (map[K]V, error) {
 		_ = c.writeManyToRedis(ctx, data)
 	}
 
+	c.logger.Debugf("KVCache %s loadFromSource: count=%d", c.name, len(data))
 	return data, nil
 }
 
@@ -596,6 +610,7 @@ func (c *KVCache[K, V]) writeManyToRedis(ctx context.Context, items map[K]V) err
 
 // Refresh 手动刷新缓存（从数据源重新加载，仅更新本节点 + Redis，不广播）
 func (c *KVCache[K, V]) Refresh(ctx context.Context) error {
+	c.logger.Debugf("KVCache %s Refresh", c.name)
 	_, err := c.loadFromSource(ctx)
 	return err
 }
@@ -611,6 +626,7 @@ func (c *KVCache[K, V]) Clear(ctx context.Context) error {
 		return err
 	}
 	c.publishInvalidation("clear", nil)
+	c.logger.Debugf("KVCache %s Clear", c.name)
 	return nil
 }
 
@@ -658,6 +674,10 @@ var (
 	// globalRedisClient 全局 Redis 客户端，由宿主服务在启动阶段通过 SetGlobalRedisClient 注入
 	globalRedisClient *redis.Client
 
+	// globalLogger 全局日志记录器，由宿主服务通过 SetLogger 注入
+	// 所有后续创建的 KVCache 实例若未单独指定 Logger，将复用此日志器
+	globalLogger logger.ILogger
+
 	// kvRegistry 全局 KV 缓存注册表（按 name 索引）
 	kvRegistry   = make(map[string]any)
 	kvRegistryMu sync.RWMutex
@@ -667,6 +687,13 @@ var (
 // 必须在调用 RegisterKV 之前完成注入，否则 RegisterKV 将 panic
 func SetGlobalRedisClient(client *redis.Client) {
 	globalRedisClient = client
+}
+
+// SetLogger 注入全局日志记录器
+// 必须在 RegisterKV 之前调用，所有后续注册的 KVCache 实例将复用此日志器
+// 未调用时使用默认日志器 NewDefaultCachexLogger()
+func SetLogger(l logger.ILogger) {
+	globalLogger = l
 }
 
 // RegisterKV 注册 KV 缓存（pbmo 风格）
