@@ -991,3 +991,363 @@ func TestKVCache_GetMany_RedisUnavailable_LoadAllFallback(t *testing.T) {
 	}
 	// 如果 err != nil 也算可接受（Redis 关闭后 LoadAll 也可能失败）
 }
+
+// ============================================================
+// BatchLoader 按需批量回源 测试
+// ============================================================
+
+// kvBatchLoader 构建 BatchLoader 的辅助函数：按 key 精准返回，并记录调用次数与传入 keys
+func kvBatchLoader[K comparable, V any](data map[K]V, callCount *int64, seenKeys *[][]K) BatchLoader[K, V] {
+	return func(ctx context.Context, keys []K) (map[K]V, error) {
+		if callCount != nil {
+			atomic.AddInt64(callCount, 1)
+		}
+		if seenKeys != nil {
+			cp := make([]K, len(keys))
+			copy(cp, keys)
+			*seenKeys = append(*seenKeys, cp)
+		}
+		out := make(map[K]V, len(keys))
+		for _, k := range keys {
+			if v, ok := data[k]; ok {
+				out[k] = v
+			}
+		}
+		return out, nil
+	}
+}
+
+// kvBatchErrorLoader 返回错误的 BatchLoader
+func kvBatchErrorLoader[K comparable, V any]() BatchLoader[K, V] {
+	return func(ctx context.Context, keys []K) (map[K]V, error) {
+		return nil, errors.New("batchLoader error")
+	}
+}
+
+// newTestKVCacheWithBatchLoader 创建带 BatchLoader 的测试用 KVCache（禁用自动刷新）
+func newTestKVCacheWithBatchLoader[K comparable, V any](t *testing.T, name string, loader KVLoader[K, V], bl BatchLoader[K, V]) *KVCache[K, V] {
+	t.Helper()
+	client := setupRedisClient(t)
+	_ = client.Del(context.Background(), fmt.Sprintf("kv:%s", name)).Err()
+	_ = client.Del(context.Background(), fmt.Sprintf("kv:%s:invalidate", name)).Err()
+
+	cfg := KVCacheConfig{
+		DefaultTTL:        time.Minute,
+		RefreshInterval:   time.Hour,
+		EnableAutoRefresh: false,
+		Namespace:         "kv",
+		BatchLoader:       bl,
+	}
+	return NewKVCache[K, V](client, name, loader, cfg)
+}
+
+// TestKVCache_BatchLoader_Get 单 key miss → BatchLoader 按需回源 → 回填本地+Redis
+func TestKVCache_BatchLoader_Get(t *testing.T) {
+	data := map[string]string{"a": "1", "b": "2"}
+	var callCount int64
+	c := newTestKVCacheWithBatchLoader(t, "bl-get", nil,
+		kvBatchLoader(data, &callCount, nil))
+	defer c.Stop()
+	defer c.Clear(context.Background())
+
+	ctx := context.Background()
+
+	// 本地+Redis 均 miss → 走 BatchLoader
+	v, exists, err := c.Get(ctx, "a")
+	require.NoError(t, err)
+	assert.True(t, exists)
+	assert.Equal(t, "1", v)
+	assert.Equal(t, int64(1), atomic.LoadInt64(&callCount))
+
+	// 第二次 Get 命中本地，BatchLoader 不再被调用
+	v, exists, err = c.Get(ctx, "a")
+	require.NoError(t, err)
+	assert.True(t, exists)
+	assert.Equal(t, "1", v)
+	assert.Equal(t, int64(1), atomic.LoadInt64(&callCount))
+}
+
+// TestKVCache_BatchLoader_Get_PrefillsRedis BatchLoader 回源后 Redis 被预热
+// 验证：清空本地缓存后再次 Get，应命中 Redis 而非再次调用 BatchLoader
+func TestKVCache_BatchLoader_Get_PrefillsRedis(t *testing.T) {
+	data := map[string]string{"a": "1"}
+	var callCount int64
+	c := newTestKVCacheWithBatchLoader(t, "bl-prefill", nil,
+		kvBatchLoader(data, &callCount, nil))
+	defer c.Stop()
+	defer c.Clear(context.Background())
+
+	ctx := context.Background()
+
+	// 第一次 Get → 走 BatchLoader，回填 Redis
+	_, _, err := c.Get(ctx, "a")
+	require.NoError(t, err)
+	require.Equal(t, int64(1), atomic.LoadInt64(&callCount))
+
+	// 清空本地缓存，强制下次 Get 走 Redis
+	c.mu.Lock()
+	c.localCache = make(map[string]string)
+	c.mu.Unlock()
+
+	// 再次 Get → 应命中 Redis（BatchLoader 不被再次调用）
+	v, exists, err := c.Get(ctx, "a")
+	require.NoError(t, err)
+	assert.True(t, exists)
+	assert.Equal(t, "1", v)
+	assert.Equal(t, int64(1), atomic.LoadInt64(&callCount))
+}
+
+// TestKVCache_BatchLoader_Get_NotFound BatchLoader 未返回该 key → exists=false
+func TestKVCache_BatchLoader_Get_NotFound(t *testing.T) {
+	data := map[string]string{"a": "1"} // 不含 "missing"
+	var callCount int64
+	c := newTestKVCacheWithBatchLoader(t, "bl-notfound", nil,
+		kvBatchLoader(data, &callCount, nil))
+	defer c.Stop()
+	defer c.Clear(context.Background())
+
+	ctx := context.Background()
+	v, exists, err := c.Get(ctx, "missing")
+	require.NoError(t, err)
+	assert.False(t, exists)
+	assert.Equal(t, "", v)
+	assert.Equal(t, int64(1), atomic.LoadInt64(&callCount))
+}
+
+// TestKVCache_BatchLoader_Get_Error BatchLoader 返回错误 → Get 返回错误
+func TestKVCache_BatchLoader_Get_Error(t *testing.T) {
+	c := newTestKVCacheWithBatchLoader(t, "bl-err", nil,
+		kvBatchErrorLoader[string, string]())
+	defer c.Stop()
+	defer c.Clear(context.Background())
+
+	ctx := context.Background()
+	_, exists, err := c.Get(ctx, "a")
+	assert.Error(t, err)
+	assert.False(t, exists)
+	assert.Contains(t, err.Error(), "batchLoader")
+}
+
+// TestKVCache_BatchLoader_NoKVLoader_OnlyBatchLoader 仅有 BatchLoader（KVLoader=nil）时 Get miss 走 BatchLoader 而非 LoadAll
+func TestKVCache_BatchLoader_NoKVLoader_OnlyBatchLoader(t *testing.T) {
+	data := map[string]string{"a": "1"}
+	var callCount int64
+	c := newTestKVCacheWithBatchLoader(t, "bl-only", nil,
+		kvBatchLoader(data, &callCount, nil))
+	defer c.Stop()
+	defer c.Clear(context.Background())
+
+	ctx := context.Background()
+	// KVLoader 为 nil，若无 BatchLoader 会走 LoadAll（loader=nil 会失败）；
+	// 配置了 BatchLoader 应走精准回源
+	v, exists, err := c.Get(ctx, "a")
+	require.NoError(t, err)
+	assert.True(t, exists)
+	assert.Equal(t, "1", v)
+	assert.Equal(t, int64(1), atomic.LoadInt64(&callCount))
+}
+
+// TestKVCache_BatchLoader_GetMany 部分本地命中 + Redis miss → BatchLoader 按缺失 keys 回源
+func TestKVCache_BatchLoader_GetMany(t *testing.T) {
+	data := map[string]string{"a": "1", "b": "2", "c": "3"}
+	var callCount int64
+	var seenKeys [][]string
+	c := newTestKVCacheWithBatchLoader(t, "bl-getmany", nil,
+		kvBatchLoader(data, &callCount, &seenKeys))
+	defer c.Stop()
+	defer c.Clear(context.Background())
+
+	ctx := context.Background()
+
+	// 先 Set 一个进本地缓存（模拟本地命中）
+	c.mu.Lock()
+	c.localCache["a"] = "1"
+	c.mu.Unlock()
+
+	// GetMany：a 命中本地；b、c 本地+Redis miss → BatchLoader 精准回源 [b,c]
+	result, err := c.GetMany(ctx, []string{"a", "b", "c"})
+	require.NoError(t, err)
+	assert.Equal(t, "1", result["a"])
+	assert.Equal(t, "2", result["b"])
+	assert.Equal(t, "3", result["c"])
+	assert.Equal(t, int64(1), atomic.LoadInt64(&callCount))
+
+	// 验证 BatchLoader 收到的 keys 恰好是缺失的 [b,c]（顺序无关）
+	require.Len(t, seenKeys, 1)
+	assert.ElementsMatch(t, []string{"b", "c"}, seenKeys[0])
+}
+
+// TestKVCache_BatchLoader_GetMany_AllMiss 全部 miss → BatchLoader 一次回源所有 keys
+func TestKVCache_BatchLoader_GetMany_AllMiss(t *testing.T) {
+	data := map[string]string{"x": "10", "y": "20"}
+	var callCount int64
+	var seenKeys [][]string
+	c := newTestKVCacheWithBatchLoader(t, "bl-getmany-all", nil,
+		kvBatchLoader(data, &callCount, &seenKeys))
+	defer c.Stop()
+	defer c.Clear(context.Background())
+
+	ctx := context.Background()
+	result, err := c.GetMany(ctx, []string{"x", "y"})
+	require.NoError(t, err)
+	assert.Equal(t, "10", result["x"])
+	assert.Equal(t, "20", result["y"])
+	assert.Equal(t, int64(1), atomic.LoadInt64(&callCount))
+	require.Len(t, seenKeys, 1)
+	assert.ElementsMatch(t, []string{"x", "y"}, seenKeys[0])
+}
+
+// TestKVCache_BatchLoader_GetMany_PartialRedisHit Redis 命中部分 → BatchLoader 仅回源仍 miss 的 keys
+func TestKVCache_BatchLoader_GetMany_PartialRedisHit(t *testing.T) {
+	data := map[string]string{"b": "2", "c": "3"}
+	var callCount int64
+	var seenKeys [][]string
+	c := newTestKVCacheWithBatchLoader(t, "bl-getmany-redis", nil,
+		kvBatchLoader(data, &callCount, &seenKeys))
+	defer c.Stop()
+	defer c.Clear(context.Background())
+
+	ctx := context.Background()
+
+	// 直接写 Redis：a 命中 Redis，b/c 在 Redis 也 miss
+	require.NoError(t, c.client.HSet(ctx, c.redisKey(), "a", `"1"`).Err())
+
+	// GetMany：a 命中 Redis（回填本地）；b、c 走 BatchLoader
+	result, err := c.GetMany(ctx, []string{"a", "b", "c"})
+	require.NoError(t, err)
+	assert.Equal(t, "1", result["a"])
+	assert.Equal(t, "2", result["b"])
+	assert.Equal(t, "3", result["c"])
+	assert.Equal(t, int64(1), atomic.LoadInt64(&callCount))
+	require.Len(t, seenKeys, 1)
+	assert.ElementsMatch(t, []string{"b", "c"}, seenKeys[0])
+}
+
+// TestKVCache_BatchLoader_GetMany_Error BatchLoader 返回错误 → GetMany 返回错误
+func TestKVCache_BatchLoader_GetMany_Error(t *testing.T) {
+	c := newTestKVCacheWithBatchLoader(t, "bl-getmany-err", nil,
+		kvBatchErrorLoader[string, string]())
+	defer c.Stop()
+	defer c.Clear(context.Background())
+
+	ctx := context.Background()
+	_, err := c.GetMany(ctx, []string{"a", "b"})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "batchLoader")
+}
+
+// TestKVCache_BatchLoader_GetMany_Empty 入参为空 → 不调用 BatchLoader
+func TestKVCache_BatchLoader_GetMany_Empty(t *testing.T) {
+	var callCount int64
+	c := newTestKVCacheWithBatchLoader(t, "bl-getmany-empty", nil,
+		kvBatchLoader[string, string](nil, &callCount, nil))
+	defer c.Stop()
+	defer c.Clear(context.Background())
+
+	result, err := c.GetMany(context.Background(), []string{})
+	require.NoError(t, err)
+	assert.Empty(t, result)
+	assert.Equal(t, int64(0), atomic.LoadInt64(&callCount))
+}
+
+// TestKVCache_BatchLoader_GetMany_PrefillsRedis GetMany 回源后 Redis 被预热
+// 验证：清空本地后再次 GetMany 命中 Redis，BatchLoader 不再被调用
+func TestKVCache_BatchLoader_GetMany_PrefillsRedis(t *testing.T) {
+	data := map[string]string{"a": "1", "b": "2"}
+	var callCount int64
+	c := newTestKVCacheWithBatchLoader(t, "bl-getmany-prefill", nil,
+		kvBatchLoader(data, &callCount, nil))
+	defer c.Stop()
+	defer c.Clear(context.Background())
+
+	ctx := context.Background()
+
+	// 第一次 GetMany → BatchLoader 回源 + 预热 Redis
+	_, err := c.GetMany(ctx, []string{"a", "b"})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), atomic.LoadInt64(&callCount))
+
+	// 清空本地缓存
+	c.mu.Lock()
+	c.localCache = make(map[string]string)
+	c.mu.Unlock()
+
+	// 再次 GetMany → 命中 Redis，BatchLoader 不再调用
+	result, err := c.GetMany(ctx, []string{"a", "b"})
+	require.NoError(t, err)
+	assert.Equal(t, "1", result["a"])
+	assert.Equal(t, "2", result["b"])
+	assert.Equal(t, int64(1), atomic.LoadInt64(&callCount))
+}
+
+// TestKVCache_BatchLoader_IntKey 验证 int 类型 K 的 BatchLoader 路径
+func TestKVCache_BatchLoader_IntKey(t *testing.T) {
+	data := map[int]string{1: "one", 2: "two"}
+	var callCount int64
+	c := newTestKVCacheWithBatchLoader(t, "bl-int", nil,
+		kvBatchLoader(data, &callCount, nil))
+	defer c.Stop()
+	defer c.Clear(context.Background())
+
+	ctx := context.Background()
+	v, exists, err := c.Get(ctx, 1)
+	require.NoError(t, err)
+	assert.True(t, exists)
+	assert.Equal(t, "one", v)
+
+	// 验证 Redis Hash field 用 strconv 编码
+	s, err := c.client.HGet(ctx, c.redisKey(), "1").Result()
+	require.NoError(t, err)
+	assert.Equal(t, `"one"`, s)
+}
+
+// TestKVCache_BatchLoader_TypeMismatch config.BatchLoader 类型不匹配 → batchLoader 字段为 nil
+// 此时 Get miss 应走 LoadAll 兜底（配置了 KVLoader）
+func TestKVCache_BatchLoader_TypeMismatch(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+	_ = client.Del(context.Background(), "kv:bl-type-mismatch").Err()
+
+	// 故意放入类型不匹配的 BatchLoader（int→string 配置到 string→string 的 cache）
+	wrongLoader := BatchLoader[int, string](func(ctx context.Context, keys []int) (map[int]string, error) {
+		return nil, nil
+	})
+	cfg := KVCacheConfig{
+		EnableAutoRefresh: false,
+		Namespace:         "kv",
+		BatchLoader:       wrongLoader,
+	}
+	// KVLoader 提供兜底
+	c := NewKVCache(client, "bl-type-mismatch",
+		kvLoader(map[string]string{"a": "1"}, nil), cfg)
+	defer c.Stop()
+	defer c.Clear(context.Background())
+
+	// 类型断言失败 → batchLoader 为 nil → Get miss 走 LoadAll
+	assert.Nil(t, c.batchLoader)
+	v, exists, err := c.Get(context.Background(), "a")
+	require.NoError(t, err)
+	assert.True(t, exists)
+	assert.Equal(t, "1", v)
+}
+
+// TestKVCache_WithKVBatchLoader_Option 验证 WithKVBatchLoader 选项正确设置 config.BatchLoader
+func TestKVCache_WithKVBatchLoader_Option(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+	_ = client.Del(context.Background(), "kv:bl-opt").Err()
+
+	cfg := KVCacheConfig{EnableAutoRefresh: false}
+	c := NewKVCache[string, string](client, "bl-opt", kvLoader[string, string](nil, nil), cfg)
+	defer c.Stop()
+	defer c.Clear(context.Background())
+
+	// 应用 WithKVBatchLoader 选项
+	bl := BatchLoader[string, string](func(ctx context.Context, keys []string) (map[string]string, error) {
+		return map[string]string{"k": "v"}, nil
+	})
+	WithKVBatchLoader[string, string](bl)(&c.config)
+
+	// config.BatchLoader 应被设置
+	assert.NotNil(t, c.config.BatchLoader)
+}

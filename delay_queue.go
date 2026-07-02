@@ -8,12 +8,16 @@
  *
  * 特性：
  *   - 延迟执行：任务在指定时间戳到期后才被消费
- *   - 原子出队：Lua 脚本保证 ZRANGEBYSCORE + ZREM + HDEL 原子性，多实例安全
+ *   - ACK 确认：任务出队后进入 processing，处理成功才 ACK 删除；未 ACK 的任务在可见性超时后回归队列
+ *   - 崩溃恢复：Pod 崩溃/停止时，processing 中未 ACK 的任务由其它 Pod 的 requeueStale 自动接管
+ *   - 原子出队：Lua 脚本保证 ZRANGEBYSCORE + ZREM + ZADD(processing) 原子性，多实例安全
+ *   - 顺序保证：Ordered 模式下同一 queue 内任务按到期时间串行处理，避免乱序
+ *   - 堆积监控：暴露 ReadyLength/ProcessingLength，超过 MaxReadySize 阈值时记录告警日志
  *   - 任务去重：通过唯一 Key 标识任务，重复入队会覆盖执行时间（重新调度语义）
- *   - 任务取消：支持通过 Key 取消未执行的延迟任务
- *   - 失败重试：处理失败自动重新入队，支持指数退避
+ *   - 任务取消：支持通过 Key 取消未执行/处理中的延迟任务
+ *   - 失败重试：处理失败自动 ACK 后重新入队，支持指数退避
  *   - 死信队列：超过最大重试次数进入死信列表，便于人工干预
- *   - 优雅关闭：Stop 等待所有在途任务处理完成
+ *   - 优雅关闭：Stop 等待所有在途任务处理完成，未 ACK 的任务靠可见性超时兜底
  *
  * 适用场景：
  *   - 定时状态流转（如订单超时关闭、维护计划状态自动更新）
@@ -25,10 +29,10 @@
  *   - 毫秒级精度的实时调度（受轮询间隔限制，默认 1s）
  *
  * 存储结构：
- *   - ZSET {ns}:zset:{queue}    score=执行时间戳(ms)  member=taskKey
- *   - HASH {ns}:hash:{queue}    field=taskKey         value=任务JSON
- *   - LIST {ns}:dead:{queue}    死信队列（LPush）
- *   - STR  {ns}:lock:{q}:{key}  单任务处理锁（SETNX）
+ *   - ZSET {ns}:zset:{queue}         ready，score=执行时间戳(ms)     member=taskKey
+ *   - ZSET {ns}:processing:{queue}   processing，score=可见性超时戳  member=taskKey
+ *   - HASH {ns}:hash:{queue}         field=taskKey                   value=任务JSON（ready/processing 共用，ACK 时删除）
+ *   - LIST {ns}:dead:{queue}         死信队列（LPush）
  *
  * Copyright (c) 2026 by kamalyes, All Rights Reserved.
  */
@@ -58,27 +62,30 @@ var (
 
 // DelayQueueConfig 延迟队列配置
 type DelayQueueConfig struct {
-	Namespace    string        // Redis 键命名空间前缀，默认 "delayq"
-	PollInterval time.Duration // 消费者轮询间隔，默认 1s
-	BatchSize    int64         // 每次轮询最多拉取的到期任务数，默认 10
-	Concurrency  int           // 单实例内并发处理任务数，默认 5
-	MaxRetries   int           // 最大重试次数（不含首次执行），默认 3
-	RetryDelay   time.Duration // 失败重试基础延迟，默认 5s（实际按指数退避：delay * 2^retry）
-	LockTTL      time.Duration // 单任务处理锁 TTL，默认 5m（防止处理者崩溃后任务长期被锁）
-	Logger       logger.ILogger
+	Namespace         string        // Redis 键命名空间前缀，默认 "delayq"
+	PollInterval      time.Duration // 消费者轮询间隔，默认 1s
+	BatchSize         int64         // 每次轮询最多拉取的到期任务数，默认 10
+	Concurrency       int           // 单实例内并发处理任务数，默认 5（Ordered=true 时忽略）
+	MaxRetries        int           // 最大重试次数（不含首次执行），默认 3
+	RetryDelay        time.Duration // 失败重试基础延迟，默认 5s（实际按指数退避：delay * 2^retry）
+	VisibilityTimeout time.Duration // 可见性超时：任务出队后多久未 ACK 视为失败回归队列，默认 5m
+	Ordered           bool          // 顺序模式：同一 queue 内任务按到期时间串行处理，禁用 WorkerPool 并发
+	MaxReadySize      int64         // ready 堆积告警阈值，超过时记录 Warn 日志，默认 10000（0 表示不检查）
+	Logger            logger.ILogger
 }
 
 // DefaultDelayQueueConfig 返回默认配置
 func DefaultDelayQueueConfig() DelayQueueConfig {
 	return DelayQueueConfig{
-		Namespace:    "delayq",
-		PollInterval: time.Second,
-		BatchSize:    10,
-		Concurrency:  5,
-		MaxRetries:   3,
-		RetryDelay:   5 * time.Second,
-		LockTTL:      5 * time.Minute,
-		Logger:       NewDefaultCachexLogger(),
+		Namespace:         "delayq",
+		PollInterval:      time.Second,
+		BatchSize:         10,
+		Concurrency:       5,
+		MaxRetries:        3,
+		RetryDelay:        5 * time.Second,
+		VisibilityTimeout: 5 * time.Minute,
+		MaxReadySize:      10000,
+		Logger:            NewDefaultCachexLogger(),
 	}
 }
 
@@ -126,7 +133,11 @@ func NewDelayQueue[T any](client *redis.Client, config ...DelayQueueConfig) *Del
 		cfg.Concurrency = mathx.IfLeZero(c.Concurrency, cfg.Concurrency)
 		cfg.MaxRetries = mathx.IfLeZero(c.MaxRetries, cfg.MaxRetries)
 		cfg.RetryDelay = mathx.IfNotZero(c.RetryDelay, cfg.RetryDelay)
-		cfg.LockTTL = mathx.IfNotZero(c.LockTTL, cfg.LockTTL)
+		cfg.VisibilityTimeout = mathx.IfNotZero(c.VisibilityTimeout, cfg.VisibilityTimeout)
+		cfg.Ordered = c.Ordered
+		if c.MaxReadySize != 0 {
+			cfg.MaxReadySize = c.MaxReadySize
+		}
 		if c.Logger != nil {
 			cfg.Logger = c.Logger
 		}
@@ -154,8 +165,10 @@ func (q *DelayQueue[T]) deadKey(queueName string) string {
 	return fmt.Sprintf("%s:dead:%s", q.config.Namespace, queueName)
 }
 
-func (q *DelayQueue[T]) lockKey(queueName, taskKey string) string {
-	return fmt.Sprintf("%s:lock:%s:%s", q.config.Namespace, queueName, taskKey)
+// processingKey 处理中 ZSet 的 key，score = 可见性超时时间戳
+// 任务从 ready 出队后进入 processing，ACK 后删除；超时未 ACK 的任务由 requeueStale 移回 ready
+func (q *DelayQueue[T]) processingKey(queueName string) string {
+	return fmt.Sprintf("%s:processing:%s", q.config.Namespace, queueName)
 }
 
 // ========== Lua 脚本 ==========
@@ -173,15 +186,17 @@ const enqueueLuaScript = `
 	return 1
 `
 
-// dequeueLua 原子出队脚本：
-// 从 ZSET 中按 score 升序取出 score <= now 的前 batchSize 个任务，
-// 同时从 ZSET 和 HASH 中删除，返回任务 JSON 数组
-// 没有到期任务时返回 false（go-redis 解析为 nil）
+// dequeueLua 原子出队脚本（ACK 模式）：
+// 从 ready ZSet 取 score <= now 的任务，移到 processing ZSet（score = 可见性超时时间），
+// Hash 数据保留（ACK 时才删除），返回任务 JSON 数组
+// Pod 崩溃/停止时，processing 中超时未 ACK 的任务由 requeueStaleLua 回收
 const dequeueLuaScript = `
 	local zsetKey = KEYS[1]
-	local hashKey = KEYS[2]
+	local processingKey = KEYS[2]
+	local hashKey = KEYS[3]
 	local now = tonumber(ARGV[1])
 	local batchSize = tonumber(ARGV[2])
+	local visibleAt = tonumber(ARGV[3])
 
 	local results = redis.call("ZRANGEBYSCORE", zsetKey, "-inf", now, "LIMIT", 0, batchSize)
 	if #results == 0 then
@@ -193,7 +208,7 @@ const dequeueLuaScript = `
 		local member = results[i]
 		local taskData = redis.call("HGET", hashKey, member)
 		redis.call("ZREM", zsetKey, member)
-		redis.call("HDEL", hashKey, member)
+		redis.call("ZADD", processingKey, visibleAt, member)
 		if taskData then
 			table.insert(tasks, taskData)
 		end
@@ -205,22 +220,94 @@ const dequeueLuaScript = `
 	return tasks
 `
 
-// cancelLua 取消任务脚本：ZREM + HDEL 原子操作
-const cancelLuaScript = `
-	local zsetKey = KEYS[1]
+// ackLua 确认任务完成：从 processing ZSet 删除 + 从 Hash 删除（原子）
+// 只有持有该任务的消费者能 ACK（通过 member 即 taskKey 定位，无需锁）
+const ackLuaScript = `
+	local processingKey = KEYS[1]
 	local hashKey = KEYS[2]
 	local member = ARGV[1]
-	local removed = redis.call("ZREM", zsetKey, member)
-	redis.call("HDEL", hashKey, member)
+	local removed = redis.call("ZREM", processingKey, member)
+	if removed > 0 then
+		redis.call("HDEL", hashKey, member)
+	end
 	return removed
 `
 
-// releaseLockLua 释放单任务锁（只释放自己持有的）
-const releaseLockLua = `
-	if redis.call("GET", KEYS[1]) == ARGV[1] then
-		return redis.call("DEL", KEYS[1])
+// requeueStaleLua 回收超时未 ACK 任务：
+// 从 processing ZSet 取 score <= now（已超时）的任务，移回 ready ZSet（score = now，立即可消费）
+// 多实例同时执行由 ZREM 原子性保证不重复
+const requeueStaleLuaScript = `
+	local processingKey = KEYS[1]
+	local zsetKey = KEYS[2]
+	local now = tonumber(ARGV[1])
+	local batchSize = tonumber(ARGV[2])
+
+	local results = redis.call("ZRANGEBYSCORE", processingKey, "-inf", now, "LIMIT", 0, batchSize)
+	if #results == 0 then
+		return 0
 	end
-	return 0
+
+	for i = 1, #results do
+		local member = results[i]
+		redis.call("ZREM", processingKey, member)
+		redis.call("ZADD", zsetKey, now, member)
+	end
+
+	return #results
+`
+
+// pollLua 合并轮询脚本（requeueStale + dequeueExpired 单次原子完成，减少 50% Redis 往返）：
+// 1. 回收 processing 中超时未 ACK 的任务，移回 ready（score=now，立即可消费）
+// 2. 拉取 ready 中到期任务，移到 processing（score=visibleAt），Hash 保留
+// 多实例并发由 ZREM 原子性保证不重复
+const pollLuaScript = `
+	local readyKey = KEYS[1]
+	local processingKey = KEYS[2]
+	local hashKey = KEYS[3]
+	local now = tonumber(ARGV[1])
+	local batchSize = tonumber(ARGV[2])
+	local visibleAt = tonumber(ARGV[3])
+
+	-- 1. 回收 processing 超时任务到 ready
+	local stale = redis.call("ZRANGEBYSCORE", processingKey, "-inf", now, "LIMIT", 0, batchSize)
+	for i = 1, #stale do
+		redis.call("ZREM", processingKey, stale[i])
+		redis.call("ZADD", readyKey, now, stale[i])
+	end
+
+	-- 2. 拉取 ready 到期任务到 processing
+	local results = redis.call("ZRANGEBYSCORE", readyKey, "-inf", now, "LIMIT", 0, batchSize)
+	if #results == 0 then
+		return false
+	end
+
+	local tasks = {}
+	for i = 1, #results do
+		local member = results[i]
+		local taskData = redis.call("HGET", hashKey, member)
+		redis.call("ZREM", readyKey, member)
+		redis.call("ZADD", processingKey, visibleAt, member)
+		if taskData then
+			table.insert(tasks, taskData)
+		end
+	end
+
+	if #tasks == 0 then
+		return false
+	end
+	return tasks
+`
+
+// cancelLua 取消任务脚本：同时从 ready/processing ZSet 删除 + Hash 删除
+const cancelLuaScript = `
+	local zsetKey = KEYS[1]
+	local processingKey = KEYS[2]
+	local hashKey = KEYS[3]
+	local member = ARGV[1]
+	local removed = redis.call("ZREM", zsetKey, member)
+	removed = removed + redis.call("ZREM", processingKey, member)
+	redis.call("HDEL", hashKey, member)
+	return removed
 `
 
 // ========== 入队 ==========
@@ -278,7 +365,8 @@ func (q *DelayQueue[T]) Cancel(ctx context.Context, queueName, key string) (bool
 		return false, ErrDelayQueueClosed
 	}
 
-	result, err := q.client.Eval(ctx, cancelLuaScript, []string{q.zsetKey(queueName), q.hashKey(queueName)}, key).Int64()
+	result, err := q.client.Eval(ctx, cancelLuaScript,
+		[]string{q.zsetKey(queueName), q.processingKey(queueName), q.hashKey(queueName)}, key).Int64()
 	if err != nil {
 		return false, fmt.Errorf("cancel delay task failed: %w", err)
 	}
@@ -292,9 +380,25 @@ func (q *DelayQueue[T]) Cancel(ctx context.Context, queueName, key string) (bool
 
 // ========== 查询 ==========
 
-// Length 返回队列中待执行的任务数
+// Length 返回 ready 队列中待执行的任务数（兼容方法，等同 ReadyLength）
 func (q *DelayQueue[T]) Length(ctx context.Context, queueName string) (int64, error) {
 	return q.client.ZCard(ctx, q.zsetKey(queueName)).Result()
+}
+
+// ReadyLength 返回 ready 队列中待执行的任务数
+func (q *DelayQueue[T]) ReadyLength(ctx context.Context, queueName string) (int64, error) {
+	return q.client.ZCard(ctx, q.zsetKey(queueName)).Result()
+}
+
+// ProcessingLength 返回 processing 中处理中（未 ACK）的任务数
+// 持续增长通常意味着消费者处理过慢或 Pod 频繁崩溃未 ACK
+func (q *DelayQueue[T]) ProcessingLength(ctx context.Context, queueName string) (int64, error) {
+	return q.client.ZCard(ctx, q.processingKey(queueName)).Result()
+}
+
+// DeadLength 返回死信队列长度
+func (q *DelayQueue[T]) DeadLength(ctx context.Context, queueName string) (int64, error) {
+	return q.client.LLen(ctx, q.deadKey(queueName)).Result()
 }
 
 // GetTask 获取任务详情（未执行的）
@@ -318,11 +422,6 @@ func (q *DelayQueue[T]) GetTask(ctx context.Context, queueName, key string) (*De
 		ExecuteAt:  envelope.ExecuteAt,
 		RetryCount: envelope.RetryCount,
 	}, nil
-}
-
-// DeadLength 返回死信队列长度
-func (q *DelayQueue[T]) DeadLength(ctx context.Context, queueName string) (int64, error) {
-	return q.client.LLen(ctx, q.deadKey(queueName)).Result()
 }
 
 // GetDeadTasks 获取死信队列任务列表（分页）
@@ -356,7 +455,11 @@ func (q *DelayQueue[T]) GetDeadTasks(ctx context.Context, queueName string, offs
 // dequeueExpired 原子获取到期任务
 func (q *DelayQueue[T]) dequeueExpired(ctx context.Context, queueName string) ([]*DelayTask[T], error) {
 	now := float64(time.Now().UnixMilli())
-	result, err := q.client.Eval(ctx, dequeueLuaScript, []string{q.zsetKey(queueName), q.hashKey(queueName)}, now, q.config.BatchSize).Result()
+	// 可见性超时时间戳：任务进入 processing 后，超过此时间未 ACK 视为失败
+	visibleAt := float64(time.Now().Add(q.config.VisibilityTimeout).UnixMilli())
+	result, err := q.client.Eval(ctx, dequeueLuaScript,
+		[]string{q.zsetKey(queueName), q.processingKey(queueName), q.hashKey(queueName)},
+		now, q.config.BatchSize, visibleAt).Result()
 	if err != nil {
 		// Lua 返回 false 时 go-redis 解析为 redis.Nil
 		if errors.Is(err, redis.Nil) {
@@ -394,6 +497,88 @@ func (q *DelayQueue[T]) dequeueExpired(ctx context.Context, queueName string) ([
 		})
 	}
 
+	return tasks, nil
+}
+
+// ack 确认任务处理完成：从 processing ZSet 删除 + 从 Hash 删除
+// 必须在 handler 成功后调用，否则任务会在可见性超时后回归 ready 被重新消费
+func (q *DelayQueue[T]) ack(ctx context.Context, queueName, taskKey string) error {
+	removed, err := q.client.Eval(ctx, ackLuaScript,
+		[]string{q.processingKey(queueName), q.hashKey(queueName)}, taskKey).Int64()
+	if err != nil {
+		return fmt.Errorf("ack delay task failed: %w", err)
+	}
+	if removed == 0 {
+		// 任务已不在 processing（可能已被 requeueStale 回收并重新消费），视为幂等成功
+		q.logger.Debugf("ack no-op, task not in processing: queue=%s key=%s", queueName, taskKey)
+	}
+	return nil
+}
+
+// requeueStale 回收 processing 中超时未 ACK 的任务，移回 ready（score=now，立即可消费）
+// 多实例并发执行由 ZREM 原子性保证不重复回收同一任务
+// 返回回收的任务数
+func (q *DelayQueue[T]) requeueStale(ctx context.Context, queueName string) (int64, error) {
+	now := float64(time.Now().UnixMilli())
+	count, err := q.client.Eval(ctx, requeueStaleLuaScript,
+		[]string{q.processingKey(queueName), q.zsetKey(queueName)},
+		now, q.config.BatchSize).Int64()
+	if err != nil {
+		// Lua 返回 0 时正常，不会触发 redis.Nil（return 0 不是 false）
+		return 0, fmt.Errorf("requeue stale tasks failed: %w", err)
+	}
+	if count > 0 {
+		q.logger.Warnf("requeued stale tasks: queue=%s count=%d", queueName, count)
+	}
+	return count, nil
+}
+
+// pollExpired 原子轮询（合并 requeueStale + dequeueExpired 为单次 Lua 调用）：
+// 1. 回收 processing 中超时未 ACK 的任务，移回 ready
+// 2. 拉取 ready 中到期任务，移到 processing
+// 多 Pod 场景下每轮 poll 仅 1 次 Redis 往返（vs 之前 2 次）
+func (q *DelayQueue[T]) pollExpired(ctx context.Context, queueName string) ([]*DelayTask[T], error) {
+	now := float64(time.Now().UnixMilli())
+	visibleAt := float64(time.Now().Add(q.config.VisibilityTimeout).UnixMilli())
+	result, err := q.client.Eval(ctx, pollLuaScript,
+		[]string{q.zsetKey(queueName), q.processingKey(queueName), q.hashKey(queueName)},
+		now, q.config.BatchSize, visibleAt).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("poll expired tasks failed: %w", err)
+	}
+	if result == nil {
+		return nil, nil
+	}
+
+	arr, ok := result.([]interface{})
+	if !ok {
+		return nil, nil
+	}
+	if len(arr) == 0 {
+		return nil, nil
+	}
+
+	tasks := make([]*DelayTask[T], 0, len(arr))
+	for _, item := range arr {
+		dataStr, ok := item.(string)
+		if !ok {
+			continue
+		}
+		var envelope delayTaskEnvelope[T]
+		if err := json.Unmarshal([]byte(dataStr), &envelope); err != nil {
+			q.logger.Errorf("unmarshal polled delay task failed: queue=%s err=%v", queueName, err)
+			continue
+		}
+		tasks = append(tasks, &DelayTask[T]{
+			Key:        envelope.Key,
+			Data:       envelope.Data,
+			ExecuteAt:  envelope.ExecuteAt,
+			RetryCount: envelope.RetryCount,
+		})
+	}
 	return tasks, nil
 }
 
@@ -486,7 +671,7 @@ func (q *DelayQueue[T]) StartConsumer(
 	return nil
 }
 
-// pollOnce 执行一次轮询：拉取到期任务并分发到 WorkerPool
+// pollOnce 执行一次轮询（单次 Lua 原子完成回收+出队）→ 堆积监控 → 分发处理
 func (q *DelayQueue[T]) pollOnce(
 	ctx context.Context,
 	queueName string,
@@ -495,12 +680,32 @@ func (q *DelayQueue[T]) pollOnce(
 	maxRetries int,
 	retryDelay time.Duration,
 ) {
-	tasks, err := q.dequeueExpired(ctx, queueName)
+	// 1. 堆积监控：ready 超过阈值时告警（ZCARD 开销小，仅 MaxReadySize>0 时执行）
+	if q.config.MaxReadySize > 0 {
+		if readyLen, err := q.ReadyLength(ctx, queueName); err == nil && readyLen > q.config.MaxReadySize {
+			q.logger.Warnf("delay queue backlog over threshold: queue=%s ready=%d threshold=%d",
+				queueName, readyLen, q.config.MaxReadySize)
+		}
+	}
+
+	// 2. 原子轮询：回收超时任务 + 拉取到期任务（单次 Lua，多 Pod 安全）
+	tasks, err := q.pollExpired(ctx, queueName)
 	if err != nil {
-		q.logger.Errorf("dequeue expired tasks failed: queue=%s err=%v", queueName, err)
+		q.logger.Errorf("poll expired tasks failed: queue=%s err=%v", queueName, err)
 		return
 	}
 	if len(tasks) == 0 {
+		return
+	}
+
+	// 3. 分发处理：Ordered 串行保证顺序，否则并发提交 WorkerPool
+	if q.config.Ordered {
+		for _, task := range tasks {
+			if ctx.Err() != nil {
+				return
+			}
+			q.handleTask(ctx, queueName, task, handler, maxRetries, retryDelay)
+		}
 		return
 	}
 
@@ -509,8 +714,10 @@ func (q *DelayQueue[T]) pollOnce(
 		if err := worker.SubmitNonBlocking(func() {
 			q.handleTask(ctx, queueName, task, handler, maxRetries, retryDelay)
 		}); err != nil {
-			// WorkerPool 满了，立即重新入队（保持原执行时间，下轮重试）
-			if reErr := q.reEnqueue(ctx, queueName, task); reErr != nil {
+			// WorkerPool 满：任务已在 processing，先 ACK 再重新入队 ready（用独立 context 避免 ctx 取消）
+			ackCtx := context.Background()
+			_ = q.ack(ackCtx, queueName, task.Key)
+			if reErr := q.reEnqueue(ackCtx, queueName, task); reErr != nil {
 				q.logger.Errorf("re-enqueue on pool full failed: queue=%s key=%s err=%v", queueName, task.Key, reErr)
 			} else {
 				q.logger.Warnf("worker pool full, re-enqueue task: queue=%s key=%s", queueName, task.Key)
@@ -519,7 +726,9 @@ func (q *DelayQueue[T]) pollOnce(
 	}
 }
 
-// handleTask 处理单个任务（含锁、重试、死信逻辑）
+// handleTask 处理单个任务（ACK 模式：成功 ACK 删除，失败 ACK 后重试/死信）
+// 任务在 dequeueExpired 时已原子移入 processing，ACK 负责确认完成
+// Pod 崩溃/停止时未 ACK 的任务由 requeueStale 在可见性超时后回收，由其它 Pod 接管
 func (q *DelayQueue[T]) handleTask(
 	ctx context.Context,
 	queueName string,
@@ -528,55 +737,39 @@ func (q *DelayQueue[T]) handleTask(
 	maxRetries int,
 	retryDelay time.Duration,
 ) {
-	// 单任务处理锁：双重保险，防止跨实例重复处理
-	// （Lua 出队已保证唯一，锁作为崩溃恢复期间的额外保护）
-	lockKey := q.lockKey(queueName, task.Key)
-	token := fmt.Sprintf("%d-%d", time.Now().UnixNano(), task.RetryCount)
-
-	acquired, err := q.client.SetNX(ctx, lockKey, token, q.config.LockTTL).Result()
-	if err != nil {
-		q.logger.Errorf("acquire task lock failed: queue=%s key=%s err=%v", queueName, task.Key, err)
-		// 加锁失败，延迟重新入队
-		if reErr := q.reEnqueueWithDelay(ctx, queueName, task, time.Second); reErr != nil {
-			q.logger.Errorf("re-enqueue on lock failed failed: queue=%s key=%s err=%v", queueName, task.Key, reErr)
-		}
-		return
-	}
-	if !acquired {
-		// 已被其他实例处理，跳过（理论上不会发生，因为 Lua 出队是原子的）
-		q.logger.Debugf("task locked by another instance: queue=%s key=%s", queueName, task.Key)
-		return
-	}
-	defer q.releaseLock(ctx, lockKey, token)
-
 	// 执行业务处理
 	if err := handler(ctx, task); err != nil {
 		q.logger.Warnf("delay task handler failed: queue=%s key=%s retry=%d/%d err=%v",
 			queueName, task.Key, task.RetryCount, maxRetries, err)
 
+		// 处理失败：用独立 context 确保 ACK/重试/死信操作不受 ctx 取消影响
+		// 即使这些操作全部失败，requeueStale 也会在可见性超时后兜底回收
+		ackCtx := context.Background()
+		_ = q.ack(ackCtx, queueName, task.Key)
+
 		if task.RetryCount >= maxRetries {
 			// 超过最大重试次数，进入死信队列
-			q.moveToDead(ctx, queueName, task)
+			q.moveToDead(ackCtx, queueName, task)
 			return
 		}
 
 		// 指数退避重新入队：delay * 2^retry
 		task.RetryCount++
 		delay := retryDelay * time.Duration(1<<uint(task.RetryCount))
-		if reErr := q.reEnqueueWithDelay(ctx, queueName, task, delay); reErr != nil {
+		if reErr := q.reEnqueueWithDelay(ackCtx, queueName, task, delay); reErr != nil {
 			q.logger.Errorf("re-enqueue on handler failed failed: queue=%s key=%s err=%v", queueName, task.Key, reErr)
 		}
 		return
 	}
 
-	q.logger.Debugf("delay task processed: queue=%s key=%s", queueName, task.Key)
-}
-
-// releaseLock 释放单任务锁
-func (q *DelayQueue[T]) releaseLock(ctx context.Context, lockKey, token string) {
-	if err := q.client.Eval(ctx, releaseLockLua, []string{lockKey}, token).Err(); err != nil {
-		q.logger.Warnf("release task lock failed: key=%s err=%v", lockKey, err)
+	// 处理成功：ACK 确认（用独立 context，Pod 优雅停止时 ctx 可能已取消）
+	if err := q.ack(context.Background(), queueName, task.Key); err != nil {
+		// ACK 失败：任务会在可见性超时后回归 ready 被重新消费（可能重复执行）
+		// 业务 handler 需要幂等；此处仅记录日志，requeueStale 兜底
+		q.logger.Errorf("ack failed, task will be requeued after timeout: queue=%s key=%s err=%v", queueName, task.Key, err)
+		return
 	}
+	q.logger.Debugf("delay task processed: queue=%s key=%s", queueName, task.Key)
 }
 
 // reEnqueue 重新入队（立即到期，保持原 RetryCount）

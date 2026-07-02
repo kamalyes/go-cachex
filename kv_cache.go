@@ -111,10 +111,16 @@ type KVCacheConfig struct {
 	Namespace         string         // Redis 命名空间，默认 "kv"
 	Logger            logger.ILogger // 日志记录器（可选）
 	MaxLocalCacheSize int            // 本地缓存最大条目数，默认 10000
+	BatchLoader       any            // 按需批量回源加载器（可选，类型应为 BatchLoader[K,V]）
 }
 
 // KVLoader KV 数据加载器：从数据源加载全量 K->V 映射
 type KVLoader[K comparable, V any] func(ctx context.Context) (map[K]V, error)
+
+// BatchLoader 按需批量回源加载器：按指定 keys 从数据源精准加载 K->V 映射
+// 适用于"全量加载不可行"的场景（如跨服务 RPC 按需查询、大数据量表按主键查）
+// 与 KVLoader 互斥可选：两者都配置时，KVLoader 用于 autoRefresh 全量预热，BatchLoader 用于 miss 时精准回源
+type BatchLoader[K comparable, V any] func(ctx context.Context, keys []K) (map[K]V, error)
 
 // KVCache 通用键值缓存
 //
@@ -133,6 +139,7 @@ type KVCache[K comparable, V any] struct {
 	client          *redis.Client
 	config          KVCacheConfig
 	loader          KVLoader[K, V]
+	batchLoader     BatchLoader[K, V] // 按需批量回源加载器（可选）
 	name            string
 	mu              sync.RWMutex
 	localCache      map[K]V
@@ -185,8 +192,15 @@ func NewKVCache[K comparable, V any](
 		invalidateCh: fmt.Sprintf("%s:%s:invalidate", config.Namespace, name),
 	}
 
-	// 启动自动刷新
-	if config.EnableAutoRefresh {
+	// 解析可选的 BatchLoader（按需批量回源加载器）
+	if config.BatchLoader != nil {
+		if bl, ok := config.BatchLoader.(BatchLoader[K, V]); ok {
+			cache.batchLoader = bl
+		}
+	}
+
+	// 启动自动刷新（仅当存在全量 loader 时才有意义；仅有 BatchLoader 时跳过）
+	if config.EnableAutoRefresh && loader != nil {
 		syncx.Go().
 			OnPanic(func(r interface{}) {
 				cache.logger.Errorf("Panic in KVCache autoRefresh: %v", r)
@@ -311,7 +325,7 @@ func (c *KVCache[K, V]) decodeValue(s string) (V, error) {
 	return v, nil
 }
 
-// Get 获取单个值（本地 -> Redis -> loader 兜底）
+// Get 获取单个值（本地 -> Redis -> BatchLoader 按需回源 / LoadAll 全量兜底）
 func (c *KVCache[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	var zero V
 
@@ -342,7 +356,23 @@ func (c *KVCache[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 		c.logger.Warnf("KVCache %s HGet failed: %v", c.name, err)
 	}
 
-	// 3. miss 触发全量预热（保证本地缓存可用）
+	// 3. miss 回源：优先 BatchLoader 按需回源，无 BatchLoader 时触发 LoadAll 全量兜底
+	if c.batchLoader != nil {
+		c.logger.Debugf("KVCache %s Get miss, batchLoading: key=%v", c.name, key)
+		loaded, lerr := c.batchLoader(ctx, []K{key})
+		if lerr != nil {
+			return zero, false, fmt.Errorf("KVCache %s batchLoader failed: %w", c.name, lerr)
+		}
+		if v, ok := loaded[key]; ok {
+			c.mu.Lock()
+			c.localCache[key] = v
+			c.mu.Unlock()
+			_ = c.writeManyToRedis(ctx, loaded)
+			return v, true, nil
+		}
+		return zero, false, nil
+	}
+
 	c.logger.Debugf("KVCache %s Get miss, triggering LoadAll: key=%v", c.name, key)
 	if _, err := c.LoadAll(ctx); err != nil {
 		return zero, false, err
@@ -354,6 +384,9 @@ func (c *KVCache[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 }
 
 // GetMany 批量获取多个 key 的值（缺失的 key 不出现在返回 map 中）
+//
+// 查询路径：本地缓存 -> Redis HMGET -> BatchLoader 按需回源（可选）
+// 当配置了 BatchLoader 时，Redis 也 miss 的 key 会按需精准回源（而非全量 LoadAll）
 func (c *KVCache[K, V]) GetMany(ctx context.Context, keys []K) (map[K]V, error) {
 	if len(keys) == 0 {
 		return make(map[K]V), nil
@@ -383,7 +416,12 @@ func (c *KVCache[K, V]) GetMany(ctx context.Context, keys []K) (map[K]V, error) 
 	}
 	values, err := c.client.HMGet(ctx, c.redisKey(), fields...).Result()
 	if err != nil && err != redis.Nil {
-		// Redis 不可用，触发全量预热兜底
+		// Redis 不可用时的兜底策略
+		if c.batchLoader != nil {
+			// 有 BatchLoader，按缺失 keys 精准回源
+			return c.batchLoadAndFill(ctx, result, missed)
+		}
+		// 无 BatchLoader，触发全量预热兜底
 		if _, lerr := c.LoadAll(ctx); lerr == nil {
 			c.mu.RLock()
 			for _, k := range missed {
@@ -397,23 +435,57 @@ func (c *KVCache[K, V]) GetMany(ctx context.Context, keys []K) (map[K]V, error) 
 		return nil, fmt.Errorf("KVCache %s HMGet failed: %w", c.name, err)
 	}
 
-	// 回填本地缓存并合并结果
+	// 回填本地缓存并合并 Redis 命中的结果，同时收集 Redis 也 miss 的 key
+	stillMissed := make([]K, 0, len(missed))
 	c.mu.Lock()
 	for i, val := range values {
 		if val == nil {
+			stillMissed = append(stillMissed, missed[i])
 			continue
 		}
 		s, ok := val.(string)
 		if !ok {
+			stillMissed = append(stillMissed, missed[i])
 			continue
 		}
 		if v, derr := c.decodeValue(s); derr == nil {
 			c.localCache[missed[i]] = v
 			result[missed[i]] = v
+		} else {
+			stillMissed = append(stillMissed, missed[i])
 		}
 	}
 	c.mu.Unlock()
 
+	// Redis 也 miss 的 key，如果有 BatchLoader，按需精准回源
+	if len(stillMissed) > 0 && c.batchLoader != nil {
+		return c.batchLoadAndFill(ctx, result, stillMissed)
+	}
+
+	return result, nil
+}
+
+// batchLoadAndFill 调用 BatchLoader 按需回源，回填本地+Redis 缓存，合并到 result
+func (c *KVCache[K, V]) batchLoadAndFill(ctx context.Context, result map[K]V, keys []K) (map[K]V, error) {
+	loaded, err := c.batchLoader(ctx, keys)
+	if err != nil {
+		return nil, fmt.Errorf("KVCache %s batchLoader failed: %w", c.name, err)
+	}
+
+	// 回填本地缓存并合并到结果
+	c.mu.Lock()
+	for k, v := range loaded {
+		c.localCache[k] = v
+		result[k] = v
+	}
+	c.mu.Unlock()
+
+	// 预热 Redis（不广播失效——这是 miss 回源，避免雪崩）
+	if len(loaded) > 0 {
+		_ = c.writeManyToRedis(ctx, loaded)
+	}
+
+	c.logger.Debugf("KVCache %s batchLoad: requested=%d loaded=%d", c.name, len(keys), len(loaded))
 	return result, nil
 }
 
@@ -799,4 +871,18 @@ func WithKVLogger(l logger.ILogger) KVOption {
 // WithKVMaxLocalCacheSize 设置本地缓存最大条目数
 func WithKVMaxLocalCacheSize(n int) KVOption {
 	return func(c *KVCacheConfig) { c.MaxLocalCacheSize = n }
+}
+
+// WithKVBatchLoader 设置按需批量回源加载器
+// 配置后，GetMany 在本地+Redis 都 miss 时按缺失 keys 精准回源（而非全量 LoadAll）
+// 适用于"全量加载不可行"的场景（如跨服务 RPC 按需查询、大数据量表按主键查）
+//
+//	cachex.RegisterKV[string, string]("user_nickname", nil,
+//	    cachex.WithKVBatchLoader[string, string](func(ctx, keys) (map[string]string, error) {
+//	        // 调用 RPC 批量查询，返回 user_id -> nickname 映射
+//	    }),
+//	    cachex.WithKVAutoRefresh(false),  // 仅有 BatchLoader 时关闭自动刷新
+//	)
+func WithKVBatchLoader[K comparable, V any](loader BatchLoader[K, V]) KVOption {
+	return func(c *KVCacheConfig) { c.BatchLoader = loader }
 }
