@@ -555,6 +555,39 @@ func (c *KVCache[K, V]) SetMany(ctx context.Context, items map[K]V) error {
 	return nil
 }
 
+// Client 返回底层 Redis 客户端，供上层组件（如 ModelKVCache）构建 Pipeline 批量写入
+func (c *KVCache[K, V]) Client() *redis.Client { return c.client }
+
+// SetToPipe 将 HSET+TTL（Lua 原子脚本）命令追加到给定 pipeline（不立即执行），同时写本地缓存
+// 调用方负责执行 pipeline（pipe.Exec）与广播失效，避免多字段场景下 N 次 RTT
+func (c *KVCache[K, V]) SetToPipe(pipe redis.Pipeliner, key K, value V) error {
+	c.mu.Lock()
+	c.localCache[key] = value
+	c.mu.Unlock()
+
+	vstr, err := c.encodeValue(value)
+	if err != nil {
+		return err
+	}
+	ttl := int64(c.config.DefaultTTL / time.Second)
+	pipe.Eval(context.Background(), luaKVSetMany, []string{c.redisKey()}, ttl, c.encodeKey(key), vstr)
+	return nil
+}
+
+// DeleteFromPipe 将 HDel 命令追加到给定 pipeline（不立即执行），同时删本地缓存
+// 调用方负责执行 pipeline（pipe.Exec）与广播失效
+func (c *KVCache[K, V]) DeleteFromPipe(pipe redis.Pipeliner, key K) {
+	c.mu.Lock()
+	delete(c.localCache, key)
+	c.mu.Unlock()
+	pipe.HDel(context.Background(), c.redisKey(), c.encodeKey(key))
+}
+
+// PublishInvalidation 广播失效消息（导出版本，供上层批量场景按需调用）
+func (c *KVCache[K, V]) PublishInvalidation(keys []string) {
+	c.publishInvalidation("invalidate", keys)
+}
+
 // Delete 删除单个 key（并广播失效消息）
 func (c *KVCache[K, V]) Delete(ctx context.Context, key K) error {
 	c.mu.Lock()
