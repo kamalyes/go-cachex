@@ -99,7 +99,7 @@ func NewPubSub(redisClient redis.UniversalClient, config ...PubSubConfig) *PubSu
 		subscribers: make(map[string]*Subscriber),
 		ctx:         ctx,
 		cancel:      cancel,
-		logger:      mathx.IfEmpty(cfg.Logger, NewDefaultCachexLogger()),
+		logger:      mathx.IfEmpty(cfg.Logger, mathx.IfEmpty(globalLogger, NewDefaultCachexLogger())),
 	}
 }
 
