@@ -7,7 +7,7 @@ require (
 	github.com/dgraph-io/ristretto/v2 v2.4.0
 	github.com/kamalyes/go-argus v0.2.1
 	github.com/kamalyes/go-logger v0.5.3
-	github.com/kamalyes/go-toolbox v0.15.3
+	github.com/kamalyes/go-toolbox v0.15.4-0.20260706162621-92e82cf316fc
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/stretchr/testify v1.11.1
 	gorm.io/gorm v1.30.0

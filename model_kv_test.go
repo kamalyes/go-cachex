@@ -139,9 +139,7 @@ func mustKVGet(t *testing.T, name, key string) string {
 func kvGetMiss(t *testing.T, name, key string) {
 	t.Helper()
 	kv := MustGetKV[string, string](name)
-	kv.mu.RLock()
-	_, ok := kv.localCache[key]
-	kv.mu.RUnlock()
+	_, ok := kv.localCache.Load(key)
 	assert.False(t, ok, "key %q should be missing in local cache %q", key, name)
 }
 

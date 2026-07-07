@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kamalyes/go-toolbox/pkg/convert"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -73,22 +74,22 @@ func TestKVCache_EncodeKey(t *testing.T) {
 	// string K
 	cStr := NewKVCache[string, string](client, "enc-str", kvLoader[string, string](nil, nil), KVCacheConfig{EnableAutoRefresh: false})
 	defer cStr.Stop()
-	assert.Equal(t, "hello", cStr.encodeKey("hello"))
+	assert.Equal(t, "hello", convert.MustString("hello"))
 
 	// int K
 	cInt := NewKVCache[int, string](client, "enc-int", kvLoader[int, string](nil, nil), KVCacheConfig{EnableAutoRefresh: false})
 	defer cInt.Stop()
-	assert.Equal(t, "42", cInt.encodeKey(42))
+	assert.Equal(t, "42", convert.MustString(42))
 
 	// int64 K
 	cI64 := NewKVCache[int64, string](client, "enc-i64", kvLoader[int64, string](nil, nil), KVCacheConfig{EnableAutoRefresh: false})
 	defer cI64.Stop()
-	assert.Equal(t, "100", cI64.encodeKey(int64(100)))
+	assert.Equal(t, "100", convert.MustString(int64(100)))
 
 	// uint32 K
 	cU32 := NewKVCache[uint32, string](client, "enc-u32", kvLoader[uint32, string](nil, nil), KVCacheConfig{EnableAutoRefresh: false})
 	defer cU32.Stop()
-	assert.Equal(t, "4294967295", cU32.encodeKey(uint32(4294967295)))
+	assert.Equal(t, "4294967295", convert.MustString(uint32(4294967295)))
 }
 
 func TestKVCache_EncodeDecodeValue(t *testing.T) {
@@ -97,17 +98,25 @@ func TestKVCache_EncodeDecodeValue(t *testing.T) {
 	c := NewKVCache[string, string](client, "test-encdec", kvLoader[string, string](nil, nil), KVCacheConfig{EnableAutoRefresh: false})
 	defer c.Stop()
 
-	// string
+	// string 类型走快速路径：encodeValue 直接返回原始 string，跳过 JSON 序列化
 	s, err := c.encodeValue("hello")
 	require.NoError(t, err)
-	assert.Equal(t, `"hello"`, s)
+	assert.Equal(t, "hello", s)
 
-	v, err := c.decodeValue(`"hello"`)
+	// 新格式：直接 string，decodeValue 直接返回
+	v, err := c.decodeValue("hello")
 	require.NoError(t, err)
 	assert.Equal(t, "hello", v)
 
-	// decode 失败
-	_, err = c.decodeValue("not-json")
+	// 兼容旧格式：JSON 序列化的 string（以 " 开头），decodeValue 走 json.Unmarshal
+	v, err = c.decodeValue(`"hello"`)
+	require.NoError(t, err)
+	assert.Equal(t, "hello", v)
+
+	// 非 string 类型的 V 走 JSON 路径，decode 失败仍返回错误
+	cInt := NewKVCache[string, int](client, "test-encdec-int", kvLoader[string, int](nil, nil), KVCacheConfig{EnableAutoRefresh: false})
+	defer cInt.Stop()
+	_, err = cInt.decodeValue("not-json")
 	assert.Error(t, err)
 }
 
@@ -129,10 +138,10 @@ func TestKVCache_SetAndGet(t *testing.T) {
 	assert.True(t, exists)
 	assert.Equal(t, "v1", v)
 
-	// 直接查 Redis Hash 应该有值
+	// 直接查 Redis Hash 应该有值（string 快速路径：存原始 string，不带 JSON 引号）
 	s, err := c.client.HGet(ctx, c.redisKey(), "k1").Result()
 	require.NoError(t, err)
-	assert.Equal(t, `"v1"`, s)
+	assert.Equal(t, "v1", s)
 }
 
 func TestKVCache_Get_Miss_LoadAll(t *testing.T) {
@@ -629,14 +638,20 @@ func TestKVCache_DistributedInvalidate_OnSet(t *testing.T) {
 	// 2. 节点 A 写新值（本地 + Redis = "v1"，广播 invalidate("k1")）
 	require.NoError(t, nodeA.Set(ctx, "k1", "v1"))
 
-	// 3. 等待 nodeA 的 invalidate 消息到达 nodeB，nodeB 本地 "old" 被删除
-	time.Sleep(1 * time.Second)
+	// 2.1 直接验证 Redis 确实写入成功（排除 Pipeline 静默失败）
+	redisVal, err := client.HGet(ctx, "kv:"+name, "k1").Result()
+	require.NoError(t, err, "Redis HGet 应该返回 nodeA.Set 写入的值")
+	assert.Equal(t, "v1", redisVal, "Redis 中 k1 的值应为 v1")
 
-	// 4. nodeB.Get：本地 miss → Redis "v1" → 返回最新值
-	v, exists, err := nodeB.Get(ctx, "k1")
-	require.NoError(t, err)
-	assert.True(t, exists)
-	assert.Equal(t, "v1", v) // 应该是 A 写的最新值，不是 "old"
+	// 3. 轮询等待 nodeA 的 invalidate 消息到达 nodeB，nodeB 本地 "old" 被删除后 Get 返回 "v1"
+	//    用 require.Eventually 替代固定 sleep，适应远端 Redis 网络延迟
+	require.Eventually(t, func() bool {
+		v, exists, err := nodeB.Get(ctx, "k1")
+		if err != nil {
+			return false
+		}
+		return exists && v == "v1"
+	}, 5*time.Second, 100*time.Millisecond, "nodeB 应在收到 invalidate 后从 Redis 拿到 v1")
 }
 
 func TestKVCache_DistributedInvalidate_OnDelete(t *testing.T) {
@@ -670,13 +685,11 @@ func TestKVCache_DistributedInvalidate_OnDelete(t *testing.T) {
 	// 节点 A 删除 k1
 	require.NoError(t, nodeA.Delete(ctx, "k1"))
 
-	// 等待 PubSub 传播
-	time.Sleep(300 * time.Millisecond)
-
-	// 节点 B 本地应该被失效
-	_, exists, err := nodeB.Get(ctx, "k1")
-	require.NoError(t, err)
-	assert.False(t, exists)
+	// 轮询等待 PubSub 传播：nodeB 本地被失效后 Get 返回 not found
+	require.Eventually(t, func() bool {
+		_, exists, err := nodeB.Get(ctx, "k1")
+		return err == nil && !exists
+	}, 5*time.Second, 100*time.Millisecond, "nodeB 应在收到 invalidate 后找不到 k1")
 }
 
 func TestKVCache_DistributedInvalidate_OnClear(t *testing.T) {
@@ -709,11 +722,10 @@ func TestKVCache_DistributedInvalidate_OnClear(t *testing.T) {
 	// 节点 A Clear
 	require.NoError(t, nodeA.Clear(ctx))
 
-	// 等待 PubSub 传播
-	time.Sleep(300 * time.Millisecond)
-
-	// 节点 B 本地应该被清空
-	assert.Equal(t, 0, nodeB.Size())
+	// 轮询等待 PubSub 传播：nodeB 本地被清空
+	require.Eventually(t, func() bool {
+		return nodeB.Size() == 0
+	}, 5*time.Second, 100*time.Millisecond, "nodeB 应在收到 clear 后本地缓存为空")
 }
 
 func TestKVCache_DistributedInvalidate_SelfIgnore(t *testing.T) {
@@ -884,23 +896,23 @@ func TestKVCache_EncodeKey_AdditionalTypes(t *testing.T) {
 	// int32
 	cI32 := NewKVCache[int32, string](client, "enc-i32", kvLoader[int32, string](nil, nil), KVCacheConfig{EnableAutoRefresh: false})
 	defer cI32.Stop()
-	assert.Equal(t, "100", cI32.encodeKey(int32(100)))
+	assert.Equal(t, "100", convert.MustString(int32(100)))
 
 	// uint
 	cUint := NewKVCache[uint, string](client, "enc-uint", kvLoader[uint, string](nil, nil), KVCacheConfig{EnableAutoRefresh: false})
 	defer cUint.Stop()
-	assert.Equal(t, "200", cUint.encodeKey(uint(200)))
+	assert.Equal(t, "200", convert.MustString(uint(200)))
 
 	// uint64
 	cU64 := NewKVCache[uint64, string](client, "enc-u64", kvLoader[uint64, string](nil, nil), KVCacheConfig{EnableAutoRefresh: false})
 	defer cU64.Stop()
-	assert.Equal(t, "300", cU64.encodeKey(uint64(300)))
+	assert.Equal(t, "300", convert.MustString(uint64(300)))
 
 	// 自定义类型（走 default 分支，fmt.Sprintf）
 	type CustomKey struct{ ID string }
 	cCustom := NewKVCache[CustomKey, string](client, "enc-custom", kvLoader[CustomKey, string](nil, nil), KVCacheConfig{EnableAutoRefresh: false})
 	defer cCustom.Stop()
-	s := cCustom.encodeKey(CustomKey{ID: "x"})
+	s := convert.MustString(CustomKey{ID: "x"})
 	assert.Contains(t, s, "x")
 }
 
@@ -1085,9 +1097,7 @@ func TestKVCache_BatchLoader_Get_PrefillsRedis(t *testing.T) {
 	require.Equal(t, int64(1), atomic.LoadInt64(&callCount))
 
 	// 清空本地缓存，强制下次 Get 走 Redis
-	c.mu.Lock()
-	c.localCache = make(map[string]string)
-	c.mu.Unlock()
+	c.localCache.Clear()
 
 	// 再次 Get → 应命中 Redis（BatchLoader 不被再次调用）
 	v, exists, err := c.Get(ctx, "a")
@@ -1160,9 +1170,7 @@ func TestKVCache_BatchLoader_GetMany(t *testing.T) {
 	ctx := context.Background()
 
 	// 先 Set 一个进本地缓存（模拟本地命中）
-	c.mu.Lock()
-	c.localCache["a"] = "1"
-	c.mu.Unlock()
+	c.localCache.Store("a", "1")
 
 	// GetMany：a 命中本地；b、c 本地+Redis miss → BatchLoader 精准回源 [b,c]
 	result, err := c.GetMany(ctx, []string{"a", "b", "c"})
@@ -1268,9 +1276,7 @@ func TestKVCache_BatchLoader_GetMany_PrefillsRedis(t *testing.T) {
 	require.Equal(t, int64(1), atomic.LoadInt64(&callCount))
 
 	// 清空本地缓存
-	c.mu.Lock()
-	c.localCache = make(map[string]string)
-	c.mu.Unlock()
+	c.localCache.Clear()
 
 	// 再次 GetMany → 命中 Redis，BatchLoader 不再调用
 	result, err := c.GetMany(ctx, []string{"a", "b"})
@@ -1295,10 +1301,10 @@ func TestKVCache_BatchLoader_IntKey(t *testing.T) {
 	assert.True(t, exists)
 	assert.Equal(t, "one", v)
 
-	// 验证 Redis Hash field 用 strconv 编码
+	// 验证 Redis Hash field 用 strconv 编码（string 快速路径：存原始 string）
 	s, err := c.client.HGet(ctx, c.redisKey(), "1").Result()
 	require.NoError(t, err)
-	assert.Equal(t, `"one"`, s)
+	assert.Equal(t, "one", s)
 }
 
 // TestKVCache_BatchLoader_TypeMismatch config.BatchLoader 类型不匹配 → batchLoader 字段为 nil

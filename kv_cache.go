@@ -75,11 +75,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kamalyes/go-logger"
+	"github.com/kamalyes/go-toolbox/pkg/convert"
 	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/kamalyes/go-toolbox/pkg/syncx"
 	"github.com/redis/go-redis/v9"
@@ -136,14 +137,16 @@ type BatchLoader[K comparable, V any] func(ctx context.Context, keys []K) (map[K
 //	cache := cachex.NewKVCache[string, string](redisClient, "game_library",
 //	    loadFunc, cachex.KVCacheConfig{...})
 type KVCache[K comparable, V any] struct {
-	client          *redis.Client
-	config          KVCacheConfig
-	loader          KVLoader[K, V]
-	batchLoader     BatchLoader[K, V] // 按需批量回源加载器（可选）
-	name            string
-	mu              sync.RWMutex
-	localCache      map[K]V
-	lastRefreshTime time.Time
+	client      *redis.Client
+	config      KVCacheConfig
+	loader      KVLoader[K, V]
+	batchLoader BatchLoader[K, V] // 按需批量回源加载器（可选）
+	name        string
+	// localCache 本地缓存：基于 ShardedMap 分片锁，降低高并发读写锁竞争
+	// 相比单一 map+RWMutex，64 个 shard 将锁竞争降低 64 倍
+	localCache *syncx.ShardedMap[K, V]
+	// lastRefreshTime 最后刷新时间（UnixNano，原子读写，零锁开销）
+	lastRefreshTime atomic.Int64
 	stopChan        chan struct{}
 	once            sync.Once
 	logger          logger.ILogger
@@ -152,6 +155,20 @@ type KVCache[K comparable, V any] struct {
 	pubsub       *PubSub
 	instanceID   string // 本节点唯一标识，避免处理自己发的消息
 	invalidateCh string // PubSub 频道名
+}
+
+// defaultKVShardCount KVCache 本地缓存的默认分片数
+// 64 个分片在 8-32 核 CPU 上能充分并行，且内存开销可控
+const defaultKVShardCount = 64
+
+// setRefreshTime 原子更新最后刷新时间
+func (c *KVCache[K, V]) setRefreshTime(t time.Time) {
+	c.lastRefreshTime.Store(t.UnixNano())
+}
+
+// GetLastRefreshTime 原子读取最后刷新时间
+func (c *KVCache[K, V]) GetLastRefreshTime() time.Time {
+	return time.Unix(0, c.lastRefreshTime.Load())
 }
 
 // invalidateMsg 失效广播消息
@@ -185,7 +202,7 @@ func NewKVCache[K comparable, V any](
 		config:       config,
 		loader:       loader,
 		name:         name,
-		localCache:   make(map[K]V),
+		localCache:   syncx.NewShardedMap[K, V](defaultKVShardCount),
 		stopChan:     make(chan struct{}),
 		logger:       config.Logger,
 		instanceID:   fmt.Sprintf("%d-%d", time.Now().UnixNano(), randomID()),
@@ -242,19 +259,15 @@ func (c *KVCache[K, V]) startInvalidationSubscriber() {
 		c.logger.Debugf("KVCache %s received invalidation: op=%s keys=%v", c.name, msg.Op, msg.Keys)
 		switch msg.Op {
 		case "clear":
-			c.mu.Lock()
-			c.localCache = make(map[K]V)
-			c.mu.Unlock()
+			c.localCache.Clear()
 		case "invalidate":
-			c.mu.Lock()
 			for _, ks := range msg.Keys {
 				if _, isString := any(*new(K)).(string); isString {
 					if k, ok := any(ks).(K); ok {
-						delete(c.localCache, k)
+						c.localCache.Delete(k)
 					}
 				}
 			}
-			c.mu.Unlock()
 		}
 		return nil
 	})
@@ -264,21 +277,36 @@ func (c *KVCache[K, V]) startInvalidationSubscriber() {
 }
 
 // publishInvalidation 广播失效消息给其他节点
+// 直接调用 Redis PUBLISH，跳过 PubSub.Publish 内部的 retry 包装（失效广播失败不致命，下次 Refresh 会修正）
 func (c *KVCache[K, V]) publishInvalidation(op string, keys []string) {
 	if c.pubsub == nil {
 		return
 	}
-	msg := invalidateMsg{Sender: c.instanceID, Op: op, Keys: keys}
-	data, err := json.Marshal(msg)
-	if err != nil {
+	msgData := c.buildInvalidationMsg(op, keys)
+	if msgData == "" {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	c.logger.Debugf("KVCache %s publish invalidation: op=%s keys=%v", c.name, op, keys)
-	if err := c.pubsub.Publish(ctx, c.invalidateCh, string(data)); err != nil {
+	// 直接调用 Redis PUBLISH，跳过 PubSub.Publish 内部的 retry 包装，减少分配
+	if err := c.client.Publish(ctx, c.invalidateCh, msgData).Err(); err != nil {
 		c.logger.Warnf("KVCache %s publish invalidation failed: %v", c.name, err)
 	}
+}
+
+// buildInvalidationMsg 构建失效消息的 JSON 字符串
+// 如果不需要广播（pubsub 为 nil）或序列化失败，返回空字符串
+func (c *KVCache[K, V]) buildInvalidationMsg(op string, keys []string) string {
+	if c.pubsub == nil {
+		return ""
+	}
+	msg := invalidateMsg{Sender: c.instanceID, Op: op, Keys: keys}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 // redisKey 获取 Redis Hash 键名
@@ -286,28 +314,12 @@ func (c *KVCache[K, V]) redisKey() string {
 	return fmt.Sprintf("%s:%s", c.config.Namespace, c.name)
 }
 
-// encodeKey 将 K 序列化为 Redis Hash field 字符串
-func (c *KVCache[K, V]) encodeKey(k K) string {
-	switch v := any(k).(type) {
-	case string:
-		return v
-	case int:
-		return strconv.Itoa(v)
-	case int64:
-		return strconv.FormatInt(v, 10)
-	case int32:
-		return strconv.FormatInt(int64(v), 10)
-	case uint:
-		return strconv.FormatUint(uint64(v), 10)
-	case uint64:
-		return strconv.FormatUint(v, 10)
-	default:
-		return fmt.Sprintf("%v", v)
-	}
-}
-
 // encodeValue 将 V 序列化为 Redis Hash value 字符串
 func (c *KVCache[K, V]) encodeValue(v V) (string, error) {
+	// string 类型快速路径：直接返回，避免 json.Marshal 的引号包装和分配
+	if s, ok := any(v).(string); ok {
+		return s, nil
+	}
 	data, err := json.Marshal(v)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal kv value: %w", err)
@@ -319,6 +331,18 @@ func (c *KVCache[K, V]) encodeValue(v V) (string, error) {
 func (c *KVCache[K, V]) decodeValue(s string) (V, error) {
 	var zero V
 	var v V
+	// string 类型快速路径
+	if _, ok := any(v).(string); ok {
+		// 兼容旧版 JSON 格式：以 " 开头说明是 json.Marshal 序列化的 string（带引号）
+		if len(s) > 0 && s[0] == '"' {
+			if err := json.Unmarshal([]byte(s), &v); err != nil {
+				return zero, fmt.Errorf("failed to unmarshal kv value: %w", err)
+			}
+			return v, nil
+		}
+		// 新格式：直接返回原始 string
+		return any(s).(V), nil
+	}
 	if err := json.Unmarshal([]byte(s), &v); err != nil {
 		return zero, fmt.Errorf("failed to unmarshal kv value: %w", err)
 	}
@@ -329,26 +353,18 @@ func (c *KVCache[K, V]) decodeValue(s string) (V, error) {
 func (c *KVCache[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	var zero V
 
-	// 1. 本地缓存
-	c.mu.RLock()
-	if v, ok := c.localCache[key]; ok {
-		c.mu.RUnlock()
+	// 1. 本地缓存（ShardedMap 分片读锁，粒度细）
+	if v, ok := c.localCache.Load(key); ok {
 		c.logger.Debugf("KVCache %s Get local hit: key=%v", c.name, key)
 		return v, true, nil
 	}
-	c.mu.RUnlock()
 
 	// 2. Redis Hash 单字段查询
-	s, err := c.client.HGet(ctx, c.redisKey(), c.encodeKey(key)).Result()
+	s, err := c.client.HGet(ctx, c.redisKey(), convert.MustString(key)).Result()
 	if err == nil {
 		if v, err := c.decodeValue(s); err == nil {
 			// 回填本地缓存
-			c.mu.Lock()
-			if c.localCache == nil {
-				c.localCache = make(map[K]V)
-			}
-			c.localCache[key] = v
-			c.mu.Unlock()
+			c.localCache.Store(key, v)
 			c.logger.Debugf("KVCache %s Get redis hit: key=%v", c.name, key)
 			return v, true, nil
 		}
@@ -364,9 +380,7 @@ func (c *KVCache[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 			return zero, false, fmt.Errorf("KVCache %s batchLoader failed: %w", c.name, lerr)
 		}
 		if v, ok := loaded[key]; ok {
-			c.mu.Lock()
-			c.localCache[key] = v
-			c.mu.Unlock()
+			c.localCache.Store(key, v)
 			_ = c.writeManyToRedis(ctx, loaded)
 			return v, true, nil
 		}
@@ -374,13 +388,15 @@ func (c *KVCache[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	}
 
 	c.logger.Debugf("KVCache %s Get miss, triggering LoadAll: key=%v", c.name, key)
-	if _, err := c.LoadAll(ctx); err != nil {
+	data, err := c.LoadAll(ctx)
+	if err != nil {
 		return zero, false, err
 	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	v, ok := c.localCache[key]
-	return v, ok, nil
+	// 直接从 LoadAll 返回的 map 取值，避免 invalidate handler 并发删除 localCache 导致的竞态
+	if v, ok := data[key]; ok {
+		return v, true, nil
+	}
+	return zero, false, nil
 }
 
 // GetMany 批量获取多个 key 的值（缺失的 key 不出现在返回 map 中）
@@ -392,18 +408,16 @@ func (c *KVCache[K, V]) GetMany(ctx context.Context, keys []K) (map[K]V, error) 
 		return make(map[K]V), nil
 	}
 
-	// 先从本地拿
+	// 先从本地拿（ShardedMap 分片读锁，不同 key 可并行）
 	result := make(map[K]V, len(keys))
 	missed := make([]K, 0, len(keys))
-	c.mu.RLock()
 	for _, k := range keys {
-		if v, ok := c.localCache[k]; ok {
+		if v, ok := c.localCache.Load(k); ok {
 			result[k] = v
 		} else {
 			missed = append(missed, k)
 		}
 	}
-	c.mu.RUnlock()
 
 	if len(missed) == 0 {
 		return result, nil
@@ -412,7 +426,7 @@ func (c *KVCache[K, V]) GetMany(ctx context.Context, keys []K) (map[K]V, error) 
 	// Redis HMGET 批量查询
 	fields := make([]string, len(missed))
 	for i, k := range missed {
-		fields[i] = c.encodeKey(k)
+		fields[i] = convert.MustString(k)
 	}
 	values, err := c.client.HMGet(ctx, c.redisKey(), fields...).Result()
 	if err != nil && err != redis.Nil {
@@ -423,13 +437,11 @@ func (c *KVCache[K, V]) GetMany(ctx context.Context, keys []K) (map[K]V, error) 
 		}
 		// 无 BatchLoader，触发全量预热兜底
 		if _, lerr := c.LoadAll(ctx); lerr == nil {
-			c.mu.RLock()
 			for _, k := range missed {
-				if v, ok := c.localCache[k]; ok {
+				if v, ok := c.localCache.Load(k); ok {
 					result[k] = v
 				}
 			}
-			c.mu.RUnlock()
 			return result, nil
 		}
 		return nil, fmt.Errorf("KVCache %s HMGet failed: %w", c.name, err)
@@ -437,7 +449,6 @@ func (c *KVCache[K, V]) GetMany(ctx context.Context, keys []K) (map[K]V, error) 
 
 	// 回填本地缓存并合并 Redis 命中的结果，同时收集 Redis 也 miss 的 key
 	stillMissed := make([]K, 0, len(missed))
-	c.mu.Lock()
 	for i, val := range values {
 		if val == nil {
 			stillMissed = append(stillMissed, missed[i])
@@ -449,13 +460,12 @@ func (c *KVCache[K, V]) GetMany(ctx context.Context, keys []K) (map[K]V, error) 
 			continue
 		}
 		if v, derr := c.decodeValue(s); derr == nil {
-			c.localCache[missed[i]] = v
+			c.localCache.Store(missed[i], v)
 			result[missed[i]] = v
 		} else {
 			stillMissed = append(stillMissed, missed[i])
 		}
 	}
-	c.mu.Unlock()
 
 	// Redis 也 miss 的 key，如果有 BatchLoader，按需精准回源
 	if len(stillMissed) > 0 && c.batchLoader != nil {
@@ -473,12 +483,10 @@ func (c *KVCache[K, V]) batchLoadAndFill(ctx context.Context, result map[K]V, ke
 	}
 
 	// 回填本地缓存并合并到结果
-	c.mu.Lock()
 	for k, v := range loaded {
-		c.localCache[k] = v
+		c.localCache.Store(k, v)
 		result[k] = v
 	}
-	c.mu.Unlock()
 
 	// 预热 Redis（不广播失效——这是 miss 回源，避免雪崩）
 	if len(loaded) > 0 {
@@ -491,27 +499,28 @@ func (c *KVCache[K, V]) batchLoadAndFill(ctx context.Context, result map[K]V, ke
 
 // Set 设置单个值（同步双写本地 + Redis，并广播失效消息给其他节点）
 func (c *KVCache[K, V]) Set(ctx context.Context, key K, value V) error {
-	// 写本地
-	c.mu.Lock()
-	c.localCache[key] = value
-	c.mu.Unlock()
+	// 写本地（ShardedMap 分片写锁）
+	c.localCache.Store(key, value)
 
-	// 写 Redis
+	// 写 Redis + 广播：Pipeline 合并 HSET + PUBLISH（2 RTT → 1 RTT）
 	vstr, err := c.encodeValue(value)
 	if err != nil {
 		return err
 	}
 	ttl := int64(c.config.DefaultTTL / time.Second)
-	// 使用 Lua 脚本保证 HSET + EXPIRE 原子
-	if err := c.client.Eval(ctx, luaKVSetMany,
-		[]string{c.redisKey()},
-		ttl, c.encodeKey(key), vstr,
-	).Err(); err != nil {
+	encodedKey := convert.MustString(key)
+
+	pipe := c.client.Pipeline()
+	// Lua 脚本保证 HSET + EXPIRE 原子
+	pipe.Eval(ctx, luaKVSetMany, []string{c.redisKey()}, ttl, encodedKey, vstr)
+	// 失效广播合并到同一 Pipeline，不额外增加 RTT
+	if msgData := c.buildInvalidationMsg("invalidate", []string{encodedKey}); msgData != "" {
+		pipe.Publish(ctx, c.invalidateCh, msgData)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
 		return err
 	}
 
-	// 广播失效消息给其他节点（异步不阻塞）
-	c.publishInvalidation("invalidate", []string{c.encodeKey(key)})
 	c.logger.Debugf("KVCache %s Set: key=%v", c.name, key)
 	return nil
 }
@@ -522,14 +531,12 @@ func (c *KVCache[K, V]) SetMany(ctx context.Context, items map[K]V) error {
 		return nil
 	}
 
-	// 写本地
-	c.mu.Lock()
+	// 写本地（ShardedMap 分片写锁，不同 key 可并行）
 	for k, v := range items {
-		c.localCache[k] = v
+		c.localCache.Store(k, v)
 	}
-	c.mu.Unlock()
 
-	// 写 Redis（Lua 批量）
+	// 写 Redis + 广播：Pipeline 合并 Lua HSET + PUBLISH（2 RTT → 1 RTT）
 	args := make([]interface{}, 0, len(items)*2+1)
 	args = append(args, int64(c.config.DefaultTTL/time.Second))
 	keys := make([]string, 0, len(items))
@@ -538,19 +545,20 @@ func (c *KVCache[K, V]) SetMany(ctx context.Context, items map[K]V) error {
 		if err != nil {
 			return err
 		}
-		ks := c.encodeKey(k)
+		ks := convert.MustString(k)
 		args = append(args, ks, vstr)
 		keys = append(keys, ks)
 	}
-	if err := c.client.Eval(ctx, luaKVSetMany,
-		[]string{c.redisKey()},
-		args...,
-	).Err(); err != nil {
+
+	pipe := c.client.Pipeline()
+	pipe.Eval(ctx, luaKVSetMany, []string{c.redisKey()}, args...)
+	if msgData := c.buildInvalidationMsg("invalidate", keys); msgData != "" {
+		pipe.Publish(ctx, c.invalidateCh, msgData)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
 		return err
 	}
 
-	// 广播失效消息
-	c.publishInvalidation("invalidate", keys)
 	c.logger.Debugf("KVCache %s SetMany: count=%d", c.name, len(items))
 	return nil
 }
@@ -561,26 +569,22 @@ func (c *KVCache[K, V]) Client() *redis.Client { return c.client }
 // SetToPipe 将 HSET+TTL（Lua 原子脚本）命令追加到给定 pipeline（不立即执行），同时写本地缓存
 // 调用方负责执行 pipeline（pipe.Exec）与广播失效，避免多字段场景下 N 次 RTT
 func (c *KVCache[K, V]) SetToPipe(pipe redis.Pipeliner, key K, value V) error {
-	c.mu.Lock()
-	c.localCache[key] = value
-	c.mu.Unlock()
+	c.localCache.Store(key, value)
 
 	vstr, err := c.encodeValue(value)
 	if err != nil {
 		return err
 	}
 	ttl := int64(c.config.DefaultTTL / time.Second)
-	pipe.Eval(context.Background(), luaKVSetMany, []string{c.redisKey()}, ttl, c.encodeKey(key), vstr)
+	pipe.Eval(context.Background(), luaKVSetMany, []string{c.redisKey()}, ttl, convert.MustString(key), vstr)
 	return nil
 }
 
 // DeleteFromPipe 将 HDel 命令追加到给定 pipeline（不立即执行），同时删本地缓存
 // 调用方负责执行 pipeline（pipe.Exec）与广播失效
 func (c *KVCache[K, V]) DeleteFromPipe(pipe redis.Pipeliner, key K) {
-	c.mu.Lock()
-	delete(c.localCache, key)
-	c.mu.Unlock()
-	pipe.HDel(context.Background(), c.redisKey(), c.encodeKey(key))
+	c.localCache.Delete(key)
+	pipe.HDel(context.Background(), c.redisKey(), convert.MustString(key))
 }
 
 // PublishInvalidation 广播失效消息（导出版本，供上层批量场景按需调用）
@@ -589,39 +593,48 @@ func (c *KVCache[K, V]) PublishInvalidation(keys []string) {
 }
 
 // Delete 删除单个 key（并广播失效消息）
+// 使用 Pipeline 合并 HDEL + PUBLISH，将 2 次 RTT 减少为 1 次
 func (c *KVCache[K, V]) Delete(ctx context.Context, key K) error {
-	c.mu.Lock()
-	delete(c.localCache, key)
-	c.mu.Unlock()
+	c.localCache.Delete(key)
 
-	if err := c.client.HDel(ctx, c.redisKey(), c.encodeKey(key)).Err(); err != nil {
+	encodedKey := convert.MustString(key)
+	pipe := c.client.Pipeline()
+	pipe.HDel(ctx, c.redisKey(), encodedKey)
+	if msgData := c.buildInvalidationMsg("invalidate", []string{encodedKey}); msgData != "" {
+		pipe.Publish(ctx, c.invalidateCh, msgData)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
 		return err
 	}
-	c.publishInvalidation("invalidate", []string{c.encodeKey(key)})
 	c.logger.Debugf("KVCache %s Delete: key=%v", c.name, key)
 	return nil
 }
 
 // DeleteMany 批量删除多个 key（HDEL 单次 RTT，并广播失效消息）
+// 使用 Pipeline 合并 HDEL + PUBLISH，将 2 次 RTT 减少为 1 次
 func (c *KVCache[K, V]) DeleteMany(ctx context.Context, keys []K) error {
 	if len(keys) == 0 {
 		return nil
 	}
 
-	c.mu.Lock()
+	// 删本地（ShardedMap 分片写锁，不同 key 可并行）
 	for _, k := range keys {
-		delete(c.localCache, k)
+		c.localCache.Delete(k)
 	}
-	c.mu.Unlock()
 
 	fields := make([]string, len(keys))
 	for i, k := range keys {
-		fields[i] = c.encodeKey(k)
+		fields[i] = convert.MustString(k)
 	}
-	if err := c.client.HDel(ctx, c.redisKey(), fields...).Err(); err != nil {
+
+	pipe := c.client.Pipeline()
+	pipe.HDel(ctx, c.redisKey(), fields...)
+	if msgData := c.buildInvalidationMsg("invalidate", fields); msgData != "" {
+		pipe.Publish(ctx, c.invalidateCh, msgData)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
 		return err
 	}
-	c.publishInvalidation("invalidate", fields)
 	c.logger.Debugf("KVCache %s DeleteMany: count=%d", c.name, len(keys))
 	return nil
 }
@@ -649,13 +662,12 @@ func (c *KVCache[K, V]) LoadAll(ctx context.Context) (map[K]V, error) {
 				data[kk] = vv
 			}
 			if len(data) > 0 {
-				c.mu.Lock()
-				c.localCache = make(map[K]V, len(data))
+				// 清空并重建本地缓存（ShardedMap 分片清空 + 批量 Store）
+				c.localCache.Clear()
 				for k, v := range data {
-					c.localCache[k] = v
+					c.localCache.Store(k, v)
 				}
-				c.lastRefreshTime = time.Now()
-				c.mu.Unlock()
+				c.setRefreshTime(time.Now())
 				return data, nil
 			}
 		}
@@ -675,14 +687,12 @@ func (c *KVCache[K, V]) loadFromSource(ctx context.Context) (map[K]V, error) {
 		return nil, fmt.Errorf("KVCache %s loader failed: %w", c.name, err)
 	}
 
-	// 回填本地缓存
-	c.mu.Lock()
-	c.localCache = make(map[K]V, len(data))
+	// 回填本地缓存（清空并重建，ShardedMap 分片清空 + 批量 Store）
+	c.localCache.Clear()
 	for k, v := range data {
-		c.localCache[k] = v
+		c.localCache.Store(k, v)
 	}
-	c.lastRefreshTime = time.Now()
-	c.mu.Unlock()
+	c.setRefreshTime(time.Now())
 
 	// 预热 Redis（仅当数据非空时写，不广播失效——Refresh 是本节点兜底，避免雪崩）
 	if len(data) > 0 {
@@ -705,7 +715,7 @@ func (c *KVCache[K, V]) writeManyToRedis(ctx context.Context, items map[K]V) err
 		if err != nil {
 			return err
 		}
-		args = append(args, c.encodeKey(k), vstr)
+		args = append(args, convert.MustString(k), vstr)
 	}
 	return c.client.Eval(ctx, luaKVSetMany,
 		[]string{c.redisKey()},
@@ -721,25 +731,26 @@ func (c *KVCache[K, V]) Refresh(ctx context.Context) error {
 }
 
 // Clear 清空本地与 Redis 缓存（并广播 clear 消息给其他节点）
+// 使用 Pipeline 合并 DEL + PUBLISH，将 2 次 RTT 减少为 1 次
 func (c *KVCache[K, V]) Clear(ctx context.Context) error {
-	c.mu.Lock()
-	c.localCache = make(map[K]V)
-	c.lastRefreshTime = time.Now()
-	c.mu.Unlock()
+	c.localCache.Clear()
+	c.setRefreshTime(time.Now())
 
-	if err := c.client.Del(ctx, c.redisKey()).Err(); err != nil {
+	pipe := c.client.Pipeline()
+	pipe.Del(ctx, c.redisKey())
+	if msgData := c.buildInvalidationMsg("clear", nil); msgData != "" {
+		pipe.Publish(ctx, c.invalidateCh, msgData)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
 		return err
 	}
-	c.publishInvalidation("clear", nil)
 	c.logger.Debugf("KVCache %s Clear", c.name)
 	return nil
 }
 
-// Size 返回本地缓存大小
+// Size 返回本地缓存大小（原子读取，零锁开销）
 func (c *KVCache[K, V]) Size() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.localCache)
+	return c.localCache.Len()
 }
 
 // autoRefresh 自动刷新协程
