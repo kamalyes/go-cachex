@@ -213,14 +213,14 @@ func setupBenchModelKV(b *testing.B, fieldCount int) (*ModelKVCache[benchModel],
 	builder := NewModelKV[benchModel](base, newSchemaOnlyDB())
 	switch fieldCount {
 	case 1:
-		builder = builder.Field(uniqueCacheName("bench_name"), "Name")
+		builder = builder.Field("Name")
 	case 3:
 		builder = builder.
-			Field(uniqueCacheName("bench_name"), "Name").
-			Field(uniqueCacheName("bench_code"), "Code").
-			Field(uniqueCacheName("bench_icon"), "IconUrl")
+			Field("Name").
+			Field("Code").
+			Field("IconUrl")
 	default:
-		builder = builder.Field(uniqueCacheName("bench_name"), "Name")
+		builder = builder.Field("Name")
 	}
 	cache := builder.Register()
 

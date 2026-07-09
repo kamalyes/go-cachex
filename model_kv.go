@@ -9,8 +9,9 @@
  * ============================================================================
  * 设计目标
  * ============================================================================
- * 一行注册：自动通过 gorm 反射获取表名/列名，零 lambda、零 Select、零 name
+ * 一行注册：自动通过 gorm 反射获取表名/列名，cacheName 自动派生为 {tableName}:{fieldName}
  * 业务侧通过 MustGetModelKV[M]().Set/Delete 自动维护所有字段缓存
+ * 查询侧通过 MustGetModelKV[M]().GetFieldMany(ctx, "FieldName", keys) 批量读取
  *
  * 性能优化：
  *   1. unsafe 偏移读取字段（注册时预编译 extractor，零运行时反射）
@@ -27,17 +28,21 @@
  *	    TTL(constants.TTLKVCacheGame).
  *	    RefreshInterval(constants.KVCacheRefreshInterval)
  *
- * 2. 各 model 一行注册（自动 gorm 查询，反射提取字段，主键自动识别）：
+ * 2. 各 model 一行注册（cacheName 自动派生，只需传 Go 字段名）：
  *
  *	cachex.NewModelKV[models.GameBrandModel](gameBase, gwglobal.DB).
- *	    Field(constants.KVGameBrand, "Name").
- *	    Field(constants.KVGameBrandCode, "Code").
+ *	    Field("Name").
+ *	    Field("Code").
  *	    Register()
  *
  * 3. Service 层 Create/Update/Delete 自动维护所有字段缓存：
  *
  *	_ = cachex.MustGetModelKV[models.GameBrandModel]().Set(ctx, m)
  *	_ = cachex.MustGetModelKV[models.GameBrandModel]().Delete(ctx, m)
+ *
+ * 4. 查询侧批量读取某字段：
+ *
+ *	cachex.MustGetModelKV[models.GameLibraryModel]().GetFieldMany(ctx, "Name", gameIDs)
  *
  * Copyright (c) 2026 by kamalyes, All Rights Reserved.
  */
@@ -62,7 +67,7 @@ import (
 
 // FieldCacheConfig 字段缓存配置：一个 model 字段对应一个独立的 KV cache
 type FieldCacheConfig struct {
-	CacheName string // KV cache 名称（全局唯一，如 constants.KVGameBrand）
+	CacheName string // KV cache 名称（自动派生为 {tableName}:{fieldName}，无需手动指定）
 	FieldName string // model Go 字段名（PascalCase，如 "Name"、"Code"）
 }
 
@@ -134,9 +139,21 @@ func (b *ModelKVBuilder[M]) KeyField(name string) *ModelKVBuilder[M] {
 	return b
 }
 
-// Field 添加字段缓存（cacheName 全局唯一，fieldName 为 model Go 字段名）
-func (b *ModelKVBuilder[M]) Field(cacheName, fieldName string) *ModelKVBuilder[M] {
-	b.fields = append(b.fields, FieldCacheConfig{CacheName: cacheName, FieldName: fieldName})
+// Field 添加字段缓存（cacheName 自动派生为 {tableName}:{fieldName}，无需手动指定）
+func (b *ModelKVBuilder[M]) Field(fieldName string) *ModelKVBuilder[M] {
+	b.fields = append(b.fields, FieldCacheConfig{FieldName: fieldName})
+	return b
+}
+
+// Fields 批量添加字段缓存（等价于多次调用 Field，更简洁）
+//
+//	cachex.NewModelKV[models.GameLibraryModel](gameBase, gwglobal.DB).
+//	    Fields("Name", "GameCode", "BrandId", "GameType").
+//	    Register()
+func (b *ModelKVBuilder[M]) Fields(fieldNames ...string) *ModelKVBuilder[M] {
+	for _, fn := range fieldNames {
+		b.fields = append(b.fields, FieldCacheConfig{FieldName: fn})
+	}
 	return b
 }
 
@@ -180,6 +197,7 @@ type ModelKVCache[M any] struct {
 	selectColumns []string // keyField 列 + 所有 field 列（db 列名）
 	keyExtractor  fieldExtractor[M]
 	fieldKVs      []fieldKVEntry[M]
+	fieldIndex    map[string]int // fieldName → fieldKVs 索引（供 GetFieldMany 查找）
 	modelType     reflect.Type
 	// 共享 loadAll（N 个字段缓存复用一次查询结果）
 	cachedItems   []*M
@@ -228,15 +246,19 @@ func registerModelKV[M any](b *ModelKVBuilder[M]) *ModelKVCache[M] {
 	keyExtractor := buildExtractor[M](keySchemaField)
 	selectColumns := []string{keySchemaField.DBName}
 
-	// 预编译各字段提取器
+	// 预编译各字段提取器，自动派生 cacheName = {tableName}:{fieldName}
 	fieldKVs := make([]fieldKVEntry[M], 0, len(b.fields))
-	for _, fc := range b.fields {
+	fieldIndex := make(map[string]int, len(b.fields))
+	for i, fc := range b.fields {
 		sf := s.LookUpField(fc.FieldName)
 		if sf == nil {
 			panic(fmt.Sprintf("cachex: RegisterModelKV[%s] field %q not found in gorm schema", modelType.String(), fc.FieldName))
 		}
+		cacheName := fmt.Sprintf("%s:%s", s.Table, fc.FieldName)
+		b.fields[i].CacheName = cacheName
+		fieldIndex[fc.FieldName] = i
 		fieldKVs = append(fieldKVs, fieldKVEntry[M]{
-			cacheName: fc.CacheName,
+			cacheName: cacheName,
 			extractor: buildExtractor[M](sf),
 		})
 		selectColumns = append(selectColumns, sf.DBName)
@@ -248,6 +270,7 @@ func registerModelKV[M any](b *ModelKVBuilder[M]) *ModelKVCache[M] {
 		selectColumns: selectColumns,
 		keyExtractor:  keyExtractor,
 		fieldKVs:      fieldKVs,
+		fieldIndex:    fieldIndex,
 		modelType:     modelType,
 		loadTTL:       b.loadTTL,
 	}
@@ -396,7 +419,7 @@ func (c *ModelKVCache[M]) loadFieldMap(ctx context.Context, fieldIdx int) (map[s
 // Set 写入 model 的所有字段缓存（unsafe 提取 key 和各字段 value，零反射）
 //
 // 多字段时使用 Redis Pipeline 批量 HSET，N 次网络往返合并为 1 次；
-// 单字段直接走原路径，避免 pipeline 开销。
+// 单字段直接走原路径，避免 pipeline 开销
 func (c *ModelKVCache[M]) Set(ctx context.Context, m *M) error {
 	if m == nil {
 		return nil
@@ -436,7 +459,7 @@ func (c *ModelKVCache[M]) Delete(ctx context.Context, m *M) error {
 
 // DeleteByKey 按 key 删除所有字段缓存（无需 model 实例）
 //
-// 多字段时使用 Redis Pipeline 批量 HDel，N 次网络往返合并为 1 次。
+// 多字段时使用 Redis Pipeline 批量 HDel，N 次网络往返合并为 1 次
 func (c *ModelKVCache[M]) DeleteByKey(ctx context.Context, key string) error {
 	// 单字段：直接 Delete
 	if len(c.fieldKVs) == 1 {
@@ -485,6 +508,23 @@ func MustGetModelKV[M any]() *ModelKVCache[M] {
 		panic(err)
 	}
 	return c
+}
+
+// GetFieldMany 批量读取 model 某字段的 KV 缓存（空 keys 或未注册字段返回 nil）
+//
+//	cachex.MustGetModelKV[models.GameLibraryModel]().GetFieldMany(ctx, "Name", gameIDs)
+func (c *ModelKVCache[M]) GetFieldMany(ctx context.Context, fieldName string, keys []string) map[string]string {
+	if c == nil || len(keys) == 0 {
+		return nil
+	}
+	idx, ok := c.fieldIndex[fieldName]
+	if !ok {
+		return nil
+	}
+	if v, err := c.fieldKVs[idx].kv.GetMany(ctx, keys); err == nil {
+		return v
+	}
+	return nil
 }
 
 // ResetModelKVRegistry 清空全局注册表（仅测试用）

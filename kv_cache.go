@@ -27,10 +27,11 @@
  *      - 通过 instanceID 区分自己发的消息，避免循环处理
  *      - Refresh（自动刷新/手动预热）不广播，避免周期性刷新引发雪崩
  *
- * 3. pbmo 风格全局注册（RegisterKV/GetKV/MustGetKV）
+ * 3. pbmo 风格全局注册（RegisterKV/GetKV/MustGetKV/GetKVMany）
  *    SetGlobalRedisClient(client) 设置全局 Redis 客户端
  *    RegisterKV[K,V](name, loadFunc, opts...) 一行注册
  *    GetKV[K,V](name) / MustGetKV[K,V](name) 业务侧取用
+ *    GetKVMany[K,V](ctx, name, keys) 批量读取快捷封装（空 keys 或出错返回 nil）
  *    StopAllKV() 统一关闭所有注册实例
  *
  * ============================================================================
@@ -871,6 +872,24 @@ func MustGetKV[K comparable, V any](name string) *KVCache[K, V] {
 		panic(err)
 	}
 	return cache
+}
+
+// GetKVMany 批量获取已注册 KV 缓存的值的快捷封装
+// 空 keys 或任何错误（未注册/查询失败）均返回 nil，适用于"读不到就用零值"的回显场景
+//
+//	cachex.GetKVMany[string, string](ctx, constants.KVGameLibrary, gameIDs)
+func GetKVMany[K comparable, V any](ctx context.Context, name string, keys []K) map[K]V {
+	if len(keys) == 0 {
+		return nil
+	}
+	cache, err := GetKV[K, V](name)
+	if err != nil {
+		return nil
+	}
+	if v, err := cache.GetMany(ctx, keys); err == nil {
+		return v
+	}
+	return nil
 }
 
 // StopAllKV 停止所有已注册 KV 缓存的自动刷新（服务关闭时调用）

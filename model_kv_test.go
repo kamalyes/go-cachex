@@ -10,8 +10,8 @@
  *  1. gorm schema 解析 + 主键自动识别（PrioritizedPrimaryField）
  *  2. registerModelKV 自动主键检测 / 显式 KeyField / panic 场景
  *  3. buildExtractor 各类型字段提取（string/int/uint/bool/nil）
- *  4. Set / Delete / DeleteByKey 端到端（依赖 Redis，不可用则跳过）
- *  5. Builder 链式 API（NewModelKVBase + NewModelKV + Field + Register）
+ *  4. Set / Delete / DeleteByKey / GetFieldMany 端到端（依赖 Redis，不可用则跳过）
+ *  5. Builder 链式 API（NewModelKVBase + NewModelKV + Field/Fields + Register）
  *
  * Copyright (c) 2026 by kamalyes, All Rights Reserved.
  */
@@ -118,12 +118,9 @@ func setupModelKVTest(t *testing.T) *redis.Client {
 	return client
 }
 
-// uniqueCacheName 为每个测试生成唯一缓存名，避免注册表冲突
-var cacheNameCounter int64
-
-func uniqueCacheName(prefix string) string {
-	cacheNameCounter++
-	return fmt.Sprintf("%s_%d", prefix, cacheNameCounter)
+// cacheName 返回自动派生的缓存名 {tableName}:{fieldName}
+func cacheName(tableName, fieldName string) string {
+	return tableName + ":" + fieldName
 }
 
 // mustKVGet 简化测试断言：把 (V, bool, error) 收敛为 (string, error)，未命中视为错误
@@ -223,10 +220,11 @@ func TestRegisterModelKV_AutoDetectIntPrimaryKey(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("auto_int_name")
 	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
+		Field("Name").
 		Register()
+
+	nameCache := cacheName("test_int_pk", "Name")
 
 	// 验证主键列被加入 selectColumns（自动识别 Id）
 	assert.Contains(t, cache.selectColumns, "id")
@@ -237,17 +235,18 @@ func TestRegisterModelKV_AutoDetectIntPrimaryKey(t *testing.T) {
 	m := &testModelIntPK{Id: 123, Name: "brand-1"}
 	require.NoError(t, cache.Set(context.Background(), m))
 
-	assert.Equal(t, "brand-1", mustKVGet(t, nameField, "123"))
+	assert.Equal(t, "brand-1", mustKVGet(t, nameCache, "123"))
 }
 
 func TestRegisterModelKV_AutoDetectStringPrimaryKey(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("auto_str_name")
 	cache := NewModelKV[testModelStringPK](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
+		Field("Name").
 		Register()
+
+	nameCache := cacheName("test_str_pk", "Name")
 
 	// 验证字符串主键 tenant_id 被自动识别
 	assert.Contains(t, cache.selectColumns, "tenant_id")
@@ -256,7 +255,7 @@ func TestRegisterModelKV_AutoDetectStringPrimaryKey(t *testing.T) {
 	m := &testModelStringPK{TenantId: "tnt-abc", Name: "tenant-1"}
 	require.NoError(t, cache.Set(context.Background(), m))
 
-	assert.Equal(t, "tenant-1", mustKVGet(t, nameField, "tnt-abc"))
+	assert.Equal(t, "tenant-1", mustKVGet(t, nameCache, "tnt-abc"))
 }
 
 func TestRegisterModelKV_ExplicitKeyFieldOverridesAutoDetect(t *testing.T) {
@@ -264,11 +263,12 @@ func TestRegisterModelKV_ExplicitKeyFieldOverridesAutoDetect(t *testing.T) {
 	defer client.Close()
 
 	// 显式指定 Code 作为 key（覆盖主键 Id 的自动识别）
-	codeField := uniqueCacheName("explicit_code")
 	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
 		KeyField("Code").
-		Field(codeField, "Name").
+		Field("Name").
 		Register()
+
+	nameCache := cacheName("test_int_pk", "Name")
 
 	// selectColumns 应包含 code（而非 id）
 	assert.Contains(t, cache.selectColumns, "code")
@@ -278,25 +278,25 @@ func TestRegisterModelKV_ExplicitKeyFieldOverridesAutoDetect(t *testing.T) {
 	require.NoError(t, cache.Set(context.Background(), m))
 
 	// key 应为 Code 值
-	assert.Equal(t, "n1", mustKVGet(t, codeField, "CODE-X"))
+	assert.Equal(t, "n1", mustKVGet(t, nameCache, "CODE-X"))
 }
 
 func TestRegisterModelKV_MultipleFields(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("multi_name")
-	codeField := uniqueCacheName("multi_code")
 	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
-		Field(codeField, "Code").
+		Fields("Name", "Code").
 		Register()
+
+	nameCache := cacheName("test_int_pk", "Name")
+	codeCache := cacheName("test_int_pk", "Code")
 
 	m := &testModelIntPK{Id: 7, Name: "nm", Code: "CD"}
 	require.NoError(t, cache.Set(context.Background(), m))
 
-	assert.Equal(t, "nm", mustKVGet(t, nameField, "7"))
-	assert.Equal(t, "CD", mustKVGet(t, codeField, "7"))
+	assert.Equal(t, "nm", mustKVGet(t, nameCache, "7"))
+	assert.Equal(t, "CD", mustKVGet(t, codeCache, "7"))
 }
 
 // ============================================================
@@ -320,7 +320,7 @@ func TestRegisterModelKV_PanicWhenNoKeyAndNoPrimaryKey(t *testing.T) {
 
 	assert.Panics(t, func() {
 		NewModelKV[testModelNoPK](NewModelKVBase(), newSchemaOnlyDB()).
-			Field(uniqueCacheName("no_pk"), "Name").
+			Field("Name").
 			Register()
 	})
 }
@@ -332,7 +332,7 @@ func TestRegisterModelKV_PanicWhenCompositePKWithoutKeyField(t *testing.T) {
 
 	assert.Panics(t, func() {
 		NewModelKV[testModelCompositePK](NewModelKVBase(), newSchemaOnlyDB()).
-			Field(uniqueCacheName("composite_no_key"), "C").
+			Field("C").
 			Register()
 	})
 }
@@ -342,18 +342,19 @@ func TestRegisterModelKV_CompositePKWithExplicitKeyField(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	cField := uniqueCacheName("composite_explicit")
 	cache := NewModelKV[testModelCompositePK](NewModelKVBase(), newSchemaOnlyDB()).
 		KeyField("A").
-		Field(cField, "C").
+		Field("C").
 		Register()
+
+	cCache := cacheName("test_composite_pk", "C")
 
 	assert.Contains(t, cache.selectColumns, "a")
 	assert.Contains(t, cache.selectColumns, "c")
 
 	m := &testModelCompositePK{A: "ka", B: "kb", C: "vc"}
 	require.NoError(t, cache.Set(context.Background(), m))
-	assert.Equal(t, "vc", mustKVGet(t, cField, "ka"))
+	assert.Equal(t, "vc", mustKVGet(t, cCache, "ka"))
 }
 
 func TestRegisterModelKV_PanicWhenKeyFieldNotInSchema(t *testing.T) {
@@ -363,7 +364,7 @@ func TestRegisterModelKV_PanicWhenKeyFieldNotInSchema(t *testing.T) {
 	assert.Panics(t, func() {
 		NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
 			KeyField("NotExist").
-			Field(uniqueCacheName("bad_key"), "Name").
+			Field("Name").
 			Register()
 	})
 }
@@ -374,7 +375,7 @@ func TestRegisterModelKV_PanicWhenFieldNotInSchema(t *testing.T) {
 
 	assert.Panics(t, func() {
 		NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
-			Field(uniqueCacheName("bad_field"), "NotExist").
+			Field("NotExist").
 			Register()
 	})
 }
@@ -385,7 +386,7 @@ func TestRegisterModelKV_PanicWhenNonStructType(t *testing.T) {
 
 	assert.Panics(t, func() {
 		NewModelKV[string](NewModelKVBase(), newSchemaOnlyDB()).
-			Field(uniqueCacheName("non_struct"), "X").
+			Field("X").
 			Register()
 	})
 }
@@ -396,13 +397,13 @@ func TestRegisterModelKV_PanicWhenDuplicateRegistration(t *testing.T) {
 
 	base := NewModelKVBase()
 	NewModelKV[testModelIntPK](base, newSchemaOnlyDB()).
-		Field(uniqueCacheName("dup1"), "Name").
+		Field("Name").
 		Register()
 
 	// 同一类型重复注册应 panic
 	assert.Panics(t, func() {
 		NewModelKV[testModelIntPK](base, newSchemaOnlyDB()).
-			Field(uniqueCacheName("dup2"), "Code").
+			Field("Code").
 			Register()
 	})
 }
@@ -481,26 +482,26 @@ func TestBuildExtractor_BoolField(t *testing.T) {
 }
 
 // ============================================================
-// Set / Delete / DeleteByKey 端到端测试
+// Set / Delete / DeleteByKey / GetFieldMany 端到端测试
 // ============================================================
 
 func TestModelKVCache_SetWritesAllFieldsWithAutoKey(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("set_name")
-	codeField := uniqueCacheName("set_code")
 	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
-		Field(codeField, "Code").
+		Fields("Name", "Code").
 		Register()
+
+	nameCache := cacheName("test_int_pk", "Name")
+	codeCache := cacheName("test_int_pk", "Code")
 
 	m := &testModelIntPK{Id: 42, Name: "forty-two", Code: "C42"}
 	require.NoError(t, cache.Set(context.Background(), m))
 
 	// 两个字段都应以 Id=42 为 key 写入
-	assert.Equal(t, "forty-two", mustKVGet(t, nameField, "42"))
-	assert.Equal(t, "C42", mustKVGet(t, codeField, "42"))
+	assert.Equal(t, "forty-two", mustKVGet(t, nameCache, "42"))
+	assert.Equal(t, "C42", mustKVGet(t, codeCache, "42"))
 }
 
 // TestModelKVCache_SetPipelinePath 三字段走 Pipeline 批量路径（N 次 RTT → 1 次）
@@ -508,22 +509,21 @@ func TestModelKVCache_SetPipelinePath(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("pipe_name")
-	codeField := uniqueCacheName("pipe_code")
-	iconField := uniqueCacheName("pipe_icon")
 	cache := NewModelKV[benchModel](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
-		Field(codeField, "Code").
-		Field(iconField, "IconUrl").
+		Fields("Name", "Code", "IconUrl").
 		Register()
+
+	nameCache := cacheName("bench_model", "Name")
+	codeCache := cacheName("bench_model", "Code")
+	iconCache := cacheName("bench_model", "IconUrl")
 
 	m := &benchModel{Id: 777, Name: "n777", Code: "c777", IconUrl: "http://x/777"}
 	require.NoError(t, cache.Set(context.Background(), m))
 
 	// 三字段都应以 Id=777 为 key 写入（Pipeline 一次 RTT 完成）
-	assert.Equal(t, "n777", mustKVGet(t, nameField, "777"))
-	assert.Equal(t, "c777", mustKVGet(t, codeField, "777"))
-	assert.Equal(t, "http://x/777", mustKVGet(t, iconField, "777"))
+	assert.Equal(t, "n777", mustKVGet(t, nameCache, "777"))
+	assert.Equal(t, "c777", mustKVGet(t, codeCache, "777"))
+	assert.Equal(t, "http://x/777", mustKVGet(t, iconCache, "777"))
 }
 
 // TestModelKVCache_SetSingleFieldFastPath 单字段走快速路径（无 pipeline 开销）
@@ -531,23 +531,23 @@ func TestModelKVCache_SetSingleFieldFastPath(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("fast_name")
 	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
+		Field("Name").
 		Register()
+
+	nameCache := cacheName("test_int_pk", "Name")
 
 	m := &testModelIntPK{Id: 5, Name: "five"}
 	require.NoError(t, cache.Set(context.Background(), m))
-	assert.Equal(t, "five", mustKVGet(t, nameField, "5"))
+	assert.Equal(t, "five", mustKVGet(t, nameCache, "5"))
 }
 
 func TestModelKVCache_SetNilModelIsNoOp(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("set_nil")
 	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
+		Field("Name").
 		Register()
 
 	// nil 模型不应 panic 也不应报错
@@ -558,34 +558,35 @@ func TestModelKVCache_DeleteRemovesAllFields(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("del_name")
-	codeField := uniqueCacheName("del_code")
 	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
-		Field(codeField, "Code").
+		Fields("Name", "Code").
 		Register()
+
+	nameCache := cacheName("test_int_pk", "Name")
+	codeCache := cacheName("test_int_pk", "Code")
 
 	m := &testModelIntPK{Id: 88, Name: "n88", Code: "c88"}
 	require.NoError(t, cache.Set(context.Background(), m))
 
 	// 确认写入
-	assert.Equal(t, "n88", mustKVGet(t, nameField, "88"))
+	assert.Equal(t, "n88", mustKVGet(t, nameCache, "88"))
 
 	// Delete 应删除所有字段
 	require.NoError(t, cache.Delete(context.Background(), m))
 
-	kvGetMiss(t, nameField, "88")
-	kvGetMiss(t, codeField, "88")
+	kvGetMiss(t, nameCache, "88")
+	kvGetMiss(t, codeCache, "88")
 }
 
 func TestModelKVCache_DeleteByKeyRemovesAllFields(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("delbykey_name")
 	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
+		Field("Name").
 		Register()
+
+	nameCache := cacheName("test_int_pk", "Name")
 
 	m := &testModelIntPK{Id: 99, Name: "n99"}
 	require.NoError(t, cache.Set(context.Background(), m))
@@ -593,19 +594,49 @@ func TestModelKVCache_DeleteByKeyRemovesAllFields(t *testing.T) {
 	// DeleteByKey 无需 model 实例
 	require.NoError(t, cache.DeleteByKey(context.Background(), "99"))
 
-	kvGetMiss(t, nameField, "99")
+	kvGetMiss(t, nameCache, "99")
 }
 
 func TestModelKVCache_DeleteNilModelIsNoOp(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("del_nil")
 	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
+		Field("Name").
 		Register()
 
 	require.NoError(t, cache.Delete(context.Background(), nil))
+}
+
+// TestModelKVCache_GetFieldMany 批量读取某字段的 KV 缓存
+func TestModelKVCache_GetFieldMany(t *testing.T) {
+	client := setupModelKVTest(t)
+	defer client.Close()
+
+	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
+		Fields("Name", "Code").
+		Register()
+
+	require.NoError(t, cache.Set(context.Background(), &testModelIntPK{Id: 1, Name: "n1", Code: "c1"}))
+	require.NoError(t, cache.Set(context.Background(), &testModelIntPK{Id: 2, Name: "n2", Code: "c2"}))
+
+	// 批量读取 Name 字段
+	names := cache.GetFieldMany(context.Background(), "Name", []string{"1", "2", "999"})
+	assert.Equal(t, "n1", names["1"])
+	assert.Equal(t, "n2", names["2"])
+	_, has999 := names["999"]
+	assert.False(t, has999)
+
+	// 批量读取 Code 字段
+	codes := cache.GetFieldMany(context.Background(), "Code", []string{"1", "2"})
+	assert.Equal(t, "c1", codes["1"])
+	assert.Equal(t, "c2", codes["2"])
+
+	// 未注册字段返回 nil
+	assert.Nil(t, cache.GetFieldMany(context.Background(), "NotExist", []string{"1"}))
+
+	// 空 keys 返回 nil
+	assert.Nil(t, cache.GetFieldMany(context.Background(), "Name", nil))
 }
 
 // ============================================================
@@ -616,9 +647,8 @@ func TestGetModelKV_Registered(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("get_name")
 	NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
+		Field("Name").
 		Register()
 
 	got, err := GetModelKV[testModelIntPK]()
@@ -658,16 +688,17 @@ func TestModelKVBase_ChainOptions(t *testing.T) {
 		TTL(time.Minute).
 		RefreshInterval(time.Hour)
 
-	nameField := uniqueCacheName("base_chain")
 	cache := NewModelKV[testModelIntPK](base, newSchemaOnlyDB()).
-		Field(nameField, "Name").
+		Field("Name").
 		Register()
+
+	nameCache := cacheName("test_int_pk", "Name")
 
 	// 验证注册成功且可正常 Set
 	m := &testModelIntPK{Id: 100, Name: "hundred"}
 	require.NoError(t, cache.Set(context.Background(), m))
 
-	assert.Equal(t, "hundred", mustKVGet(t, nameField, "100"))
+	assert.Equal(t, "hundred", mustKVGet(t, nameCache, "100"))
 }
 
 func TestModelKVBase_OptionsAppend(t *testing.T) {
@@ -678,24 +709,24 @@ func TestModelKVBase_OptionsAppend(t *testing.T) {
 		Namespace("ns-opt").
 		Options(WithKVTTL(time.Second * 30))
 
-	nameField := uniqueCacheName("base_opts")
 	cache := NewModelKV[testModelIntPK](base, newSchemaOnlyDB()).
-		Field(nameField, "Name").
+		Field("Name").
 		Register()
+
+	nameCache := cacheName("test_int_pk", "Name")
 
 	m := &testModelIntPK{Id: 200, Name: "two-hundred"}
 	require.NoError(t, cache.Set(context.Background(), m))
 
-	assert.Equal(t, "two-hundred", mustKVGet(t, nameField, "200"))
+	assert.Equal(t, "two-hundred", mustKVGet(t, nameCache, "200"))
 }
 
 func TestModelKVBuilder_LoadTTLOption(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("loadttl")
 	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
+		Field("Name").
 		LoadTTL(500 * time.Millisecond).
 		Register()
 
@@ -706,18 +737,19 @@ func TestModelKVBuilder_ExtraOptions(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("extra_opts")
 	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
+		Field("Name").
 		ExtraOptions(WithKVTTL(time.Second * 10)).
 		Register()
+
+	nameCache := cacheName("test_int_pk", "Name")
 
 	// 验证注册成功
 	assert.NotNil(t, cache)
 	m := &testModelIntPK{Id: 300, Name: "three-hundred"}
 	require.NoError(t, cache.Set(context.Background(), m))
 
-	assert.Equal(t, "three-hundred", mustKVGet(t, nameField, "300"))
+	assert.Equal(t, "three-hundred", mustKVGet(t, nameCache, "300"))
 }
 
 // ============================================================
@@ -728,9 +760,8 @@ func TestLoadFieldMap_BuildsKeyToValueMap(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("loadmap_name")
 	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
+		Field("Name").
 		Register()
 
 	// 直接构造 cachedItems 模拟 loadAll 结果（绕过真实 DB 查询）
@@ -755,9 +786,8 @@ func TestLoadFieldMap_SkipsNilItems(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("loadmap_nil")
 	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
+		Field("Name").
 		Register()
 
 	cache.cacheMu.Lock()
@@ -778,9 +808,8 @@ func TestLoadFieldMap_SkipsEmptyKey(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("loadmap_empty_key")
 	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
+		Field("Name").
 		Register()
 
 	cache.cacheMu.Lock()
@@ -806,10 +835,11 @@ func TestModelKVCache_ConcurrentSet(t *testing.T) {
 	client := setupModelKVTest(t)
 	defer client.Close()
 
-	nameField := uniqueCacheName("conc_set")
 	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
-		Field(nameField, "Name").
+		Field("Name").
 		Register()
+
+	nameCache := cacheName("test_int_pk", "Name")
 
 	var wg sync.WaitGroup
 	for i := int64(1); i <= 50; i++ {
@@ -824,6 +854,6 @@ func TestModelKVCache_ConcurrentSet(t *testing.T) {
 
 	// 抽检若干 key
 	for _, id := range []int64{1, 10, 25, 50} {
-		assert.Equal(t, fmt.Sprintf("n%d", id), mustKVGet(t, nameField, fmt.Sprintf("%d", id)))
+		assert.Equal(t, fmt.Sprintf("n%d", id), mustKVGet(t, nameCache, fmt.Sprintf("%d", id)))
 	}
 }
