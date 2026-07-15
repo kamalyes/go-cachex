@@ -527,6 +527,27 @@ func (c *ModelKVCache[M]) GetFieldMany(ctx context.Context, fieldName string, ke
 	return nil
 }
 
+// ResetLoadCache 重置共享 loadAll 缓存，下次 loadAll 强制从 DB 查询
+// 适用于启动预热场景：Clear 后需要强制刷新 loadAll 缓存，避免读到清理前的旧数据
+func (c *ModelKVCache[M]) ResetLoadCache() {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+	c.cachedItems = nil
+	c.cachedItemsAt = time.Time{}
+}
+
+// ResetAllModelKVLoadCache 重置所有已注册 ModelKVCache 的 loadAll 共享缓存
+// 在 ClearAllKV 之前调用，确保后续 Refresh 从 DB 加载最新数据而非复用旧缓存
+func ResetAllModelKVLoadCache() {
+	modelKVRegistryMu.RLock()
+	defer modelKVRegistryMu.RUnlock()
+	for _, c := range modelKVRegistry {
+		if resetter, ok := c.(interface{ ResetLoadCache() }); ok {
+			resetter.ResetLoadCache()
+		}
+	}
+}
+
 // ResetModelKVRegistry 清空全局注册表（仅测试用）
 func ResetModelKVRegistry() {
 	modelKVRegistryMu.Lock()

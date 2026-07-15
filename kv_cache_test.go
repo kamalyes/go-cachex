@@ -1357,3 +1357,469 @@ func TestKVCache_WithKVBatchLoader_Option(t *testing.T) {
 	// config.BatchLoader 应被设置
 	assert.NotNil(t, c.config.BatchLoader)
 }
+
+// ============================================================
+// runParallel 单元测试（不依赖 Redis）
+// ============================================================
+
+func TestRunParallel_AllSuccess(t *testing.T) {
+	var counter int64
+	fns := make([]func() error, 10)
+	for i := range fns {
+		fns[i] = func() error {
+			atomic.AddInt64(&counter, 1)
+			return nil
+		}
+	}
+	err := runParallel(fns)
+	require.NoError(t, err)
+	assert.Equal(t, int64(10), atomic.LoadInt64(&counter))
+}
+
+func TestRunParallel_PartialFailure(t *testing.T) {
+	var counter int64
+	fns := make([]func() error, 5)
+	for i := range fns {
+		idx := i
+		fns[idx] = func() error {
+			atomic.AddInt64(&counter, 1)
+			if idx == 2 {
+				return fmt.Errorf("error on task %d", idx)
+			}
+			return nil
+		}
+	}
+	err := runParallel(fns)
+	require.Error(t, err)
+	// 所有任务都应该执行，即使部分失败
+	assert.Equal(t, int64(5), atomic.LoadInt64(&counter))
+}
+
+func TestRunParallel_EmptyTasks(t *testing.T) {
+	err := runParallel(nil)
+	require.NoError(t, err)
+}
+
+func TestRunParallel_AllFail(t *testing.T) {
+	fns := make([]func() error, 3)
+	for i := range fns {
+		fns[i] = func() error { return errors.New("fail") }
+	}
+	err := runParallel(fns)
+	require.Error(t, err)
+}
+
+// TestRunParallel_ConcurrentSafe 验证并发安全（配合 -race 运行）
+func TestRunParallel_ConcurrentSafe(t *testing.T) {
+	var counter int64
+	fns := make([]func() error, 100)
+	for i := range fns {
+		fns[i] = func() error {
+			atomic.AddInt64(&counter, 1)
+			return nil
+		}
+	}
+	err := runParallel(fns)
+	require.NoError(t, err)
+	assert.Equal(t, int64(100), atomic.LoadInt64(&counter))
+}
+
+// ============================================================
+// 空注册表测试（不依赖 Redis）
+// ============================================================
+
+func TestClearAllKV_EmptyRegistry(t *testing.T) {
+	resetKVRegistry()
+	err := ClearAllKV(context.Background())
+	require.NoError(t, err)
+}
+
+func TestRefreshAllKV_EmptyRegistry(t *testing.T) {
+	resetKVRegistry()
+	err := RefreshAllKV(context.Background())
+	require.NoError(t, err)
+}
+
+func TestWarmupAllKV_EmptyRegistry(t *testing.T) {
+	resetKVRegistry()
+	ResetModelKVRegistry()
+	err := WarmupAllKV(context.Background())
+	require.NoError(t, err)
+}
+
+// ============================================================
+// ClearAllKV 测试（依赖 Redis）
+// ============================================================
+
+// setupWarmupTest 初始化 Redis + 重置注册表，返回 cleanup 函数
+func setupWarmupTest(t *testing.T) (context.Context, func()) {
+	t.Helper()
+	client := setupRedisClient(t)
+	if client == nil {
+		t.Skip("Redis 不可用，跳过预热测试")
+	}
+	SetGlobalRedisClient(client)
+	resetKVRegistry()
+	ResetModelKVRegistry()
+
+	ctx := context.Background()
+	cleanup := func() {
+		StopAllKV()
+	}
+	return ctx, cleanup
+}
+
+func TestClearAllKV_ClearsAllCaches(t *testing.T) {
+	ctx, cleanup := setupWarmupTest(t)
+	defer cleanup()
+
+	// 注册 3 个缓存，各自写入数据
+	RegisterKV[string, string]("warmup-clear-1",
+		kvLoader[string, string](nil, nil),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+	RegisterKV[string, string]("warmup-clear-2",
+		kvLoader[string, string](nil, nil),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+	RegisterKV[string, string]("warmup-clear-3",
+		kvLoader[string, string](nil, nil),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+
+	c1 := MustGetKV[string, string]("warmup-clear-1")
+	c2 := MustGetKV[string, string]("warmup-clear-2")
+	c3 := MustGetKV[string, string]("warmup-clear-3")
+
+	require.NoError(t, c1.Set(ctx, "a", "1"))
+	require.NoError(t, c2.Set(ctx, "b", "2"))
+	require.NoError(t, c3.Set(ctx, "c", "3"))
+	assert.Equal(t, 1, c1.Size())
+	assert.Equal(t, 1, c2.Size())
+	assert.Equal(t, 1, c3.Size())
+
+	// 清空所有
+	require.NoError(t, ClearAllKV(ctx))
+
+	// 验证本地缓存全部清空
+	assert.Equal(t, 0, c1.Size())
+	assert.Equal(t, 0, c2.Size())
+	assert.Equal(t, 0, c3.Size())
+
+	// 验证 Redis 也被清空
+	for _, name := range []string{"warmup-clear-1", "warmup-clear-2", "warmup-clear-3"} {
+		cnt, err := globalRedisClient.Exists(ctx, fmt.Sprintf("kv:%s", name)).Result()
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), cnt, "Redis key for %s should be deleted", name)
+	}
+}
+
+func TestClearAllKV_PartialFailure(t *testing.T) {
+	ctx, cleanup := setupWarmupTest(t)
+	defer cleanup()
+
+	// 正常缓存
+	RegisterKV[string, string]("warmup-partial-ok",
+		kvLoader[string, string](map[string]string{"x": "1"}, nil),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+
+	// 用临时 client 模拟断连的缓存
+	badClient := globalRedisClient
+	RegisterKV[string, string]("warmup-partial-bad",
+		kvLoader[string, string](map[string]string{"y": "2"}, nil),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+	_ = badClient // 两个缓存共用同一 client，此处验证 ClearAllKV 不因单个错误中断
+
+	okCache := MustGetKV[string, string]("warmup-partial-ok")
+	require.NoError(t, okCache.Set(ctx, "x", "1"))
+	assert.Equal(t, 1, okCache.Size())
+
+	// ClearAllKV 应执行完毕，不因任何错误中断其余缓存
+	_ = ClearAllKV(ctx)
+
+	// ok 缓存应被清空
+	assert.Equal(t, 0, okCache.Size())
+}
+
+// ============================================================
+// RefreshAllKV 测试（依赖 Redis）
+// ============================================================
+
+func TestRefreshAllKV_LoadsFromSource(t *testing.T) {
+	ctx, cleanup := setupWarmupTest(t)
+	defer cleanup()
+
+	var call1, call2 int64
+	RegisterKV[string, string]("warmup-refresh-1",
+		kvLoader(map[string]string{"a": "v1", "b": "v2"}, &call1),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+	RegisterKV[string, string]("warmup-refresh-2",
+		kvLoader(map[string]string{"c": "v3"}, &call2),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+
+	// 先清空确保从空状态开始
+	require.NoError(t, ClearAllKV(ctx))
+
+	// Refresh 从 loader 加载
+	require.NoError(t, RefreshAllKV(ctx))
+
+	assert.Equal(t, int64(1), atomic.LoadInt64(&call1))
+	assert.Equal(t, int64(1), atomic.LoadInt64(&call2))
+
+	// 验证本地缓存有数据
+	c1 := MustGetKV[string, string]("warmup-refresh-1")
+	c2 := MustGetKV[string, string]("warmup-refresh-2")
+	assert.Equal(t, 2, c1.Size())
+	assert.Equal(t, 1, c2.Size())
+
+	// 验证 Redis 也有数据
+	v, ok, err := c1.Get(ctx, "a")
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "v1", v)
+}
+
+func TestRefreshAllKV_PartialFailure(t *testing.T) {
+	ctx, cleanup := setupWarmupTest(t)
+	defer cleanup()
+
+	var okCalls int64
+	RegisterKV[string, string]("warmup-rf-ok",
+		kvLoader(map[string]string{"k": "v"}, &okCalls),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+	RegisterKV[string, string]("warmup-rf-err",
+		kvErrorLoader[string, string](),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+
+	// RefreshAllKV 应返回错误（来自 err loader），但不中断 ok 缓存
+	err := RefreshAllKV(ctx)
+	require.Error(t, err)
+
+	// ok 缓存仍然成功加载
+	assert.Equal(t, int64(1), atomic.LoadInt64(&okCalls))
+	okCache := MustGetKV[string, string]("warmup-rf-ok")
+	assert.Equal(t, 1, okCache.Size())
+}
+
+// ============================================================
+// WarmupAllKV 完整流程测试（依赖 Redis）
+// ============================================================
+
+func TestWarmupAllKV_FullFlow(t *testing.T) {
+	ctx, cleanup := setupWarmupTest(t)
+	defer cleanup()
+
+	var callCount int64
+	RegisterKV[string, string]("warmup-full-1",
+		kvLoader(map[string]string{"a": "1", "b": "2"}, &callCount),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+	RegisterKV[string, string]("warmup-full-2",
+		kvLoader(map[string]string{"c": "3"}, nil),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+
+	// 手动写入陈旧数据到 Redis（包括 loader 中不存在的 key）
+	c1 := MustGetKV[string, string]("warmup-full-1")
+	require.NoError(t, c1.Set(ctx, "a", "OLD"))
+	require.NoError(t, c1.Set(ctx, "stale_key", "should_be_removed"))
+
+	// 执行完整预热
+	err := WarmupAllKV(ctx)
+	require.NoError(t, err)
+
+	// 验证 loader 被调用
+	assert.Equal(t, int64(1), atomic.LoadInt64(&callCount))
+
+	// 验证 "a" 的值已被刷新为 loader 的值
+	v, ok, err := c1.Get(ctx, "a")
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "1", v, "stale value should be replaced by fresh loader data")
+
+	// 验证 "b" 存在（loader 新增的）
+	v, ok, err = c1.Get(ctx, "b")
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "2", v)
+
+	// 验证 "stale_key" 已被清除（Clear 删除了整个 Hash，Refresh 只写 loader 数据）
+	_, ok, _ = c1.Get(ctx, "stale_key")
+	assert.False(t, ok, "stale key should be removed after WarmupAllKV (Clear + Refresh)")
+}
+
+func TestWarmupAllKV_RemovesStaleEntries(t *testing.T) {
+	ctx, cleanup := setupWarmupTest(t)
+	defer cleanup()
+
+	// 注册一个缓存，loader 只返回 {"fresh": "data"}
+	RegisterKV[string, string]("warmup-stale",
+		kvLoader(map[string]string{"fresh": "data"}, nil),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+
+	// 直接写 Redis 模拟陈旧数据（loader 中不存在这些 key）
+	redisKey := "kv:warmup-stale"
+	require.NoError(t, globalRedisClient.HSet(ctx, redisKey, "stale1", "old1", "stale2", "old2", "fresh", "OLD").Err())
+
+	// 执行预热
+	require.NoError(t, WarmupAllKV(ctx))
+
+	// 验证 stale 条目已被清除
+	exists, err := globalRedisClient.HExists(ctx, redisKey, "stale1").Result()
+	require.NoError(t, err)
+	assert.False(t, exists, "stale1 should be removed from Redis after warmup")
+
+	exists, err = globalRedisClient.HExists(ctx, redisKey, "stale2").Result()
+	require.NoError(t, err)
+	assert.False(t, exists, "stale2 should be removed from Redis after warmup")
+
+	// 验证 fresh 条目已被更新为 loader 的值
+	val, err := globalRedisClient.HGet(ctx, redisKey, "fresh").Result()
+	require.NoError(t, err)
+	assert.Equal(t, "data", val, "fresh key should be updated to loader value")
+}
+
+// ============================================================
+// ResetLoadCache / ResetAllModelKVLoadCache 测试
+// ============================================================
+
+func TestModelKVCache_ResetLoadCache(t *testing.T) {
+	client := setupModelKVTest(t)
+	defer client.Close()
+
+	cache := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
+		Field("Name").
+		Register()
+
+	// 手动填充 cachedItems 模拟之前的 loadAll
+	cache.cacheMu.Lock()
+	cache.cachedItems = []*testModelIntPK{{Id: 1, Name: "test"}}
+	cache.cachedItemsAt = time.Now()
+	cache.cacheMu.Unlock()
+
+	// 重置
+	cache.ResetLoadCache()
+
+	// 验证 cachedItems 已清空
+	cache.cacheMu.RLock()
+	assert.Nil(t, cache.cachedItems)
+	assert.True(t, cache.cachedItemsAt.IsZero())
+	cache.cacheMu.RUnlock()
+}
+
+func TestResetAllModelKVLoadCache(t *testing.T) {
+	client := setupModelKVTest(t)
+	defer client.Close()
+
+	cache1 := NewModelKV[testModelIntPK](NewModelKVBase(), newSchemaOnlyDB()).
+		Field("Name").
+		Register()
+	cache2 := NewModelKV[testModelStringPK](NewModelKVBase(), newSchemaOnlyDB()).
+		Field("Name").
+		Register()
+
+	// 填充两个 ModelKV 的 cachedItems
+	cache1.cacheMu.Lock()
+	cache1.cachedItems = []*testModelIntPK{{Id: 1}}
+	cache1.cachedItemsAt = time.Now()
+	cache1.cacheMu.Unlock()
+
+	cache2.cacheMu.Lock()
+	cache2.cachedItems = []*testModelStringPK{{TenantId: "t1"}}
+	cache2.cachedItemsAt = time.Now()
+	cache2.cacheMu.Unlock()
+
+	// 重置所有
+	ResetAllModelKVLoadCache()
+
+	// 验证两个都已重置
+	cache1.cacheMu.RLock()
+	assert.Nil(t, cache1.cachedItems)
+	cache1.cacheMu.RUnlock()
+
+	cache2.cacheMu.RLock()
+	assert.Nil(t, cache2.cachedItems)
+	cache2.cacheMu.RUnlock()
+}
+
+func TestResetAllModelKVLoadCache_EmptyRegistry(t *testing.T) {
+	ResetModelKVRegistry()
+	// 不应 panic
+	ResetAllModelKVLoadCache()
+}
+
+// ============================================================
+// 并发安全测试（配合 -race 运行）
+// ============================================================
+
+// TestWarmupAllKV_ConcurrentSafe 验证预热流程的并发安全
+// 多个 goroutine 同时读缓存时执行 WarmupAllKV 不应出现数据竞争
+func TestWarmupAllKV_ConcurrentSafe(t *testing.T) {
+	ctx, cleanup := setupWarmupTest(t)
+	defer cleanup()
+
+	RegisterKV[string, string]("warmup-race",
+		kvLoader(map[string]string{"k1": "v1", "k2": "v2", "k3": "v3"}, nil),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+
+	// 先预热一次
+	require.NoError(t, WarmupAllKV(ctx))
+
+	cache := MustGetKV[string, string]("warmup-race")
+
+	// 并发：1 个 goroutine 执行 WarmupAllKV，3 个 goroutine 并发读
+	done := make(chan struct{})
+	var wg atomic.Int64
+	wg.Store(4)
+
+	// writer：执行 WarmupAllKV
+	go func() {
+		defer func() { wg.Add(-1) }()
+		_ = WarmupAllKV(ctx)
+	}()
+
+	// readers：并发读缓存
+	for i := 0; i < 3; i++ {
+		go func() {
+			defer func() { wg.Add(-1) }()
+			for j := 0; j < 100; j++ {
+				_, _, _ = cache.Get(ctx, "k1")
+			}
+		}()
+	}
+
+	// 等待全部完成
+	for {
+		if wg.Load() == 0 {
+			break
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent test timed out")
+		}
+	}
+}
+
+// ============================================================
+// 基准测试
+// ============================================================
+
+// BenchmarkRunParallel 测量 runParallel 的调度开销（无 I/O，纯调度）
+func BenchmarkRunParallel(b *testing.B) {
+	fns := make([]func() error, 20)
+	for i := range fns {
+		fns[i] = func() error { return nil }
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = runParallel(fns)
+	}
+}
+
+// BenchmarkRunParallel_WithErrors 测量有错误时的收集开销
+func BenchmarkRunParallel_WithErrors(b *testing.B) {
+	fns := make([]func() error, 20)
+	for i := range fns {
+		fns[i] = func() error { return errors.New("bench error") }
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = runParallel(fns)
+	}
+}

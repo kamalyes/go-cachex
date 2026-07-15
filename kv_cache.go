@@ -903,6 +903,165 @@ func StopAllKV() {
 	}
 }
 
+// kvNamedCache 带名称的 KV 缓存接口（用于批量 Clear/Refresh 时的日志输出）
+// *KVCache[K,V] 通过实现 Name/Clear/Refresh 满足此接口
+type kvNamedCache interface {
+	Name() string
+	Clear(context.Context) error
+	Refresh(context.Context) error
+}
+
+// Name 返回 KV 缓存名称（用于批量操作的日志输出与实例标识）
+func (c *KVCache[K, V]) Name() string {
+	return c.name
+}
+
+// kvLogger 返回全局日志器，未注入时 fallback 到默认日志器
+// 避免在 WarmupAllKV/ClearAllKV/RefreshAllKV 之间反复透传 log 参数
+func kvLogger() logger.ILogger {
+	return mathx.IfEmpty(globalLogger, NewDefaultCachexLogger())
+}
+
+// WarmupAllKV 启动预热：重置 ModelKV 缓存 → 清空所有 KV → 从数据源重新加载
+// 解决 autoRefresh 首次触发延迟（RefreshInterval=5min）期间缓存为空/陈旧的问题
+//
+// 流程：
+//  1. ResetAllModelKVLoadCache — 重置 ModelKV 共享 loadAll 缓存，强制下次从 DB 查询
+//  2. ClearAllKV — 清空所有 KV 缓存（本地 + Redis），清除已删除记录的残留字段
+//  3. RefreshAllKV — 从数据源重新加载全量数据，写回本地 + Redis
+//
+// 返回首个错误（不中断其余缓存的预热），调用方根据日志判断是否需要重试
+// 日志统一使用 globalLogger（未注入时 fallback 到默认日志器），无需调用方传参
+func WarmupAllKV(ctx context.Context) error {
+	log := kvLogger()
+
+	kvCount := kvRegistrySize()
+	modelCount := modelKVRegistrySize()
+	totalStart := time.Now()
+
+	log.InfoContext(ctx, "KV cache warmup started: %d KV caches, %d ModelKV caches", kvCount, modelCount)
+
+	// 1. 重置 ModelKV 的共享 loadAll 缓存，强制下次从 DB 查询
+	log.InfoContext(ctx, "Step 1/3: resetting ModelKV loadAll cache (%d models)", modelCount)
+	ResetAllModelKVLoadCache()
+
+	// 2. 清空所有 KV 缓存（本地 + Redis），清除已删除记录的残留字段
+	log.InfoContext(ctx, "Step 2/3: clearing all KV caches (%d caches)", kvCount)
+	clearStart := time.Now()
+	if err := ClearAllKV(ctx); err != nil {
+		log.WarnContext(ctx, "Step 2/3: clear all completed with errors (took %v): %v", time.Since(clearStart), err)
+	} else {
+		log.InfoContext(ctx, "Step 2/3: clear all completed successfully (took %v)", time.Since(clearStart))
+	}
+
+	// 3. 从数据源重新加载全量数据，写回本地 + Redis
+	log.InfoContext(ctx, "Step 3/3: refreshing all KV caches from source (%d caches)", kvCount)
+	refreshStart := time.Now()
+	if err := RefreshAllKV(ctx); err != nil {
+		log.WarnContext(ctx, "Step 3/3: refresh all completed with errors (took %v): %v", time.Since(refreshStart), err)
+	} else {
+		log.InfoContext(ctx, "Step 3/3: refresh all completed successfully (took %v)", time.Since(refreshStart))
+	}
+
+	log.InfoContext(ctx, "KV cache warmup finished (total %v)", time.Since(totalStart))
+	return nil
+}
+
+// kvRegistrySize 返回已注册 KV 缓存数量
+func kvRegistrySize() int {
+	kvRegistryMu.RLock()
+	defer kvRegistryMu.RUnlock()
+	return len(kvRegistry)
+}
+
+// modelKVRegistrySize 返回已注册 ModelKV 缓存数量
+func modelKVRegistrySize() int {
+	modelKVRegistryMu.RLock()
+	defer modelKVRegistryMu.RUnlock()
+	return len(modelKVRegistry)
+}
+
+// ClearAllKV 清空所有已注册 KV 缓存（本地 + Redis），并广播 clear 消息到其他节点
+// 并发执行各缓存的 Clear 操作，返回首个错误（不中断其余缓存）
+// 适用于服务启动时重置缓存，清除 Redis 中已删除记录的残留字段
+func ClearAllKV(ctx context.Context) error {
+	return applyAllKV(ctx, "Clear", func(c kvNamedCache) error { return c.Clear(ctx) })
+}
+
+// RefreshAllKV 从数据源刷新所有已注册 KV 缓存（清空本地后重新加载，写回 Redis，不广播）
+// 并发执行各缓存的 Refresh 操作，返回首个错误（不中断其余缓存）
+// 适用于服务启动时预热缓存，通常在 ClearAllKV 之后调用以确保缓存与数据库一致
+func RefreshAllKV(ctx context.Context) error {
+	return applyAllKV(ctx, "Refresh", func(c kvNamedCache) error { return c.Refresh(ctx) })
+}
+
+// snapshotKVCaches 快照所有已注册 KV 缓存（读锁内完成，释放后并发执行）
+// 仅保留同时实现 Name/Clear/Refresh 的实例
+func snapshotKVCaches() []kvNamedCache {
+	kvRegistryMu.RLock()
+	defer kvRegistryMu.RUnlock()
+	out := make([]kvNamedCache, 0, len(kvRegistry))
+	for _, c := range kvRegistry {
+		if nc, ok := c.(kvNamedCache); ok {
+			out = append(out, nc)
+		}
+	}
+	return out
+}
+
+// applyAllKV 并发执行所有已注册 KV 缓存的指定操作（Clear/Refresh），返回首个错误
+// 适用于启动预热场景：即使部分缓存操作失败，也要继续处理其余缓存
+// 日志使用 globalLogger（未注入时 fallback 到默认日志器）
+func applyAllKV(ctx context.Context, op string, action func(kvNamedCache) error) error {
+	entries := snapshotKVCaches()
+	if len(entries) == 0 {
+		return nil
+	}
+	log := kvLogger()
+	fns := make([]func() error, len(entries))
+	for i, e := range entries {
+		e := e
+		fns[i] = func() error {
+			start := time.Now()
+			err := action(e)
+			if err != nil {
+				log.WarnContext(ctx, "KV cache %s %q failed (took %v): %v", op, e.Name(), time.Since(start), err)
+			} else {
+				log.DebugContext(ctx, "KV cache %s %q done (took %v)", op, e.Name(), time.Since(start))
+			}
+			return err
+		}
+	}
+	return runParallel(fns)
+}
+
+// runParallel 并发执行多个任务，返回首个错误（不中断其他任务）
+// 适用于启动预热场景：即使部分缓存操作失败，也要继续处理其余缓存
+func runParallel(fns []func() error) error {
+	if len(fns) == 0 {
+		return nil
+	}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	wg.Add(len(fns))
+	for _, fn := range fns {
+		fn := fn
+		go func() {
+			defer wg.Done()
+			if err := fn(); err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	return firstErr
+}
+
 // KVOption KV 缓存配置项
 type KVOption func(*KVCacheConfig)
 
