@@ -269,7 +269,6 @@ func main() {
 
 - **[API文档](https://pkg.go.dev/github.com/kamalyes/go-cachex)** - 在线API参考
 - **[examples/](examples/)** - 代码示例集合
-- **[TEST-STATUS-REPORT.md](./TEST-STATUS-REPORT.md)** - 测试覆盖率报告
 
 ## 🏃‍♂️ 代码示例
 

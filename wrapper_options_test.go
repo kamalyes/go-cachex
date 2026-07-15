@@ -52,10 +52,10 @@ func TestCacheWrapperWithTTL(t *testing.T) {
 	assert.Equal(t, "test data", *result1)
 	assert.Equal(t, 1, callCount)
 
-	// 检查 TTL 是否为 5 秒
+	// 检查 TTL 是否为 5 秒（miniredis 的 TTL 返回整数秒，FastForward 同步时钟可能导致 50ms 偏差使 5s 舍入为 4s）
 	ttl, err := client.TTL(ctx, key).Result()
 	assert.NoError(t, err)
-	assert.True(t, ttl > time.Second*4 && ttl <= time.Second*5)
+	assert.True(t, ttl >= time.Second*4 && ttl <= time.Second*5+time.Second/2)
 
 	// 第二次调用，从缓存加载
 	result2, err := cachedLoader(ctx)

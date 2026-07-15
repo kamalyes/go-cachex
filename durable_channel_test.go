@@ -704,7 +704,7 @@ func TestDurableChannel_Concurrency(t *testing.T) {
 			wg.Add(1)
 			go func(id int) {
 				defer wg.Done()
-				for i := range 20 {
+				for i := range 100 {
 					msgID := fmt.Sprintf("g%d-m%d", id, i)
 					err := ch.Send(ctx, createTestMessage(msgID, "Race"))
 					if err != nil {

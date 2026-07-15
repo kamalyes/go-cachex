@@ -16,52 +16,52 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+// setupRedisClient 创建基于 miniredis 的本地内存 Redis 客户端，供测试离线运行
+// 每次调用启动一个独立 miniredis 实例，通过 tb.Cleanup 自动关闭，无需外部 Redis 服务
+// miniredis 使用虚拟时钟，TTL 不会随真实时间自动过期，因此启动后台 goroutine
+// 周期性调用 FastForward 同步虚拟时钟，使 TTL 行为与真实 Redis 一致
 func setupRedisClient(tb testing.TB) *redis.Client {
-	// 使用测试名称的哈希值作为DB编号，避免测试间数据冲突
-	// DB范围：1-15（保留0作为默认DB）
-	testName := tb.Name()
-	dbNum := 1
-	if len(testName) > 0 {
-		hash := 0
-		for _, c := range testName {
-			hash = hash*31 + int(c)
+	mr := miniredis.RunT(tb)
+
+	// 后台同步虚拟时钟：每 50ms 推进 miniredis 时钟，使 TTL 过期与真实时间一致
+	clockDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-clockDone:
+				return
+			case <-ticker.C:
+				mr.FastForward(50 * time.Millisecond)
+			}
 		}
-		dbNum = (hash % 15) + 1 // 确保DB在1-15范围内
-	}
+	}()
+	tb.Cleanup(func() { close(clockDone) })
 
 	client := redis.NewClient(&redis.Options{
-		Addr:            "120.79.25.168:16389",
-		Password:        "M5Pi9YW6u",
-		DB:              dbNum,
-		DialTimeout:     3 * time.Second, // 减少拨号超时
-		ReadTimeout:     3 * time.Second, // 减少读超时
-		WriteTimeout:    3 * time.Second, // 减少写超时
-		PoolTimeout:     5 * time.Second, // 减少池超时
-		PoolSize:        10,              // 连接池大小
-		MinIdleConns:    0,               // 不预创建空闲连接，避免初始化阻塞
-		MaxRetries:      1,               // 减少重试次数，快速失败
+		Addr:            mr.Addr(),
+		DialTimeout:     3 * time.Second,
+		ReadTimeout:     3 * time.Second,
+		WriteTimeout:    3 * time.Second,
+		PoolTimeout:     5 * time.Second,
+		PoolSize:        10,
 		DisableIdentity: true,
 	})
 
-	// 减少连接测试超时
+	// 验证连接可用
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
-	// 测试连接
-	err := client.Ping(ctx).Err()
-	if err != nil {
+	if err := client.Ping(ctx).Err(); err != nil {
 		client.Close()
-		tb.Skipf("Redis不可用，跳过测试: %v", err)
-		return nil
+		tb.Fatalf("miniredis 连接失败: %v", err)
 	}
-
-	// 清理测试数据
-	client.FlushDB(ctx)
 
 	return client
 }

@@ -105,6 +105,28 @@ end
 return n
 `
 
+// luaKVReplaceAll Lua脚本：原子替换整个 Hash（DEL + HSET + EXPIRE）
+// 用于 RefreshAndSwap：先删除旧数据（含已删除记录的残留字段），再写入新数据，全程原子
+// 消除 Clear→Refresh 之间的空窗期，避免其他请求 cache miss 触发 DB 雪崩
+//
+// KEYS[1] = Redis Hash 键名
+// ARGV[1] = TTL（秒）
+// ARGV[2..N] = field1 value1 field2 value2 ...（可为空，仅 DEL）
+// 返回：写入字段数
+var luaKVReplaceAll = `
+redis.call('DEL', KEYS[1])
+local ttl = tonumber(ARGV[1])
+local n = 0
+for i = 2, #ARGV, 2 do
+    redis.call('HSET', KEYS[1], ARGV[i], ARGV[i+1])
+    n = n + 1
+end
+if ttl and ttl > 0 and n > 0 then
+    redis.call('EXPIRE', KEYS[1], ttl)
+end
+return n
+`
+
 // KVCacheConfig KV 缓存配置
 type KVCacheConfig struct {
 	DefaultTTL        time.Duration  // 默认TTL，默认 30 分钟
@@ -731,6 +753,64 @@ func (c *KVCache[K, V]) Refresh(ctx context.Context) error {
 	return err
 }
 
+// RefreshAndSwap 原子刷新：先从数据源加载新数据，再用 Lua 脚本原子替换 Redis（DEL+HSET+EXPIRE），
+// 最后替换本地缓存并广播 clear 通知其他节点从 Redis 重新加载
+//
+// 与 Clear+Refresh 的区别：
+//   - Clear+Refresh 有空窗期（Redis DEL 后、HSET 前），其他请求会 cache miss → lazy LoadAll → DB 雪崩
+//   - RefreshAndSwap 先加载数据再原子替换，Redis 从旧值→新值无空窗，其他节点收到 clear 后从 Redis 读到最新数据
+//
+// 适用于启动预热（WarmupAllKV）和高优先级缓存刷新场景
+func (c *KVCache[K, V]) RefreshAndSwap(ctx context.Context) error {
+	if c.loader == nil {
+		return fmt.Errorf("KVCache %s has no loader", c.name)
+	}
+
+	// 1. 先从数据源加载新数据（此时 Redis 和本地缓存仍持有旧数据，其他请求正常读到旧值）
+	data, err := c.loader(ctx)
+	if err != nil {
+		return fmt.Errorf("KVCache %s loader failed: %w", c.name, err)
+	}
+
+	// 2. 原子替换 Redis：DEL 旧 Hash + HSET 新数据 + EXPIRE，一次 Lua 调用完成
+	//    即使 data 为空也会 DEL（清除已删除记录的残留字段）
+	if err := c.replaceRedis(ctx, data); err != nil {
+		return fmt.Errorf("KVCache %s replaceRedis failed: %w", c.name, err)
+	}
+
+	// 3. 替换本地缓存（Clear + Store，数据已在内存中，微秒级完成）
+	c.localCache.Clear()
+	for k, v := range data {
+		c.localCache.Store(k, v)
+	}
+	c.setRefreshTime(time.Now())
+
+	// 4. 广播 clear 通知其他节点：清除本地缓存，下次读时从 Redis 获取最新数据
+	c.publishInvalidation("clear", nil)
+
+	c.logger.Debugf("KVCache %s RefreshAndSwap: count=%d", c.name, len(data))
+	return nil
+}
+
+// replaceRedis 原子替换 Redis Hash：DEL 旧数据 + HSET 新数据 + EXPIRE
+// 使用 luaKVReplaceAll 脚本保证原子性，消除 Clear→HSET 之间的空窗期
+// data 为空时仅执行 DEL（清除残留字段）
+func (c *KVCache[K, V]) replaceRedis(ctx context.Context, items map[K]V) error {
+	args := make([]interface{}, 0, len(items)*2+1)
+	args = append(args, int64(c.config.DefaultTTL/time.Second))
+	for k, v := range items {
+		vstr, err := c.encodeValue(v)
+		if err != nil {
+			return err
+		}
+		args = append(args, convert.MustString(k), vstr)
+	}
+	return c.client.Eval(ctx, luaKVReplaceAll,
+		[]string{c.redisKey()},
+		args...,
+	).Err()
+}
+
 // Clear 清空本地与 Redis 缓存（并广播 clear 消息给其他节点）
 // 使用 Pipeline 合并 DEL + PUBLISH，将 2 次 RTT 减少为 1 次
 func (c *KVCache[K, V]) Clear(ctx context.Context) error {
@@ -903,12 +983,13 @@ func StopAllKV() {
 	}
 }
 
-// kvNamedCache 带名称的 KV 缓存接口（用于批量 Clear/Refresh 时的日志输出）
-// *KVCache[K,V] 通过实现 Name/Clear/Refresh 满足此接口
+// kvNamedCache 带名称的 KV 缓存接口（用于批量 Clear/Refresh/RefreshAndSwap 时的日志输出）
+// *KVCache[K,V] 通过实现 Name/Clear/Refresh/RefreshAndSwap 满足此接口
 type kvNamedCache interface {
 	Name() string
 	Clear(context.Context) error
 	Refresh(context.Context) error
+	RefreshAndSwap(context.Context) error
 }
 
 // Name 返回 KV 缓存名称（用于批量操作的日志输出与实例标识）
@@ -922,13 +1003,16 @@ func kvLogger() logger.ILogger {
 	return mathx.IfEmpty(globalLogger, NewDefaultCachexLogger())
 }
 
-// WarmupAllKV 启动预热：重置 ModelKV 缓存 → 清空所有 KV → 从数据源重新加载
+// WarmupAllKV 启动预热：重置 ModelKV 缓存 → 原子替换所有 KV 缓存
 // 解决 autoRefresh 首次触发延迟（RefreshInterval=5min）期间缓存为空/陈旧的问题
 //
 // 流程：
 //  1. ResetAllModelKVLoadCache — 重置 ModelKV 共享 loadAll 缓存，强制下次从 DB 查询
-//  2. ClearAllKV — 清空所有 KV 缓存（本地 + Redis），清除已删除记录的残留字段
-//  3. RefreshAllKV — 从数据源重新加载全量数据，写回本地 + Redis
+//  2. RefreshAndSwapAllKV — 原子替换所有 KV 缓存（先从 DB 加载，再 Lua 原子替换 Redis + 本地 + 广播）
+//
+// 与旧方案（Clear→Refresh）的区别：
+//   - 旧方案有空窗期：Clear DEL Redis 后、Refresh HSET 前，其他请求 cache miss → DB 雪崩
+//   - 新方案无空窗：先加载数据，再原子替换（DEL+HSET 一次 Lua），Redis 从旧值→新值无缝切换
 //
 // 返回首个错误（不中断其余缓存的预热），调用方根据日志判断是否需要重试
 // 日志统一使用 globalLogger（未注入时 fallback 到默认日志器），无需调用方传参
@@ -942,25 +1026,17 @@ func WarmupAllKV(ctx context.Context) error {
 	log.InfoContext(ctx, "KV cache warmup started: %d KV caches, %d ModelKV caches", kvCount, modelCount)
 
 	// 1. 重置 ModelKV 的共享 loadAll 缓存，强制下次从 DB 查询
-	log.InfoContext(ctx, "Step 1/3: resetting ModelKV loadAll cache (%d models)", modelCount)
+	log.InfoContext(ctx, "Step 1/2: resetting ModelKV loadAll cache (%d models)", modelCount)
 	ResetAllModelKVLoadCache()
 
-	// 2. 清空所有 KV 缓存（本地 + Redis），清除已删除记录的残留字段
-	log.InfoContext(ctx, "Step 2/3: clearing all KV caches (%d caches)", kvCount)
-	clearStart := time.Now()
-	if err := ClearAllKV(ctx); err != nil {
-		log.WarnContext(ctx, "Step 2/3: clear all completed with errors (took %v): %v", time.Since(clearStart), err)
+	// 2. 原子替换所有 KV 缓存：先从 DB 加载新数据，再 Lua 原子替换 Redis（DEL+HSET+EXPIRE），
+	//    替换本地缓存，广播 clear 通知其他节点从 Redis 重新加载
+	log.InfoContext(ctx, "Step 2/2: refresh-and-swap all KV caches (%d caches)", kvCount)
+	swapStart := time.Now()
+	if err := RefreshAndSwapAllKV(ctx); err != nil {
+		log.WarnContext(ctx, "Step 2/2: refresh-and-swap completed with errors (took %v): %v", time.Since(swapStart), err)
 	} else {
-		log.InfoContext(ctx, "Step 2/3: clear all completed successfully (took %v)", time.Since(clearStart))
-	}
-
-	// 3. 从数据源重新加载全量数据，写回本地 + Redis
-	log.InfoContext(ctx, "Step 3/3: refreshing all KV caches from source (%d caches)", kvCount)
-	refreshStart := time.Now()
-	if err := RefreshAllKV(ctx); err != nil {
-		log.WarnContext(ctx, "Step 3/3: refresh all completed with errors (took %v): %v", time.Since(refreshStart), err)
-	} else {
-		log.InfoContext(ctx, "Step 3/3: refresh all completed successfully (took %v)", time.Since(refreshStart))
+		log.InfoContext(ctx, "Step 2/2: refresh-and-swap completed successfully (took %v)", time.Since(swapStart))
 	}
 
 	log.InfoContext(ctx, "KV cache warmup finished (total %v)", time.Since(totalStart))
@@ -993,6 +1069,13 @@ func ClearAllKV(ctx context.Context) error {
 // 适用于服务启动时预热缓存，通常在 ClearAllKV 之后调用以确保缓存与数据库一致
 func RefreshAllKV(ctx context.Context) error {
 	return applyAllKV(ctx, "Refresh", func(c kvNamedCache) error { return c.Refresh(ctx) })
+}
+
+// RefreshAndSwapAllKV 原子刷新所有已注册 KV 缓存（先加载 → Lua 原子替换 Redis → 替换本地 → 广播）
+// 并发执行各缓存的 RefreshAndSwap 操作，返回首个错误（不中断其余缓存）
+// 适用于启动预热（WarmupAllKV 调用），消除 Clear→Refresh 空窗期
+func RefreshAndSwapAllKV(ctx context.Context) error {
+	return applyAllKV(ctx, "RefreshAndSwap", func(c kvNamedCache) error { return c.RefreshAndSwap(ctx) })
 }
 
 // snapshotKVCaches 快照所有已注册 KV 缓存（读锁内完成，释放后并发执行）

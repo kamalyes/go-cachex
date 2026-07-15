@@ -12,11 +12,13 @@ package cachex
 import (
 	"context"
 	"fmt"
-	"github.com/redis/go-redis/v9"
-	"github.com/stretchr/testify/assert"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/assert"
 )
 
 // TestIDGenerator_NilClient 测试当Redis客户端为nil时的行为
@@ -370,8 +372,10 @@ func TestIDGenerator_NoReset_ContinuousIncrement(t *testing.T) {
 // TestIDGenerator_DistributedProtection 测试分布式环境下的并发保护
 func TestIDGenerator_DistributedProtection(t *testing.T) {
 	ctx := context.Background()
-	clientA := setupRedisClient(t)
-	clientB := setupRedisClient(t)
+	// 分布式测试需要两个客户端共享同一个 Redis 实例
+	mr := miniredis.RunT(t)
+	clientA := redis.NewClient(&redis.Options{Addr: mr.Addr(), DisableIdentity: true})
+	clientB := redis.NewClient(&redis.Options{Addr: mr.Addr(), DisableIdentity: true})
 	defer clientA.Close()
 	defer clientB.Close()
 

@@ -20,7 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1057,29 +1056,11 @@ func TestCacheWrapper_ConcurrentAccess(t *testing.T) {
 
 // BenchmarkCacheWrapper_Performance 性能基准测试
 func BenchmarkCacheWrapper_Performance(b *testing.B) {
-	client := redis.NewClient(&redis.Options{
-		Addr:            "120.79.25.168:16389",
-		Password:        "M5Pi9YW6u",
-		DB:              1,
-		DialTimeout:     10 * time.Second, // 增加拨号超时
-		ReadTimeout:     5 * time.Second,  // 增加读超时
-		WriteTimeout:    5 * time.Second,  // 增加写超时
-		PoolTimeout:     10 * time.Second, // 增加池超时
-		PoolSize:        10,               // 恢复正常连接池大小
-		MinIdleConns:    2,                // 最小空闲连接
-		MaxRetries:      3,                // 增加重试次数
-		DisableIdentity: true,
-	})
+	// 使用 miniredis 本地内存 Redis，无需外部服务
+	client := setupRedisClient(b)
+	defer client.Close()
 
 	ctx := context.Background()
-	// 测试连接 - 使用Set/Get测试而不是Ping
-	testKey := fmt.Sprintf("bench_test_conn_%d", time.Now().UnixNano())
-	if err := client.Set(ctx, testKey, "test", time.Second).Err(); err != nil {
-		b.Skipf("Redis不可用，跳过基准测试: %v", err)
-		return
-	}
-	client.Del(ctx, testKey) // 清理测试键
-	defer client.Close()
 
 	dataLoader := func(ctx context.Context) (string, error) {
 		return "benchmark_data", nil

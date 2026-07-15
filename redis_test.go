@@ -17,31 +17,17 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // 测试Redis GetOrCompute的分布式锁机制
 func TestRedisGetOrComputeDistributedLock(t *testing.T) {
-	// 创建Redis客户端
-	client := redis.NewClient(&redis.Options{
-		Addr:     "120.79.25.168:16389",
-		DB:       1, // 使用DB1进行测试
-		Password: "M5Pi9YW6u",
-		// 禁用身份设置以减少警告
-		DisableIdentity: true,
-	})
+	// 使用 miniredis 本地内存 Redis，无需外部服务
+	client := setupRedisClient(t)
+	defer client.Close()
 
-	// 测试连接
 	ctx := context.Background()
-	if err := client.Ping(ctx).Err(); err != nil {
-		t.Skipf("Redis不可用，跳过测试: %v", err)
-		return
-	}
-
-	// 清理测试数据
-	defer client.FlushDB(ctx)
 
 	// 创建Redis Handler
 	handler := &RedisHandler{
@@ -98,20 +84,11 @@ func TestRedisGetOrComputeDistributedLock(t *testing.T) {
 
 // 测试Redis GetOrCompute的基本功能
 func TestRedisGetOrComputeBasic(t *testing.T) {
-	// 创建Redis客户端
-	client := redis.NewClient(&redis.Options{
-		Addr:     "120.79.25.168:16389",
-		DB:       1, // 使用DB1进行测试
-		Password: "M5Pi9YW6u",
-	})
+	// 使用 miniredis 本地内存 Redis，无需外部服务
+	client := setupRedisClient(t)
+	defer client.Close()
 
 	ctx := context.Background()
-	if err := client.Ping(ctx).Err(); err != nil {
-		t.Skipf("Redis不可用，跳过测试: %v", err)
-		return
-	}
-
-	defer client.FlushDB(ctx)
 
 	handler := &RedisHandler{
 		redis: client,
@@ -158,23 +135,10 @@ func TestRedisGetOrComputeBasic(t *testing.T) {
 
 // 测试使用推荐配置的Redis Handler
 func TestRedisHandlerWithRecommendedConfig(t *testing.T) {
-	// 使用推荐配置创建Handler
-	handler, err := NewRedisHandlerSimple("120.79.25.168:16389", "M5Pi9YW6u", 1)
-	if err != nil {
-		t.Fatalf("创建Redis Handler失败: %v", err)
-	}
-
-	// 转换为具体类型以测试连接
-	redisHandler := handler.(*RedisHandler)
-
-	ctx := context.Background()
-	if err := redisHandler.redis.Ping(ctx).Err(); err != nil {
-		t.Skipf("Redis不可用，跳过测试: %v", err)
-		return
-	}
-
-	// 清理测试数据
-	defer redisHandler.redis.FlushDB(ctx)
+	// 使用 miniredis 本地内存 Redis，无需外部服务
+	mr := miniredis.RunT(t)
+	handler, err := NewRedisHandlerSimple(mr.Addr(), "", 0)
+	require.NoError(t, err)
 
 	// 测试基本操作
 	testKey := []byte("test-recommended-config")

@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1440,6 +1441,12 @@ func TestRefreshAllKV_EmptyRegistry(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestRefreshAndSwapAllKV_EmptyRegistry(t *testing.T) {
+	resetKVRegistry()
+	err := RefreshAndSwapAllKV(context.Background())
+	require.NoError(t, err)
+}
+
 func TestWarmupAllKV_EmptyRegistry(t *testing.T) {
 	resetKVRegistry()
 	ResetModelKVRegistry()
@@ -1599,6 +1606,121 @@ func TestRefreshAllKV_PartialFailure(t *testing.T) {
 }
 
 // ============================================================
+// RefreshAndSwap 测试（依赖 Redis）
+// ============================================================
+
+// TestRefreshAndSwap_AtomicReplace 验证 RefreshAndSwap 原子替换：
+//   - 旧 key 被清除（stale_key 不存在于 loader，应从 Redis 消失）
+//   - 新 key 被写入
+//   - 旧 key 的值被刷新为 loader 最新值
+func TestRefreshAndSwap_AtomicReplace(t *testing.T) {
+	ctx, cleanup := setupWarmupTest(t)
+	defer cleanup()
+
+	var callCount int64
+	RegisterKV[string, string]("swap-atomic",
+		kvLoader(map[string]string{"a": "NEW", "b": "2"}, &callCount),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+
+	c := MustGetKV[string, string]("swap-atomic")
+
+	// 先写入陈旧数据：a=OLD（将被刷新）和 stale_key（应被删除）
+	require.NoError(t, c.Set(ctx, "a", "OLD"))
+	require.NoError(t, c.Set(ctx, "stale_key", "should_be_removed"))
+
+	// 执行 RefreshAndSwap
+	require.NoError(t, c.RefreshAndSwap(ctx))
+
+	// loader 被调用一次
+	assert.Equal(t, int64(1), atomic.LoadInt64(&callCount))
+
+	// "a" 应为 loader 的新值
+	v, ok, err := c.Get(ctx, "a")
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "NEW", v)
+
+	// "b" 应存在
+	v, ok, err = c.Get(ctx, "b")
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "2", v)
+
+	// "stale_key" 应从 Redis 消失（Lua 脚本 DEL 了整个 Hash）
+	redisKey := "kv:swap-atomic"
+	exists, err := globalRedisClient.HExists(ctx, redisKey, "stale_key").Result()
+	require.NoError(t, err)
+	assert.False(t, exists, "stale_key should be removed from Redis by atomic DEL+HSET")
+}
+
+// TestRefreshAndSwap_EmptyDataClearsRedis 验证 loader 返回空数据时 RefreshAndSwap 清空 Redis
+func TestRefreshAndSwap_EmptyDataClearsRedis(t *testing.T) {
+	ctx, cleanup := setupWarmupTest(t)
+	defer cleanup()
+
+	// loader 返回空 map
+	RegisterKV("swap-empty",
+		kvLoader(map[string]string{}, nil),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+
+	c := MustGetKV[string, string]("swap-empty")
+
+	// 先写入数据
+	require.NoError(t, c.Set(ctx, "k1", "v1"))
+	require.NoError(t, c.Set(ctx, "k2", "v2"))
+
+	// 执行 RefreshAndSwap（loader 返回空）
+	require.NoError(t, c.RefreshAndSwap(ctx))
+
+	// 本地缓存应为空
+	assert.Equal(t, 0, c.Size())
+
+	// Redis Hash 应被删除（DEL 后没有 HSET，键不存在）
+	redisKey := "kv:swap-empty"
+	cnt, err := globalRedisClient.Exists(ctx, redisKey).Result()
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), cnt, "Redis Hash should be deleted when loader returns empty data")
+}
+
+// TestRefreshAndSwap_NoLoaderReturnsError 验证无 loader 时 RefreshAndSwap 返回错误
+func TestRefreshAndSwap_NoLoaderReturnsError(t *testing.T) {
+	ctx, cleanup := setupWarmupTest(t)
+	defer cleanup()
+
+	RegisterKV[string, string]("swap-no-loader",
+		nil,
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+
+	c := MustGetKV[string, string]("swap-no-loader")
+	err := c.RefreshAndSwap(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no loader")
+}
+
+// TestRefreshAndSwapAllKV_PartialFailure 验证 RefreshAndSwapAllKV 部分失败不中断其余缓存
+func TestRefreshAndSwapAllKV_PartialFailure(t *testing.T) {
+	ctx, cleanup := setupWarmupTest(t)
+	defer cleanup()
+
+	var okCalls int64
+	RegisterKV[string, string]("swap-partial-ok",
+		kvLoader(map[string]string{"k": "v"}, &okCalls),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+	RegisterKV[string, string]("swap-partial-err",
+		kvErrorLoader[string, string](),
+		WithKVNamespace("kv"), WithKVTTL(time.Minute), WithKVAutoRefresh(false))
+
+	// RefreshAndSwapAllKV 应返回错误（来自 err loader），但不中断 ok 缓存
+	err := RefreshAndSwapAllKV(ctx)
+	require.Error(t, err)
+
+	// ok 缓存仍然成功加载
+	assert.Equal(t, int64(1), atomic.LoadInt64(&okCalls))
+	okCache := MustGetKV[string, string]("swap-partial-ok")
+	assert.Equal(t, 1, okCache.Size())
+}
+
+// ============================================================
 // WarmupAllKV 完整流程测试（依赖 Redis）
 // ============================================================
 
@@ -1638,9 +1760,9 @@ func TestWarmupAllKV_FullFlow(t *testing.T) {
 	assert.True(t, ok)
 	assert.Equal(t, "2", v)
 
-	// 验证 "stale_key" 已被清除（Clear 删除了整个 Hash，Refresh 只写 loader 数据）
+	// 验证 "stale_key" 已被清除（RefreshAndSwap 的 Lua 脚本 DEL 了整个 Hash，只写 loader 数据）
 	_, ok, _ = c1.Get(ctx, "stale_key")
-	assert.False(t, ok, "stale key should be removed after WarmupAllKV (Clear + Refresh)")
+	assert.False(t, ok, "stale key should be removed after WarmupAllKV (RefreshAndSwap)")
 }
 
 func TestWarmupAllKV_RemovesStaleEntries(t *testing.T) {
@@ -1763,36 +1885,36 @@ func TestWarmupAllKV_ConcurrentSafe(t *testing.T) {
 	cache := MustGetKV[string, string]("warmup-race")
 
 	// 并发：1 个 goroutine 执行 WarmupAllKV，3 个 goroutine 并发读
+	var wg sync.WaitGroup
+	wg.Add(4)
 	done := make(chan struct{})
-	var wg atomic.Int64
-	wg.Store(4)
 
 	// writer：执行 WarmupAllKV
 	go func() {
-		defer func() { wg.Add(-1) }()
+		defer wg.Done()
 		_ = WarmupAllKV(ctx)
 	}()
 
 	// readers：并发读缓存
 	for i := 0; i < 3; i++ {
 		go func() {
-			defer func() { wg.Add(-1) }()
+			defer wg.Done()
 			for j := 0; j < 100; j++ {
 				_, _, _ = cache.Get(ctx, "k1")
 			}
 		}()
 	}
 
-	// 等待全部完成
-	for {
-		if wg.Load() == 0 {
-			break
-		}
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("concurrent test timed out")
-		}
+	// 等待全部完成，超时保护
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent test timed out")
 	}
 }
 

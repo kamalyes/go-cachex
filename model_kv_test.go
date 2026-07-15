@@ -93,7 +93,7 @@ func (testModelCompositePK) TableName() string { return "test_composite_pk" }
 // newSchemaOnlyDB 创建仅用于 schema 解析的最小 gorm.DB（无真实连接）
 //
 // parseSchema 只调用 schema.Parse(m, cache, db.NamingStrategy)，
-// 不需要真实 DB 连接，NamingStrategy 足够。
+// 不需要真实 DB 连接，NamingStrategy 足够
 func newSchemaOnlyDB() *gorm.DB {
 	return &gorm.DB{Config: &gorm.Config{NamingStrategy: schema.NamingStrategy{}}}
 }
@@ -105,13 +105,10 @@ func resetKVRegistry() {
 	kvRegistry = make(map[string]any)
 }
 
-// setupModelKVTest 初始化全局 Redis（若不可用则跳过），并重置注册表
+// setupModelKVTest 初始化全局 miniredis，并重置注册表
 func setupModelKVTest(t *testing.T) *redis.Client {
 	t.Helper()
 	client := setupRedisClient(t)
-	if client == nil {
-		t.Skip("Redis 不可用，跳过依赖 Redis 的 ModelKV 测试")
-	}
 	SetGlobalRedisClient(client)
 	ResetModelKVRegistry()
 	resetKVRegistry()
@@ -193,7 +190,7 @@ func TestParseSchema_CompositePrimaryKey(t *testing.T) {
 	require.NoError(t, err)
 
 	// 复合主键：gorm 的 PrioritizedPrimaryField 为 nil（仅单主键时才有），
-	// PrimaryFields 包含全部主键字段。此时自动识别不可用，业务必须显式 KeyField。
+	// PrimaryFields 包含全部主键字段此时自动识别不可用，业务必须显式 KeyField
 	assert.Nil(t, s.PrioritizedPrimaryField)
 	assert.Len(t, s.PrimaryFields, 2)
 }
