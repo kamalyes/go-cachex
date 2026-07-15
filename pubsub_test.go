@@ -228,15 +228,22 @@ func TestPubSub_JSONMessages(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
-	for i, expected := range testData {
+	// PubSub 不保证消息顺序，收集所有消息后按集合比较
+	receivedSet := make(map[int]TestData, len(testData))
+	for i := range testData {
 		select {
 		case receivedData := <-received:
-			assert.Equal(t, expected.ID, receivedData.ID, "消息%d的ID应该匹配", i+1)
-			assert.Equal(t, expected.Message, receivedData.Message, "消息%d的内容应该匹配", i+1)
-			assert.Equal(t, expected.Time, receivedData.Time, "消息%d的时间应该匹配", i+1)
+			receivedSet[receivedData.ID] = receivedData
 		case <-time.After(time.Second * 2):
-			t.Fatalf("等待消息%d超时", i+1)
+			t.Fatalf("等待消息%d超时（已收到 %d 条）", i+1, len(receivedSet))
 		}
+	}
+
+	for _, expected := range testData {
+		got, ok := receivedSet[expected.ID]
+		assert.True(t, ok, "应该收到消息 ID=%d", expected.ID)
+		assert.Equal(t, expected.Message, got.Message, "消息 ID=%d 的内容应该匹配", expected.ID)
+		assert.Equal(t, expected.Time, got.Time, "消息 ID=%d 的时间应该匹配", expected.ID)
 	}
 }
 
