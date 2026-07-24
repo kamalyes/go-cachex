@@ -57,6 +57,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
 )
@@ -525,6 +526,87 @@ func (c *ModelKVCache[M]) GetFieldMany(ctx context.Context, fieldName string, ke
 		return v
 	}
 	return nil
+}
+
+// GetFieldsMany 批量读取 model 多个字段的 KV 缓存，用 Redis Pipeline 合并 N 个字段的 HMGet 为 1 次网络往返
+// 返回 map[key]map[fieldName]string 嵌套结构（未命中字段不出现在内层 map 中）
+//
+// 性能：N 个字段 × M 个 key → 1 次 Pipeline（N 个 HMGet 命令），而非 N 次 HMGet 网络往返
+// 适用场景：列表查询需同时回显多个字段（如 Name + Code + GameType + IconUrl）
+//
+// 注意：此方法跳过单字段的 localCache 读和 BatchLoader 回源，仅从 Redis 读取
+//   - 单字段场景自动降级为 GetFieldMany，保留三层兜底
+//   - 多字段场景 miss 的 key 不回源，需调用方自行处理空值
+func (c *ModelKVCache[M]) GetFieldsMany(ctx context.Context, fieldNames, keys []string) map[string]map[string]string {
+	if c == nil || len(keys) == 0 || len(fieldNames) == 0 {
+		return nil
+	}
+
+	// 解析有效字段
+	type fieldEntry struct {
+		name string
+		kv   *KVCache[string, string]
+	}
+	fields := make([]fieldEntry, 0, len(fieldNames))
+	for _, fn := range fieldNames {
+		if idx, ok := c.fieldIndex[fn]; ok {
+			fields = append(fields, fieldEntry{fn, c.fieldKVs[idx].kv})
+		}
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+
+	// 单字段走 GetFieldMany 保留 localCache + BatchLoader 兜底
+	if len(fields) == 1 {
+		single := c.GetFieldMany(ctx, fields[0].name, keys)
+		if single == nil {
+			return nil
+		}
+		result := make(map[string]map[string]string, len(single))
+		for k, v := range single {
+			inner := make(map[string]string, 1)
+			inner[fields[0].name] = v
+			result[k] = inner
+		}
+		return result
+	}
+
+	// 多字段：Pipeline 批量 HMGet，N 次 RTT → 1 次
+	client := fields[0].kv.Client()
+	pipe := client.Pipeline()
+	cmds := make([]*redis.SliceCmd, len(fields))
+	for i, f := range fields {
+		cmds[i] = f.kv.GetManyToPipe(pipe, keys)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+		return nil
+	}
+
+	// 解析结果：vals[j] 对应 keys[j]
+	result := make(map[string]map[string]string, len(keys))
+	for i, f := range fields {
+		vals, err := cmds[i].Result()
+		if err != nil && err != redis.Nil {
+			continue
+		}
+		for j, val := range vals {
+			if j >= len(keys) {
+				break
+			}
+			s, ok := val.(string)
+			if !ok || s == "" {
+				continue
+			}
+			inner := result[keys[j]]
+			if inner == nil {
+				inner = make(map[string]string, len(fields))
+				result[keys[j]] = inner
+			}
+			inner[f.name] = s
+		}
+	}
+	return result
 }
 
 // ResetLoadCache 重置共享 loadAll 缓存，下次 loadAll 强制从 DB 查询

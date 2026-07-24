@@ -589,6 +589,23 @@ func (c *KVCache[K, V]) SetMany(ctx context.Context, items map[K]V) error {
 // Client 返回底层 Redis 客户端，供上层组件（如 ModelKVCache）构建 Pipeline 批量写入
 func (c *KVCache[K, V]) Client() *redis.Client { return c.client }
 
+// GetManyToPipe 将 HMGet 命令追加到给定 pipeline（不立即执行），返回 *redis.SliceCmd 供 Exec 后读取
+// 调用方负责执行 pipeline（pipe.Exec）与解析结果
+//
+// 与 GetMany 的差异：跳过本地缓存读和 BatchLoader 回源，仅从 Redis 读取
+// 适用于多字段 Pipeline 聚合场景（ModelKVCache.GetFieldsMany），将 N 个字段的 HMGet 合并为 1 次 RTT
+// 代价：不回填本地缓存、不支持 miss 回源；单字段场景应优先用 GetMany 保留三层兜底
+func (c *KVCache[K, V]) GetManyToPipe(pipe redis.Pipeliner, keys []K) *redis.SliceCmd {
+	if len(keys) == 0 {
+		return nil
+	}
+	fields := make([]string, len(keys))
+	for i, k := range keys {
+		fields[i] = convert.MustString(k)
+	}
+	return pipe.HMGet(context.Background(), c.redisKey(), fields...)
+}
+
 // SetToPipe 将 HSET+TTL（Lua 原子脚本）命令追加到给定 pipeline（不立即执行），同时写本地缓存
 // 调用方负责执行 pipeline（pipe.Exec）与广播失效，避免多字段场景下 N 次 RTT
 func (c *KVCache[K, V]) SetToPipe(pipe redis.Pipeliner, key K, value V) error {
