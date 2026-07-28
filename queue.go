@@ -3,7 +3,7 @@
  * @Date: 2025-11-19 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
  * @LastEditTime: 2025-12-21 15:35:16
- * @FilePath: \engine-im-service\go-cachex\queue.go
+ * @FilePath: \go-cachex\queue.go
  * @Description: Redis队列实现，支持FIFO、优先级队列等多种队列类型
  *
  * Copyright (c) 2025 by kamalyes, All Rights Reserved.
@@ -245,9 +245,7 @@ func (q *QueueHandler) processDelayedQueue(ctx context.Context, queueName string
 
 // BatchDequeue 批量出队
 func (q *QueueHandler) BatchDequeue(ctx context.Context, queueName string, queueType QueueType, count int) ([]*QueueItem, error) {
-	if count <= 0 {
-		count = q.config.BatchSize
-	}
+	count = mathx.IfLeZero(count, q.config.BatchSize)
 
 	queueKey := q.getQueueKey(queueName, queueType)
 
@@ -347,9 +345,7 @@ func (q *QueueHandler) Length(ctx context.Context, queueName string, queueType Q
 
 // Peek 查看队列头部元素（不移除）
 func (q *QueueHandler) Peek(ctx context.Context, queueName string, queueType QueueType, count int) ([]*QueueItem, error) {
-	if count <= 0 {
-		count = 1
-	}
+	count = mathx.IfLeZero(count, 1)
 
 	queueKey := q.getQueueKey(queueName, queueType)
 	var result []string

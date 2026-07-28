@@ -44,7 +44,7 @@ const DefaultMaxEntries = 10000
 
 // NewLRUHandler 创建一个新的 LRUHandler，maxEntries<=0 时使用默认容量
 func NewLRUHandler(maxEntries int) *LRUHandler {
-	maxEntries = mathx.IF(maxEntries > 0, maxEntries, DefaultMaxEntries)
+	maxEntries = mathx.IfLeZero(maxEntries, DefaultMaxEntries)
 
 	return &LRUHandler{
 		maxEntries: maxEntries,

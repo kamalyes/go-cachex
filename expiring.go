@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/kamalyes/go-toolbox/pkg/syncx"
 )
 
@@ -36,9 +37,7 @@ type expItem struct {
 
 // NewExpiringHandler 创建一个新的 ExpiringHandler，cleanupInterval 控制后台清理频率（为0则使用1s）
 func NewExpiringHandler(cleanupInterval time.Duration) *ExpiringHandler {
-	if cleanupInterval <= 0 {
-		cleanupInterval = time.Second
-	}
+	cleanupInterval = mathx.IfLeZero(cleanupInterval, time.Second)
 	h := &ExpiringHandler{
 		items:  make(map[string]expItem),
 		ticker: time.NewTicker(cleanupInterval),

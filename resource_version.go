@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -33,9 +34,7 @@ type VersionTracker struct {
 // NewVersionTracker 创建版本追踪器
 // prefix 为版本键的前缀，建议使用业务模块名，如 "product:"、"payment:"
 func NewVersionTracker(redisClient redis.UniversalClient, prefix string) *VersionTracker {
-	if prefix == "" {
-		prefix = "cachex:version:"
-	}
+	prefix = mathx.IfNotEmpty(prefix, "cachex:version:")
 	return &VersionTracker{
 		redisClient: redisClient,
 		prefix:      prefix,

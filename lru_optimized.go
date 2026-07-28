@@ -26,6 +26,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/kamalyes/go-toolbox/pkg/syncx"
 )
 
@@ -132,9 +133,7 @@ type singleLoadCall struct {
 
 // NewLRUOptimizedHandler 创建分片式高性能LRU缓存
 func NewLRUOptimizedHandler(maxEntries int) *LRUOptimizedHandler {
-	if maxEntries <= 0 {
-		maxEntries = defaultShardCapacity * defaultShardCount
-	}
+	maxEntries = mathx.IfLeZero(maxEntries, defaultShardCapacity*defaultShardCount)
 
 	// 计算分片数量，确保是2的幂次方
 	shardCount := defaultShardCount

@@ -146,6 +146,7 @@ type DurableChannel[T any] struct {
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
 	closed      atomic.Bool
+	mu          sync.RWMutex      // 保护 memChan 的关闭与发送（Close 写锁，Send 读锁）
 	logger      logger.ILogger    // 日志记录器
 	persistPool *syncx.WorkerPool // 持久化池（用于 PersistAsync 异步持久化）
 }
@@ -259,16 +260,25 @@ func (dc *DurableChannel[T]) Send(ctx context.Context, data T) error {
 
 	case PersistAsync:
 		// 异步模式：先写内存，异步持久化
+		// 使用 RLock 保护 memChan，防止与 Close 的 close(memChan) 竞争
+		dc.mu.RLock()
+		if dc.closed.Load() {
+			dc.mu.RUnlock()
+			return ErrChannelClosed
+		}
 		select {
 		case dc.memChan <- data:
+			dc.mu.RUnlock()
 			// 使用 WorkerPool 异步持久化（避免无限创建 goroutine）
 			dc.persistPool.SubmitNonBlocking(func() {
 				dc.persistToRedis(ctx, data)
 			})
 			return nil
 		case <-dc.ctx.Done():
+			dc.mu.RUnlock()
 			return ErrChannelClosed
 		case <-ctx.Done():
+			dc.mu.RUnlock()
 			return ctx.Err()
 		}
 
@@ -278,7 +288,9 @@ func (dc *DurableChannel[T]) Send(ctx context.Context, data T) error {
 			return err
 		}
 
-		// 再次检查是否已关闭（避免在 persistToRedis 期间被关闭）
+		// 使用 RLock 保护 memChan，防止与 Close 的 close(memChan) 竞争
+		dc.mu.RLock()
+		defer dc.mu.RUnlock()
 		if dc.closed.Load() {
 			return ErrChannelClosed
 		}
@@ -374,8 +386,11 @@ func (dc *DurableChannel[T]) Close() error {
 		dc.persistPool.Close()
 	}
 
-	// 关闭内存 channel
+	// 获取写锁后关闭内存 channel，确保不会有 Send 正在访问 memChan
+	// dc.cancel() 已唤醒所有阻塞在 ctx.Done 的 Send，此处等待它们释放 RLock
+	dc.mu.Lock()
 	close(dc.memChan)
+	dc.mu.Unlock()
 
 	return nil
 }

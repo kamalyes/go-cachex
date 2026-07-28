@@ -426,9 +426,7 @@ func (q *DelayQueue[T]) GetTask(ctx context.Context, queueName, key string) (*De
 
 // GetDeadTasks 获取死信队列任务列表（分页）
 func (q *DelayQueue[T]) GetDeadTasks(ctx context.Context, queueName string, offset, limit int64) ([]*DelayTask[T], error) {
-	if limit <= 0 {
-		limit = 50
-	}
+	limit = mathx.IfLeZero(limit, 50)
 	result, err := q.client.LRange(ctx, q.deadKey(queueName), offset, offset+limit-1).Result()
 	if err != nil {
 		return nil, err

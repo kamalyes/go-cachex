@@ -18,6 +18,7 @@ import (
 	"hash/fnv"
 	"time"
 
+	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/kamalyes/go-toolbox/pkg/syncx"
 )
 
@@ -30,9 +31,7 @@ type ShardedHandler struct {
 
 // NewShardedHandler 使用 factory 创建 shards 个 Handler
 func NewShardedHandler(factory func() Handler, shards int) *ShardedHandler {
-	if shards <= 0 {
-		shards = 16
-	}
+	shards = mathx.IfLeZero(shards, 16)
 	s := make([]Handler, shards)
 	for i := 0; i < shards; i++ {
 		s[i] = factory()

@@ -303,12 +303,16 @@ func (m *ObjectPoolManager[T]) Start(ctx context.Context) error {
 	// 冷启动同步预生成，保证启动后即有对象可用
 	m.fill(m.config.ColdStartCount)
 
-	// 异步补齐到目标容量（不阻塞调用方）
-	syncx.Go(ctx).OnPanic(func(r interface{}) {
-		m.logger.Errorf("object pool %q async prefill panic: %v", m.name, r)
-	}).Exec(func() {
-		m.fill(m.config.Capacity)
-	})
+	// 异步补齐剩余缺口（不阻塞调用方）
+	// 只生成 Capacity - ColdStartCount 个对象，而非整个 Capacity
+	// 避免与并发 TryGet 叠加导致超发（总生成数超过 Capacity）
+	if deficit := m.config.Capacity - m.config.ColdStartCount; deficit > 0 {
+		syncx.Go(ctx).OnPanic(func(r interface{}) {
+			m.logger.Errorf("object pool %q async prefill panic: %v", m.name, r)
+		}).Exec(func() {
+			m.fill(deficit)
+		})
+	}
 
 	// 注册周期补充任务（防重叠执行）
 	refillTask := syncx.NewPeriodicTask(

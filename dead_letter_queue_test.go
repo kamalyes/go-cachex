@@ -14,6 +14,7 @@ package cachex
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -234,10 +235,13 @@ func TestDeadLetterQueue_AlertCallback(t *testing.T) {
 
 	// 设置预警回调
 	var alertCount atomic.Int32
+	var mu sync.Mutex
 	var lastEvent AlertEvent
 	dlq.SetAlertCallback(func(event AlertEvent) {
 		alertCount.Add(1)
+		mu.Lock()
 		lastEvent = event
+		mu.Unlock()
 	})
 
 	// 推送数据触发警告阈值（60% = 6）
@@ -256,9 +260,12 @@ func TestDeadLetterQueue_AlertCallback(t *testing.T) {
 
 	// 验证触发了预警
 	assert.Greater(t, alertCount.Load(), int32(0))
-	assert.Equal(t, AlertLevelWarning, lastEvent.Level)
-	assert.Equal(t, testQueueKeyTest, lastEvent.QueueKey)
-	assert.Equal(t, int64(6), lastEvent.Length)
+	mu.Lock()
+	event := lastEvent
+	mu.Unlock()
+	assert.Equal(t, AlertLevelWarning, event.Level)
+	assert.Equal(t, testQueueKeyTest, event.QueueKey)
+	assert.Equal(t, int64(6), event.Length)
 }
 
 func TestDeadLetterQueue_SetAlertThresholds(t *testing.T) {
@@ -270,9 +277,12 @@ func TestDeadLetterQueue_SetAlertThresholds(t *testing.T) {
 	// 设置自定义阈值
 	dlq.SetAlertThresholds(0.5, 0.7, 0.9)
 
+	var mu sync.Mutex
 	var alertLevel AlertLevel
 	dlq.SetAlertCallback(func(event AlertEvent) {
+		mu.Lock()
 		alertLevel = event.Level
+		mu.Unlock()
 	})
 
 	// 推送数据触发警告阈值（50% = 5）
@@ -287,7 +297,10 @@ func TestDeadLetterQueue_SetAlertThresholds(t *testing.T) {
 	}
 
 	time.Sleep(100 * time.Millisecond)
-	assert.Equal(t, AlertLevelWarning, alertLevel)
+	mu.Lock()
+	level := alertLevel
+	mu.Unlock()
+	assert.Equal(t, AlertLevelWarning, level)
 }
 
 func TestDeadLetterQueue_MultipleQueues(t *testing.T) {

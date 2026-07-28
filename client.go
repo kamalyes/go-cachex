@@ -28,6 +28,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -81,10 +82,7 @@ func NewClient(ctx context.Context, cfg *ClientConfig) (*Client, error) {
 		}
 		h = NewLRUOptimizedHandler(cfg.Capacity)
 	case CacheExpiring:
-		interval := cfg.CleanupInterval
-		if interval <= 0 {
-			interval = time.Minute
-		}
+		interval := mathx.IfLeZero(cfg.CleanupInterval, time.Minute)
 		h = NewExpiringHandler(interval)
 	case CacheRistretto:
 		h, err = NewRistrettoHandler(cfg.RistrettoConfig)
