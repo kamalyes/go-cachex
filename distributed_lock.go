@@ -53,12 +53,58 @@ type DistributedLock struct {
 	stopChan   chan struct{}  // 停止看门狗的通道
 	mu         sync.Mutex     // 保护锁状态的互斥锁
 	logger     logger.ILogger // 日志记录器
+
+	// 续期钩子（watchdog 周期性续期时调用）
+	// onBeforeExtend: IsLocked 成功后、Extend 调用前执行，可用于续期前置检查、指标采集
+	// onAfterExtend:  Extend 完成后执行（err 为 Extend 返回错误，nil 表示成功），可用于续期结果监控
+	onBeforeExtend func(ctx context.Context)
+	onAfterExtend  func(ctx context.Context, err error)
 }
 
 // WithLogger 设置日志记录器
 func (c *DistributedLock) WithLogger(logger logger.ILogger) *DistributedLock {
 	c.logger = logger
 	return c
+}
+
+// OnBeforeExtend 设置续期前置钩子
+// watchdog 在 IsLocked 确认锁仍有效后、Extend 调用前执行
+// 可用于续期前置检查、监控指标采集、自定义逻辑注入
+func (l *DistributedLock) OnBeforeExtend(fn func(ctx context.Context)) *DistributedLock {
+	l.onBeforeExtend = fn
+	return l
+}
+
+// OnAfterExtend 设置续期后置钩子
+// watchdog 在 Extend 完成后执行，err 为 Extend 的返回错误（nil 表示续期成功）
+// 可用于续期结果监控、告警、指标采集
+func (l *DistributedLock) OnAfterExtend(fn func(ctx context.Context, err error)) *DistributedLock {
+	l.onAfterExtend = fn
+	return l
+}
+
+// resetState 清理锁的本地状态并停止看门狗
+// 调用者必须已持有 l.mu
+// 用于 Unlock 所有权丢失、Extend 失败、IsLocked 检测到 token 不匹配等场景
+// 确保本地 acquired/token/expireTime 与 Redis 实际状态一致，避免下次 TryLock 误判
+func (l *DistributedLock) resetState() {
+	l.acquired = false
+	l.token = ""
+	l.expireTime = time.Time{}
+	l.stopWatchdogLocked()
+}
+
+// stopWatchdogLocked 停止看门狗 goroutine（调用者必须已持有 l.mu）
+// 通过发送信号让 watchdog 自然退出，不关闭 channel 避免与 watchdog 的 select 竞争
+func (l *DistributedLock) stopWatchdogLocked() {
+	if l.stopChan != nil {
+		select {
+		case l.stopChan <- struct{}{}:
+		default:
+			// channel 已满或已关闭，看门狗可能已退出
+		}
+		l.stopChan = nil
+	}
 }
 
 // NewDistributedLock 创建分布式锁
@@ -87,7 +133,15 @@ func (l *DistributedLock) TryLock(ctx context.Context) (bool, error) {
 	defer l.mu.Unlock()
 
 	if l.acquired {
-		return true, nil // 已经持有锁
+		// 本地认为已持有锁，但必须校验 Redis 中的实际状态
+		// 防止因上次 Unlock/Extend 所有权丢失未清理状态而误判（核心 bug 修复）
+		value, err := l.client.Get(ctx, l.key).Result()
+		if err == nil && value == l.token {
+			return true, nil // Redis 确认仍持有锁
+		}
+		// Redis 中锁已丢失或被他人持有，清理本地陈旧状态后继续尝试获取
+		l.logger.WarnContext(ctx, "local state indicates lock held but Redis disagrees for key %s, resetting", l.key)
+		l.resetState()
 	}
 
 	// 重新生成token确保每次获取锁都有唯一标识
@@ -96,14 +150,14 @@ func (l *DistributedLock) TryLock(ctx context.Context) (bool, error) {
 	// 使用SET命令的NX和EX选项原子性地设置锁
 	result, err := l.client.SetNX(ctx, l.key, l.token, l.config.TTL).Result()
 	if err != nil {
-		l.logger.Errorf("failed to acquire lock for key %s: %v", l.key, err)
+		l.logger.ErrorContext(ctx, "failed to acquire lock for key %s: %v", l.key, err)
 		return false, fmt.Errorf("failed to acquire lock: %w", err)
 	}
 
 	if result {
 		l.acquired = true
 		l.expireTime = time.Now().Add(l.config.TTL)
-		l.logger.Debugf("lock acquired for key %s, token: %s, ttl: %v", l.key, l.token, l.config.TTL)
+		l.logger.DebugContext(ctx, "lock acquired for key %s, token: %s, ttl: %v", l.key, l.token, l.config.TTL)
 
 		// 启动看门狗
 		if l.config.EnableWatchdog {
@@ -111,7 +165,7 @@ func (l *DistributedLock) TryLock(ctx context.Context) (bool, error) {
 			l.stopChan = make(chan struct{})
 			syncx.Go(ctx).
 				OnPanic(func(r interface{}) {
-					l.logger.Errorf("Panic in watchdog: %v", r)
+					l.logger.ErrorContext(ctx, "Panic in watchdog: %v", r)
 				}).
 				Exec(func() { l.watchdog(ctx) })
 		}
@@ -163,17 +217,6 @@ func (l *DistributedLock) Unlock(ctx context.Context) error {
 		return ErrLockNotFound
 	}
 
-	// 停止看门狗（只发送信号，不关闭 channel 避免竞争）
-	if l.config.EnableWatchdog && l.stopChan != nil {
-		select {
-		case l.stopChan <- struct{}{}:
-		default:
-			// channel 已满或已关闭，忽略
-		}
-		// 不关闭 channel，让 watchdog goroutine 自然退出
-		// 避免与 watchdog 的 select 语句产生竞争
-	}
-
 	// 使用Lua脚本确保只有持锁者能释放锁
 	script := `
 		if redis.call("GET", KEYS[1]) == ARGV[1] then
@@ -184,19 +227,28 @@ func (l *DistributedLock) Unlock(ctx context.Context) error {
 	`
 
 	result, err := l.client.Eval(ctx, script, []string{l.key}, l.token).Result()
+
+	// 无论结果如何都清理本地状态：
+	// - 成功释放：锁已不在 Redis，本地状态应重置
+	// - 所有权丢失（ErrLockNotOwned）：锁在 Redis 但不归当前实例，本地状态必须重置，
+	//   否则下次 TryLock 会因 acquired=true 误判（核心 bug 修复）
+	// - Eval 错误：锁状态不确定，清理本地状态更安全
+	l.resetState()
+
 	if err != nil {
+		l.logger.WarnContext(ctx, "failed to release lock for key %s: %v", l.key, err)
 		return fmt.Errorf("failed to release lock: %w", err)
 	}
 
-	// 检查是否成功释放
 	if result.(int64) == 1 {
-		l.acquired = false
-		l.logger.Debugf("lock released for key %s", l.key)
+		l.logger.DebugContext(ctx, "lock released for key %s", l.key)
 		return nil
 	}
 
-	l.logger.Warnf("failed to release lock for key %s: not owned by this instance", l.key)
-	return ErrLockNotOwned
+	l.logger.WarnContext(ctx, "failed to release lock for key %s: not owned by this instance", l.key)
+	// 返回 ErrLockNotFound 而非 ErrLockNotOwned：resetState 已清理本地状态，
+	// 从当前实例角度锁已不存在；上层调用者静默跳过 ErrLockNotFound 避免噪音日志
+	return ErrLockNotFound
 }
 
 // Extend 延长锁的TTL
@@ -214,28 +266,33 @@ func (l *DistributedLock) Extend(ctx context.Context, ttl time.Duration) error {
 	}
 
 	// 使用Lua脚本确保只有持锁者能延长TTL
+	// 使用 PEXPIRE（毫秒）避免 EXPIRE（秒）对 sub-second TTL 的截断
 	script := `
 		if redis.call("GET", KEYS[1]) == ARGV[1] then
-			return redis.call("EXPIRE", KEYS[1], ARGV[2])
+			return redis.call("PEXPIRE", KEYS[1], ARGV[2])
 		else
 			return 0
 		end
 	`
 
-	result, err := l.client.Eval(ctx, script, []string{l.key}, l.token, int64(ttl.Seconds())).Result()
+	result, err := l.client.Eval(ctx, script, []string{l.key}, l.token, ttl.Milliseconds()).Result()
 	if err != nil {
+		// Eval 错误（如 Redis 连接问题）时锁状态不确定，必须重置本地状态，
+		// 否则 acquired 仍为 true，后续 Unlock 会用过期 token 尝试释放，
+		// 导致 "lock not owned by this instance" 警告
+		l.resetState()
 		return fmt.Errorf("failed to extend lock: %w", err)
 	}
 
 	if result.(int64) == 1 {
 		l.expireTime = time.Now().Add(ttl)
-		l.logger.Debugf("lock extended for key %s, new ttl: %v", l.key, ttl)
+		l.logger.DebugContext(ctx, "lock extended for key %s, new ttl: %v", l.key, ttl)
 		return nil
 	}
 
-	// 延长失败，可能锁已经丢失
-	l.acquired = false
-	l.logger.Warnf("failed to extend lock for key %s: lock may have been lost", l.key)
+	// 延长失败，锁已丢失，清理完整本地状态（含 token/expireTime/看门狗）
+	l.logger.WarnContext(ctx, "failed to extend lock for key %s: lock may have been lost", l.key)
+	l.resetState()
 	return ErrLockNotOwned
 }
 
@@ -252,7 +309,8 @@ func (l *DistributedLock) IsLocked(ctx context.Context) (bool, error) {
 	value, err := l.client.Get(ctx, l.key).Result()
 	if err != nil {
 		if err == redis.Nil {
-			l.acquired = false
+			// Redis 中锁已不存在，清理本地状态
+			l.resetState()
 			return false, nil
 		}
 		return false, err
@@ -260,7 +318,8 @@ func (l *DistributedLock) IsLocked(ctx context.Context) (bool, error) {
 
 	// 检查令牌是否匹配
 	if value != l.token {
-		l.acquired = false
+		// 锁被他人持有或 token 不匹配，清理本地状态
+		l.resetState()
 		return false, nil
 	}
 
@@ -283,6 +342,15 @@ func (l *DistributedLock) TTL(ctx context.Context) (time.Duration, error) {
 
 // watchdog 看门狗，自动续期锁
 func (l *DistributedLock) watchdog(ctx context.Context) {
+	// 快照 stopChan（加锁），避免与 stopWatchdogLocked 写 l.stopChan 产生数据竞争
+	// select 中使用快照而非直接读 l.stopChan
+	l.mu.Lock()
+	stopChan := l.stopChan
+	l.mu.Unlock()
+	if stopChan == nil {
+		return
+	}
+
 	ticker := time.NewTicker(l.config.WatchdogInterval)
 	defer ticker.Stop()
 
@@ -304,22 +372,34 @@ func (l *DistributedLock) watchdog(ctx context.Context) {
 			locked, err := l.IsLocked(watchdogCtx)
 			if err != nil {
 				// 发生错误时继续尝试，不立即退出
-				l.logger.Warnf("watchdog failed to check lock status for key %s: %v", l.key, err)
+				l.logger.WarnContext(watchdogCtx, "watchdog failed to check lock status for key %s: %v", l.key, err)
 				continue
 			}
 			if !locked {
-				// 锁已丢失，退出看门狗
-				l.logger.Warnf("watchdog detected lock lost for key %s, stopping", l.key)
+				// 锁已丢失（IsLocked 内部已清理本地状态），退出看门狗
+				l.logger.WarnContext(watchdogCtx, "watchdog detected lock lost for key %s, stopping", l.key)
 				return
 			}
 
-			// 续期锁
-			if err := l.Extend(watchdogCtx, l.config.TTL); err != nil {
-				// 续期失败，继续尝试而不是立即退出
-				l.logger.Warnf("watchdog failed to extend lock for key %s: %v", l.key, err)
-				continue
+			// 续期前置钩子：IsLocked 确认锁仍有效后、Extend 调用前执行
+			if l.onBeforeExtend != nil {
+				l.onBeforeExtend(watchdogCtx)
 			}
-		case <-l.stopChan:
+
+			// 续期锁
+			extendErr := l.Extend(watchdogCtx, l.config.TTL)
+
+			// 续期后置钩子：Extend 完成后执行（无论成功失败）
+			if l.onAfterExtend != nil {
+				l.onAfterExtend(watchdogCtx, extendErr)
+			}
+
+			if extendErr != nil {
+				// 续期失败意味着锁已丢失（Extend 内部已清理本地状态），退出看门狗
+				l.logger.WarnContext(watchdogCtx, "watchdog failed to extend lock for key %s: %v, stopping", l.key, extendErr)
+				return
+			}
+		case <-stopChan:
 			return
 		case <-ctx.Done():
 			return
@@ -384,7 +464,7 @@ func (m *LockManager) ReleaseLock(ctx context.Context, key string) error {
 	lock, exists := m.locks[key]
 	if !exists {
 		m.mu.Unlock()
-		m.logger.Warnf("attempted to release non-existent lock: %s", key)
+		m.logger.WarnContext(ctx, "attempted to release non-existent lock: %s", key)
 		return ErrLockNotFound
 	}
 	delete(m.locks, key)
@@ -392,7 +472,7 @@ func (m *LockManager) ReleaseLock(ctx context.Context, key string) error {
 
 	err := lock.Unlock(ctx)
 	if err == nil {
-		m.logger.Debugf("lock manager released lock: %s", key)
+		m.logger.DebugContext(ctx, "lock manager released lock: %s", key)
 	}
 	return err
 }
@@ -413,13 +493,13 @@ func (m *LockManager) ReleaseAllLocks(ctx context.Context) error {
 	for key, lock := range locks {
 		if err := lock.Unlock(ctx); err != nil {
 			lastErr = fmt.Errorf("failed to release lock %s: %w", key, err)
-			m.logger.Errorf("failed to release lock %s: %v", key, err)
+			m.logger.ErrorContext(ctx, "failed to release lock %s: %v", key, err)
 		} else {
 			releasedCount++
 		}
 	}
 
-	m.logger.Infof("released %d/%d locks", releasedCount, len(locks))
+	m.logger.InfoContext(ctx, "released %d/%d locks", releasedCount, len(locks))
 
 	return lastErr
 }
@@ -507,7 +587,7 @@ func LockWithRetry(ctx context.Context, client *redis.Client, key string, config
 	defer func() {
 		if unlockErr := lock.Unlock(ctx); unlockErr != nil {
 			// 记录解锁错误，但不覆盖原始错误
-			lock.logger.Warnf("failed to unlock: %v", unlockErr)
+			lock.logger.WarnContext(ctx, "failed to unlock: %v", unlockErr)
 		}
 	}()
 
