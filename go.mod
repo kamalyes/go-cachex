@@ -5,9 +5,9 @@ go 1.25.0
 require (
 	github.com/alicebob/miniredis/v2 v2.35.0
 	github.com/dgraph-io/ristretto/v2 v2.4.0
-	github.com/kamalyes/go-argus v0.3.0
-	github.com/kamalyes/go-logger v0.5.4
-	github.com/kamalyes/go-toolbox v0.15.5
+	github.com/kamalyes/go-argus v0.3.1
+	github.com/kamalyes/go-logger v0.5.6
+	github.com/kamalyes/go-toolbox v0.15.6
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/stretchr/testify v1.11.1
 	gorm.io/gorm v1.30.0
@@ -22,6 +22,8 @@ require (
 	github.com/jinzhu/now v1.1.5 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/yuin/gopher-lua v1.1.1 // indirect
+	go.opentelemetry.io/otel v1.44.0 // indirect
+	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
