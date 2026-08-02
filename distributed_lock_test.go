@@ -762,12 +762,18 @@ func TestDistributedLock_TryLockRedisConfirms(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, acquired)
 
-	// 再次 TryLock，Redis 确认仍持有锁 → return true, nil
+	// 再次 TryLock，Redis 确认仍持有锁 → return true, nil，重入计数 +1
 	acquired, err = lock.TryLock(ctx)
 	assert.NoError(t, err)
 	assert.True(t, acquired, "Redis 确认持有时 TryLock 应返回 true")
 
-	lock.Unlock(ctx)
+	// 第一次 Unlock 仅递减重入计数（reentrantCount 2→1），不释放 Redis 锁
+	err = lock.Unlock(ctx)
+	assert.NoError(t, err)
+
+	// 第二次 Unlock 才真正释放 Redis 锁
+	err = lock.Unlock(ctx)
+	assert.NoError(t, err)
 }
 
 // TestDistributedLock_UnlockNotAcquired 覆盖 Unlock 未获取锁时返回 ErrLockNotFound
@@ -1384,4 +1390,102 @@ func TestLockWithRetry_UnlockFail(t *testing.T) {
 	})
 	// LockWithRetry 返回 fn 的结果（nil），Unlock 失败只记录日志
 	assert.NoError(t, err)
+}
+
+// TestDistributedLock_ReentrantCount 验证重入计数器：
+// 多次 TryLock（Redis 确认仍持有）后，前 N-1 次 Unlock 仅递减计数，
+// 只有最后一次 Unlock 才真正释放 Redis 锁
+func TestDistributedLock_ReentrantCount(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+	ctx := context.Background()
+	config := LockConfig{TTL: time.Minute, Namespace: "test", EnableWatchdog: false}
+	lock := NewDistributedLock(client, "reentrant_count", config)
+
+	// 第一次获取锁
+	acquired, err := lock.TryLock(ctx)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	// 重入两次
+	acquired, err = lock.TryLock(ctx)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	acquired, err = lock.TryLock(ctx)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	// 验证 Redis 锁仍存在
+	locked, err := lock.IsLocked(ctx)
+	require.NoError(t, err)
+	require.True(t, locked, "重入期间锁应仍然持有")
+
+	// 第一次 Unlock：reentrantCount 3→2，锁不应释放
+	err = lock.Unlock(ctx)
+	assert.NoError(t, err)
+	exists, _ := client.Exists(ctx, lock.key).Result()
+	assert.Equal(t, int64(1), exists, "重入计数 >0 时不应删除 Redis key")
+
+	// 第二次 Unlock：reentrantCount 2→1，锁不应释放
+	err = lock.Unlock(ctx)
+	assert.NoError(t, err)
+	exists, _ = client.Exists(ctx, lock.key).Result()
+	assert.Equal(t, int64(1), exists, "重入计数 >0 时不应删除 Redis key")
+
+	// 第三次 Unlock：reentrantCount 1→0，真正释放 Redis 锁
+	err = lock.Unlock(ctx)
+	assert.NoError(t, err)
+	exists, _ = client.Exists(ctx, lock.key).Result()
+	assert.Equal(t, int64(0), exists, "最后一次 Unlock 应删除 Redis key")
+}
+
+// TestDistributedLock_ConcurrentReentrantUnlock 验证并发场景下重入计数器：
+// 模拟 kronos WithCachexLock 在未强制 overlap-prevent 时多个 goroutine
+// 共享同一 DistributedLock 实例，先完成的 goroutine 不会误释放锁
+func TestDistributedLock_ConcurrentReentrantUnlock(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+	ctx := context.Background()
+	config := LockConfig{
+		TTL:              time.Minute,
+		Namespace:        "test",
+		EnableWatchdog:   true,
+		WatchdogInterval: time.Millisecond * 200,
+	}
+	lock := NewDistributedLock(client, "concurrent_reentrant", config)
+
+	// 第一个 goroutine 获取锁
+	acquired, err := lock.TryLock(ctx)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	// 第二个 goroutine 重入获取锁（模拟 kronos 新 tick 调用 TryLock）
+	acquired, err = lock.TryLock(ctx)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	// 第一个 goroutine 完成 Unlock（仅递减计数，不释放锁，看门狗继续运行）
+	err = lock.Unlock(ctx)
+	assert.NoError(t, err)
+
+	// 锁仍应存在于 Redis
+	exists, _ := client.Exists(ctx, lock.key).Result()
+	assert.Equal(t, int64(1), exists, "第一个 goroutine Unlock 后锁不应释放")
+
+	// 等待看门狗至少续期一次（验证看门狗未被停止）
+	time.Sleep(time.Millisecond * 300)
+
+	// 锁仍应存在且 token 不变
+	val, err := client.Get(ctx, lock.key).Result()
+	require.NoError(t, err)
+	assert.NotEmpty(t, val, "看门狗续期后锁应仍存在")
+
+	// 第二个 goroutine 完成 Unlock（真正释放锁）
+	err = lock.Unlock(ctx)
+	assert.NoError(t, err)
+
+	// 锁应已从 Redis 删除
+	exists, _ = client.Exists(ctx, lock.key).Result()
+	assert.Equal(t, int64(0), exists, "最后一个 goroutine Unlock 后锁应释放")
 }

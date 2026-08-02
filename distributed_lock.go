@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kamalyes/go-logger"
@@ -44,15 +45,16 @@ type LockConfig struct {
 
 // DistributedLock 分布式锁
 type DistributedLock struct {
-	client     *redis.Client
-	config     LockConfig
-	key        string         // 锁的键名
-	token      string         // 锁的令牌（用于确保只有持锁者能释放锁）
-	acquired   bool           // 是否已获取锁
-	expireTime time.Time      // 锁的过期时间
-	stopChan   chan struct{}  // 停止看门狗的通道
-	mu         sync.Mutex     // 保护锁状态的互斥锁
-	logger     logger.ILogger // 日志记录器
+	client         *redis.Client
+	config         LockConfig
+	key            string         // 锁的键名
+	token          string         // 锁的令牌（用于确保只有持锁者能释放锁）
+	acquired       bool           // 是否已获取锁
+	expireTime     time.Time      // 锁的过期时间
+	stopChan       chan struct{}  // 停止看门狗的通道
+	mu             sync.Mutex     // 保护锁状态的互斥锁
+	logger         logger.ILogger // 日志记录器
+	reentrantCount atomic.Int32   // 重入计数器，记录 TryLock 成功次数（含首次获取），确保所有持有者 Unlock 后才释放锁
 
 	// 续期钩子（watchdog 周期性续期时调用）
 	// onBeforeExtend: IsLocked 成功后、Extend 调用前执行，可用于续期前置检查、指标采集
@@ -91,6 +93,7 @@ func (l *DistributedLock) resetState() {
 	l.acquired = false
 	l.token = ""
 	l.expireTime = time.Time{}
+	l.reentrantCount.Store(0)
 	l.stopWatchdogLocked()
 }
 
@@ -137,7 +140,11 @@ func (l *DistributedLock) TryLock(ctx context.Context) (bool, error) {
 		// 防止因上次 Unlock/Extend 所有权丢失未清理状态而误判（核心 bug 修复）
 		value, err := l.client.Get(ctx, l.key).Result()
 		if err == nil && value == l.token {
-			return true, nil // Redis 确认仍持有锁
+			// Redis 确认仍持有锁 → 重入：reentrantCount+1，直接返回 true
+			// 场景：LockManager.GetLock 对相同 key 返回缓存实例，多个 goroutine 共享同一把锁
+			// 正常用法不会走到这里（单 goroutine TryLock 后 acquired=false 不会重入）
+			l.reentrantCount.Add(1)
+			return true, nil
 		}
 		// Redis 中锁已丢失或被他人持有，清理本地陈旧状态后继续尝试获取
 		l.logger.WarnContext(ctx, "local state indicates lock held but Redis disagrees for key %s, resetting", l.key)
@@ -156,6 +163,7 @@ func (l *DistributedLock) TryLock(ctx context.Context) (bool, error) {
 
 	if result {
 		l.acquired = true
+		l.reentrantCount.Store(1)
 		l.expireTime = time.Now().Add(l.config.TTL)
 		l.logger.DebugContext(ctx, "lock acquired for key %s, token: %s, ttl: %v", l.key, l.token, l.config.TTL)
 
@@ -209,12 +217,26 @@ func (l *DistributedLock) LockWithTimeout(ctx context.Context, timeout time.Dura
 }
 
 // Unlock 释放锁
+//
+// 正常用法（单 goroutine）：reentrantCount 为 1，直接执行 Lua 脚本释放 Redis 锁并停止看门狗
+//
+// 异常场景（LockManager.GetLock 返回缓存实例，多 goroutine 共享同一把锁）：
+//   - reentrantCount > 1 时，仅递减计数（reentrantCount-1），不释放 Redis 锁也不停止看门狗
+//   - 只有最后一个持有者调用 Unlock（reentrantCount 归 1）才真正释放 Redis 锁并停止看门狗
+//   - 避免先退出的 goroutine 误释放锁，导致仍在执行的 goroutine 失去锁保护和看门狗续期
 func (l *DistributedLock) Unlock(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if !l.acquired {
 		return ErrLockNotFound
+	}
+
+	// 重入计数 > 1：仅递减计数，不释放 Redis 锁，看门狗继续运行
+	if l.reentrantCount.Load() > 1 {
+		l.reentrantCount.Add(-1)
+		l.logger.DebugContext(ctx, "lock reentrant decrement for key %s, remaining: %d", l.key, l.reentrantCount.Load())
+		return nil
 	}
 
 	// 使用Lua脚本确保只有持锁者能释放锁
@@ -275,6 +297,7 @@ func (l *DistributedLock) Extend(ctx context.Context, ttl time.Duration) error {
 
 	result, err := l.client.Eval(ctx, script, []string{l.key}, l.token, ttl.Milliseconds()).Result()
 	if err != nil {
+		l.logger.WarnContext(ctx, "failed to extend lock for key %s: %v", l.key, err)
 		return fmt.Errorf("failed to extend lock: %w", err)
 	}
 
