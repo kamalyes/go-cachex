@@ -14,9 +14,44 @@ package cachex
 import (
 	"context"
 	"fmt"
-	"github.com/redis/go-redis/v9"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
+
+// luaIdGenScript 预编译脚本：原子生成单个序列号（检查初始化 + INCR），自动使用 EVALSHA 减少网络传输
+var luaIdGenScript = redis.NewScript(`
+local key = KEYS[1]
+local expire = tonumber(ARGV[1])
+local seqStart = tonumber(ARGV[2])
+local exists = redis.call('EXISTS', key)
+if exists == 0 and seqStart > 1 then
+	redis.call('SET', key, seqStart-1, 'EX', expire)
+end
+local seq = redis.call('INCR', key)
+if exists == 0 and seqStart <= 1 then
+	redis.call('EXPIRE', key, expire)
+end
+return seq
+`)
+
+// luaIdGenBatchScript 预编译脚本：原子批量生成序列号（检查初始化 + INCRBY），自动使用 EVALSHA 减少网络传输
+var luaIdGenBatchScript = redis.NewScript(`
+local key = KEYS[1]
+local expire = tonumber(ARGV[1])
+local n = tonumber(ARGV[2])
+local seqStart = tonumber(ARGV[3])
+local exists = redis.call('EXISTS', key)
+if exists == 0 and seqStart > 1 then
+	redis.call('SET', key, seqStart-1, 'EX', expire)
+end
+local seq = redis.call('INCRBY', key, n)
+local ids = {}
+for i=seq-n+1,seq do
+	table.insert(ids, i)
+end
+return ids
+`)
 
 // IDGenerator 通用ID生成器
 type IDGenerator struct {
@@ -122,22 +157,7 @@ func (g *IDGenerator) GenerateID(ctx context.Context) (string, error) {
 	timePrefix := g.getTimePrefix()
 	redisKey := g.getRedisKey(timePrefix)
 
-	// 使用 Lua 脚本保证原子性：检查 key 是否存在，不存在则初始化，然后 INCR
-	luaScript := `
-		local key = KEYS[1]
-		local expire = tonumber(ARGV[1])
-		local seqStart = tonumber(ARGV[2])
-		local exists = redis.call('EXISTS', key)
-		if exists == 0 and seqStart > 1 then
-			redis.call('SET', key, seqStart-1, 'EX', expire)
-		end
-		local seq = redis.call('INCR', key)
-		if exists == 0 and seqStart <= 1 then
-			redis.call('EXPIRE', key, expire)
-		end
-		return seq
-	`
-
+	// 使用预编译 Lua 脚本保证原子性：检查 key 是否存在，不存在则初始化，然后 INCR（自动 EVALSHA）
 	start := g.seqStart
 	if g.OnSequenceInit != nil {
 		start = g.OnSequenceInit()
@@ -145,7 +165,7 @@ func (g *IDGenerator) GenerateID(ctx context.Context) (string, error) {
 	expireSec := int64(g.expire.Seconds())
 	args := []interface{}{expireSec, start}
 
-	res, err := g.redisClient.Eval(ctx, luaScript, []string{redisKey}, args...).Result()
+	res, err := luaIdGenScript.Run(ctx, g.redisClient, []string{redisKey}, args...).Result()
 	if err != nil {
 		return "", fmt.Errorf("failed to generate sequence: %w", err)
 	}
@@ -187,30 +207,14 @@ func (g *IDGenerator) GenerateIDs(ctx context.Context, n int) ([]string, error) 
 	}
 	timePrefix := g.getTimePrefix()
 	redisKey := g.getRedisKey(timePrefix)
-	// Lua脚本：批量INCRBY并返回所有ID
-	luaScript := `
-		local key = KEYS[1]
-		local expire = tonumber(ARGV[1])
-		local n = tonumber(ARGV[2])
-		local seqStart = tonumber(ARGV[3])
-		local exists = redis.call('EXISTS', key)
-		if exists == 0 and seqStart > 1 then
-			redis.call('SET', key, seqStart-1, 'EX', expire)
-		end
-		local seq = redis.call('INCRBY', key, n)
-		local ids = {}
-		for i=seq-n+1,seq do
-			table.insert(ids, i)
-		end
-		return ids
-	`
+	// 使用预编译 Lua脚本：批量INCRBY并返回所有ID（自动 EVALSHA）
 	start := g.seqStart
 	if g.OnSequenceInit != nil {
 		start = g.OnSequenceInit()
 	}
 	expireSec := int64(g.expire.Seconds())
 	args := []interface{}{expireSec, n, start}
-	res, err := g.redisClient.Eval(ctx, luaScript, []string{redisKey}, args...).Result()
+	res, err := luaIdGenBatchScript.Run(ctx, g.redisClient, []string{redisKey}, args...).Result()
 	if err != nil {
 		return nil, fmt.Errorf("failed to batch generate sequence: %w", err)
 	}

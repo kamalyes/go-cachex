@@ -310,6 +310,16 @@ const cancelLuaScript = `
 	return removed
 `
 
+// 预编译 Lua 脚本，避免每次调用都发送脚本内容（使用 EVALSHA 复用）
+var (
+	enqueueScript      = redis.NewScript(enqueueLuaScript)
+	cancelScript       = redis.NewScript(cancelLuaScript)
+	dequeueScript      = redis.NewScript(dequeueLuaScript)
+	ackScript          = redis.NewScript(ackLuaScript)
+	requeueStaleScript = redis.NewScript(requeueStaleLuaScript)
+	pollScript         = redis.NewScript(pollLuaScript)
+)
+
 // ========== 入队 ==========
 
 // EnqueueAt 在指定时间执行任务
@@ -338,7 +348,7 @@ func (q *DelayQueue[T]) EnqueueAt(ctx context.Context, queueName string, task *D
 	zsetKey := q.zsetKey(queueName)
 	hashKey := q.hashKey(queueName)
 
-	if err := q.client.Eval(ctx, enqueueLuaScript, []string{zsetKey, hashKey}, score, task.Key, string(taskData)).Err(); err != nil {
+	if err := enqueueScript.Run(ctx, q.client, []string{zsetKey, hashKey}, score, task.Key, string(taskData)).Err(); err != nil {
 		return fmt.Errorf("enqueue delay task failed: %w", err)
 	}
 
@@ -365,7 +375,7 @@ func (q *DelayQueue[T]) Cancel(ctx context.Context, queueName, key string) (bool
 		return false, ErrDelayQueueClosed
 	}
 
-	result, err := q.client.Eval(ctx, cancelLuaScript,
+	result, err := cancelScript.Run(ctx, q.client,
 		[]string{q.zsetKey(queueName), q.processingKey(queueName), q.hashKey(queueName)}, key).Int64()
 	if err != nil {
 		return false, fmt.Errorf("cancel delay task failed: %w", err)
@@ -455,7 +465,7 @@ func (q *DelayQueue[T]) dequeueExpired(ctx context.Context, queueName string) ([
 	now := float64(time.Now().UnixMilli())
 	// 可见性超时时间戳：任务进入 processing 后，超过此时间未 ACK 视为失败
 	visibleAt := float64(time.Now().Add(q.config.VisibilityTimeout).UnixMilli())
-	result, err := q.client.Eval(ctx, dequeueLuaScript,
+	result, err := dequeueScript.Run(ctx, q.client,
 		[]string{q.zsetKey(queueName), q.processingKey(queueName), q.hashKey(queueName)},
 		now, q.config.BatchSize, visibleAt).Result()
 	if err != nil {
@@ -501,7 +511,7 @@ func (q *DelayQueue[T]) dequeueExpired(ctx context.Context, queueName string) ([
 // ack 确认任务处理完成：从 processing ZSet 删除 + 从 Hash 删除
 // 必须在 handler 成功后调用，否则任务会在可见性超时后回归 ready 被重新消费
 func (q *DelayQueue[T]) ack(ctx context.Context, queueName, taskKey string) error {
-	removed, err := q.client.Eval(ctx, ackLuaScript,
+	removed, err := ackScript.Run(ctx, q.client,
 		[]string{q.processingKey(queueName), q.hashKey(queueName)}, taskKey).Int64()
 	if err != nil {
 		return fmt.Errorf("ack delay task failed: %w", err)
@@ -518,7 +528,7 @@ func (q *DelayQueue[T]) ack(ctx context.Context, queueName, taskKey string) erro
 // 返回回收的任务数
 func (q *DelayQueue[T]) requeueStale(ctx context.Context, queueName string) (int64, error) {
 	now := float64(time.Now().UnixMilli())
-	count, err := q.client.Eval(ctx, requeueStaleLuaScript,
+	count, err := requeueStaleScript.Run(ctx, q.client,
 		[]string{q.processingKey(queueName), q.zsetKey(queueName)},
 		now, q.config.BatchSize).Int64()
 	if err != nil {
@@ -538,7 +548,7 @@ func (q *DelayQueue[T]) requeueStale(ctx context.Context, queueName string) (int
 func (q *DelayQueue[T]) pollExpired(ctx context.Context, queueName string) ([]*DelayTask[T], error) {
 	now := float64(time.Now().UnixMilli())
 	visibleAt := float64(time.Now().Add(q.config.VisibilityTimeout).UnixMilli())
-	result, err := q.client.Eval(ctx, pollLuaScript,
+	result, err := pollScript.Run(ctx, q.client,
 		[]string{q.zsetKey(queueName), q.processingKey(queueName), q.hashKey(queueName)},
 		now, q.config.BatchSize, visibleAt).Result()
 	if err != nil {

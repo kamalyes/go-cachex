@@ -127,6 +127,12 @@ end
 return n
 `
 
+// luaKVSetManyScript 预编译脚本，自动使用 EVALSHA 减少网络传输
+var luaKVSetManyScript = redis.NewScript(luaKVSetMany)
+
+// luaKVReplaceAllScript 预编译脚本，自动使用 EVALSHA 减少网络传输
+var luaKVReplaceAllScript = redis.NewScript(luaKVReplaceAll)
+
 // KVCacheConfig KV 缓存配置
 type KVCacheConfig struct {
 	DefaultTTL        time.Duration  // 默认TTL，默认 30 分钟
@@ -757,7 +763,7 @@ func (c *KVCache[K, V]) writeManyToRedis(ctx context.Context, items map[K]V) err
 		}
 		args = append(args, convert.MustString(k), vstr)
 	}
-	return c.client.Eval(ctx, luaKVSetMany,
+	return luaKVSetManyScript.Run(ctx, c.client,
 		[]string{c.redisKey()},
 		args...,
 	).Err()
@@ -822,7 +828,7 @@ func (c *KVCache[K, V]) replaceRedis(ctx context.Context, items map[K]V) error {
 		}
 		args = append(args, convert.MustString(k), vstr)
 	}
-	return c.client.Eval(ctx, luaKVReplaceAll,
+	return luaKVReplaceAllScript.Run(ctx, c.client,
 		[]string{c.redisKey()},
 		args...,
 	).Err()

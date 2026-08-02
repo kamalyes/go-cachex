@@ -20,6 +20,36 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// luaScript 批量出队Lua脚本：一次性弹出多个元素
+var luaScript = `
+	local key = KEYS[1]
+	local count = tonumber(ARGV[1])
+	local pop_cmd = ARGV[2]  -- "LPOP" 或 "RPOP"
+
+	local results = {}
+	for i = 1, count do
+		local value = redis.call(pop_cmd, key)
+		if not value then
+			break
+		end
+		table.insert(results, value)
+	end
+	return results
+`
+
+var luaQueueScript = redis.NewScript(luaScript)
+
+// releaseLockLuaScript 释放分布式锁Lua脚本：确保只能释放自己持有的锁
+var releaseLockLuaScript = `
+	if redis.call("GET", KEYS[1]) == ARGV[1] then
+		return redis.call("DEL", KEYS[1])
+	else
+		return 0
+	end
+`
+
+var releaseLockScript = redis.NewScript(releaseLockLuaScript)
+
 // QueueType 队列类型
 type QueueType string
 
@@ -272,23 +302,6 @@ func (q *QueueHandler) BatchDequeue(ctx context.Context, queueName string, queue
 
 // batchDequeueLua 使用Lua脚本批量出队
 func (q *QueueHandler) batchDequeueLua(ctx context.Context, queueKey string, queueType QueueType, count int) ([]*QueueItem, error) {
-	// Lua脚本：一次性弹出多个元素
-	luaScript := `
-		local key = KEYS[1]
-		local count = tonumber(ARGV[1])
-		local pop_cmd = ARGV[2]  -- "LPOP" 或 "RPOP"
-		
-		local results = {}
-		for i = 1, count do
-			local value = redis.call(pop_cmd, key)
-			if not value then
-				break
-			end
-			table.insert(results, value)
-		end
-		return results
-	`
-
 	// 根据队列类型选择弹出命令
 	popCmd := "LPOP"
 	if queueType == QueueTypeFIFO {
@@ -298,7 +311,7 @@ func (q *QueueHandler) batchDequeueLua(ctx context.Context, queueKey string, que
 	}
 
 	// 执行Lua脚本
-	result, err := q.client.Eval(ctx, luaScript, []string{queueKey}, count, popCmd).Result()
+	result, err := luaQueueScript.Run(ctx, q.client, []string{queueKey}, count, popCmd).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -506,15 +519,7 @@ func (q *QueueHandler) ReleaseLock(ctx context.Context, queueName string, worker
 	lockKey := q.getLockKey(queueName)
 
 	// 使用Lua脚本确保只能释放自己持有的锁
-	script := `
-		if redis.call("GET", KEYS[1]) == ARGV[1] then
-			return redis.call("DEL", KEYS[1])
-		else
-			return 0
-		end
-	`
-
-	return q.client.Eval(ctx, script, []string{lockKey}, workerID).Err()
+	return releaseLockScript.Run(ctx, q.client, []string{lockKey}, workerID).Err()
 }
 
 // Statistics 获取队列统计信息

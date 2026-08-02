@@ -30,6 +30,15 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// luaReleaseLockScript 预编译脚本：安全释放分布式锁（校验持锁值后删除），自动使用 EVALSHA 减少网络传输
+var luaReleaseLockScript = redis.NewScript(`
+if redis.call("get", KEYS[1]) == ARGV[1] then
+	return redis.call("del", KEYS[1])
+else
+	return 0
+end
+`)
+
 // NewRedisOptions 创建推荐的Redis配置
 // 这个函数设置了一些推荐的默认值以避免常见的警告和问题
 func NewRedisOptions(addr, password string, db int) *redis.Options {
@@ -400,15 +409,8 @@ func (h *RedisHandler) GetOrComputeWithCtx(ctx context.Context, key []byte, ttl 
 	if acquired {
 		// 成功获取锁，执行计算
 		defer func() {
-			// 使用Lua脚本安全释放锁
-			script := `
-				if redis.call("get", KEYS[1]) == ARGV[1] then
-					return redis.call("del", KEYS[1])
-				else
-					return 0
-				end
-			`
-			h.redis.Eval(ctx, script, []string{lockKey}, lockValue)
+			// 使用预编译Lua脚本安全释放锁（自动 EVALSHA）
+			luaReleaseLockScript.Run(ctx, h.redis, []string{lockKey}, lockValue)
 		}()
 
 		// 三重检查缓存（可能在等待锁期间已被其他实例设置）
@@ -480,14 +482,8 @@ func (h *RedisHandler) GetOrComputeWithCtx(ctx context.Context, key []byte, ttl 
 		acquired := h.redis.SetNX(ctx, lockKey, lockValue, lockTTL).Val()
 		if acquired {
 			defer func() {
-				script := `
-					if redis.call("get", KEYS[1]) == ARGV[1] then
-						return redis.call("del", KEYS[1])
-					else
-						return 0
-					end
-				`
-				h.redis.Eval(ctx, script, []string{lockKey}, lockValue)
+				// 使用预编译Lua脚本安全释放锁（自动 EVALSHA）
+				luaReleaseLockScript.Run(ctx, h.redis, []string{lockKey}, lockValue)
 			}()
 
 			// 再次检查缓存

@@ -42,6 +42,8 @@ end
 return deleted
 `
 
+var luaDeleteByIndexScript = redis.NewScript(luaDeleteByIndexSet)
+
 // CacheIndexManager 缓存索引管理器
 // 基于索引集合（Redis Set）追踪缓存键，支持按分组原子删除
 //
@@ -84,7 +86,7 @@ func (m *CacheIndexManager) DeleteByIndex(ctx context.Context, idxKeys ...string
 	if m.client == nil || len(idxKeys) == 0 {
 		return 0, nil
 	}
-	result, err := m.client.Eval(ctx, luaDeleteByIndexSet, idxKeys).Int64()
+	result, err := luaDeleteByIndexScript.Run(ctx, m.client, idxKeys).Int64()
 	if err != nil {
 		return 0, err
 	}
