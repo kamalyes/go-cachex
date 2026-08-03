@@ -337,8 +337,3 @@ func TestNewRistrettoClient(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, []byte("value"), val)
 }
-
-func TestNewRedisClient(t *testing.T) {
-	// 这个测试需要真实的Redis连接，可以跳过或使用miniredis
-	t.Skip("Requires real Redis connection")
-}

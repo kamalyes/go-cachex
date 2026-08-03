@@ -644,7 +644,6 @@ func TestPubSub_BroadcastMessage(t *testing.T) {
 }
 
 func TestPubSub_RequestResponse(t *testing.T) {
-	t.Skip("Skipping RequestResponse test - may cause timeout due to Redis connection issues")
 
 	pubsub, cleanup := setupPubSub(t, "request_response_test")
 	defer cleanup()
@@ -764,8 +763,6 @@ func TestPubSub_ErrorHandling(t *testing.T) {
 }
 
 func TestSimpleFunctions(t *testing.T) {
-	t.Skip("Skipping SimpleFunction test - may cause timeout due to Redis connection issues")
-
 	client := setupRedisClient(t)
 	defer client.Close()
 
