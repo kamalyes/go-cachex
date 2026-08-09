@@ -52,9 +52,10 @@ type PubSubConfig struct {
 }
 
 // DefaultPubSubConfig 默认配置
+// Namespace 默认为空，即频道名不加前缀；需要隔离的模块通过 WithPubSubNamespace 显式设置
 func DefaultPubSubConfig() PubSubConfig {
 	return PubSubConfig{
-		Namespace:          "pubsub",
+		Namespace:          "",
 		MaxRetries:         2,                      // 减少重试次数
 		RetryDelay:         time.Millisecond * 100, // 大幅减少重试延迟
 		BufferSize:         100,
@@ -68,7 +69,7 @@ func DefaultPubSubConfig() PubSubConfig {
 
 // PubSub Redis发布订阅封装
 type PubSub struct {
-	client      *redis.Client          // Redis 客户端
+	client      redis.UniversalClient  // Redis 客户端
 	config      PubSubConfig           // 发布订阅配置
 	subscribers map[string]*Subscriber // 订阅者注册表，key 为频道或模式名
 	mu          sync.RWMutex           // 保护 subscribers 的读写锁
@@ -78,17 +79,64 @@ type PubSub struct {
 	logger      logger.ILogger         // 日志记录器
 }
 
-// NewPubSub 创建发布订阅实例
-func NewPubSub(redisClient redis.UniversalClient, config ...PubSubConfig) *PubSub {
-	// 类型断言为*redis.Client
-	client, ok := redisClient.(*redis.Client)
-	if !ok {
-		panic("PubSub requires *redis.Client, cluster mode not supported yet")
-	}
+// PubSubOption 发布订阅配置项
+type PubSubOption func(*PubSubConfig)
 
+// WithPubSubNamespace 设置命名空间
+func WithPubSubNamespace(ns string) PubSubOption {
+	return func(c *PubSubConfig) { c.Namespace = ns }
+}
+
+// WithPubSubMaxRetries 设置最大重试次数
+func WithPubSubMaxRetries(n int) PubSubOption {
+	return func(c *PubSubConfig) { c.MaxRetries = n }
+}
+
+// WithPubSubRetryDelay 设置重试延迟
+func WithPubSubRetryDelay(d time.Duration) PubSubOption {
+	return func(c *PubSubConfig) { c.RetryDelay = d }
+}
+
+// WithPubSubBufferSize 设置消息缓冲区大小
+func WithPubSubBufferSize(n int) PubSubOption {
+	return func(c *PubSubConfig) { c.BufferSize = n }
+}
+
+// WithPubSubLogger 设置日志记录器
+func WithPubSubLogger(l logger.ILogger) PubSubOption {
+	return func(c *PubSubConfig) { c.Logger = l }
+}
+
+// WithPubSubPingInterval 设置心跳间隔
+func WithPubSubPingInterval(d time.Duration) PubSubOption {
+	return func(c *PubSubConfig) { c.PingInterval = d }
+}
+
+// WithPubSubCompression 是否启用消息压缩
+func WithPubSubCompression(enable bool) PubSubOption {
+	return func(c *PubSubConfig) { c.EnableCompression = enable }
+}
+
+// WithPubSubCompressionMinSize 设置压缩阈值
+func WithPubSubCompressionMinSize(n int) PubSubOption {
+	return func(c *PubSubConfig) { c.CompressionMinSize = n }
+}
+
+// WithPubSubMaxWorkers 设置消息处理 worker 数量
+func WithPubSubMaxWorkers(n int) PubSubOption {
+	return func(c *PubSubConfig) { c.MaxWorkers = n }
+}
+
+// WithPubSubWorkerQueueSize 设置 worker 队列大小
+func WithPubSubWorkerQueueSize(n int) PubSubOption {
+	return func(c *PubSubConfig) { c.WorkerQueueSize = n }
+}
+
+// NewPubSub 创建发布订阅实例
+func NewPubSub(client redis.UniversalClient, opts ...PubSubOption) *PubSub {
 	cfg := DefaultPubSubConfig()
-	if len(config) > 0 {
-		cfg = config[0]
+	for _, opt := range opts {
+		opt(&cfg)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -104,11 +152,12 @@ func NewPubSub(redisClient redis.UniversalClient, config ...PubSubConfig) *PubSu
 }
 
 // getChannelKey 获取带命名空间的频道名
+// namespace 为空时直接返回原始频道名，避免加多余的 ':' 前缀
 func (p *PubSub) getChannelKey(channel string) string {
 	if p.config.Namespace == "" {
 		return channel
 	}
-	return fmt.Sprintf("%s:%s", p.config.Namespace, channel)
+	return p.config.Namespace + ":" + channel
 }
 
 // Publish 发布消息
@@ -318,13 +367,25 @@ func (p *PubSub) GetChannels() []string {
 func (p *PubSub) Close() error {
 	p.cancel()
 
-	// 停止所有订阅者
-	syncx.WithLock(&p.mu, func() {
-		for _, subscriber := range p.subscribers {
-			subscriber.Stop()
+	// 先收集所有唯一订阅者并清空注册表（持锁时间短）
+	// 不在持锁状态下调用 Stop，避免与 Resubscribe 的 stopMu → p.mu 形成锁顺序反转死锁
+	subscribers := syncx.WithLockReturnValue(&p.mu, func() []*Subscriber {
+		seen := make(map[*Subscriber]bool)
+		result := make([]*Subscriber, 0, len(p.subscribers))
+		for _, sub := range p.subscribers {
+			if !seen[sub] {
+				seen[sub] = true
+				result = append(result, sub)
+			}
 		}
 		p.subscribers = make(map[string]*Subscriber)
+		return result
 	})
+
+	// 在锁外停止所有订阅者
+	for _, sub := range subscribers {
+		sub.Stop()
+	}
 
 	// 等待所有goroutine结束
 	p.wg.Wait()
@@ -344,10 +405,11 @@ type Subscriber struct {
 	config      PubSubConfig      // 订阅配置
 	isPattern   bool              // 是否为模式订阅
 	pubSubConn  *redis.PubSub     // Redis 订阅连接
-	once        sync.Once         // 确保 Stop 只执行一次
 	pool        *syncx.WorkerPool // Worker 池，用于限制消息处理的并发数
 	mu          sync.RWMutex      // 保护状态字段
 	isActive    bool              // 明确的活跃状态标记
+	stopMu      sync.Mutex        // 序列化 Stop/Resubscribe 操作，防止竞态
+	loopWg      sync.WaitGroup    // 跟踪 messageLoop goroutine，确保退出后再重置
 }
 
 // start 启动订阅
@@ -378,7 +440,8 @@ func (s *Subscriber) start() error {
 		s.isActive = true
 	})
 
-	// 启动消息接收goroutine
+	// 启动消息接收goroutine，使用 loopWg 跟踪以便 Stop 时等待退出
+	s.loopWg.Add(1)
 	s.pubsub.wg.Add(1)
 	syncx.Go(s.pubsub.ctx).
 		OnPanic(func(r interface{}) {
@@ -395,12 +458,19 @@ func (s *Subscriber) start() error {
 
 // messageLoop 消息循环
 func (s *Subscriber) messageLoop() {
+	// loopWg.Done 放在最前（最后执行），确保 pool 关闭和状态更新完成后才通知 Stop 可以返回
+	defer s.loopWg.Done()
 	defer s.pubsub.wg.Done()
 	defer func() {
+		// 标记为非活跃（messageLoop 可能因 channel 关闭或 ctx 取消而自行退出）
+		syncx.WithLock(&s.mu, func() {
+			s.isActive = false
+		})
 		if s.pubSubConn != nil {
 			s.pubSubConn.Close()
 		}
 		// 关闭 Worker 池，等待所有消息处理完成
+		// pool.Close 内部使用 sync.Once，与 Stop 中的 Close 不会冲突
 		if s.pool != nil {
 			s.pool.Close()
 		}
@@ -490,13 +560,44 @@ func (s *Subscriber) handleMessage(msg *redis.Message) {
 }
 
 // Stop 停止订阅（不从注册表中移除）
+// 该方法会阻塞直到 messageLoop goroutine 完全退出，防止 goroutine 泄漏。
+// 使用 stopMu 序列化 Stop/Resubscribe，避免竞态。
 func (s *Subscriber) Stop() {
-	s.once.Do(func() {
-		syncx.WithLock(&s.mu, func() {
-			s.isActive = false
-		})
-		close(s.stopChan)
+	s.stopMu.Lock()
+	defer s.stopMu.Unlock()
+
+	// 检查是否已停止
+	s.mu.RLock()
+	active := s.isActive
+	s.mu.RUnlock()
+	if !active {
+		return
+	}
+
+	// 标记为非活跃
+	syncx.WithLock(&s.mu, func() {
+		s.isActive = false
 	})
+
+	// 关闭 stopChan 通知 messageLoop 退出
+	select {
+	case <-s.stopChan:
+		// 已经关闭
+	default:
+		close(s.stopChan)
+	}
+
+	// 关闭 pool 以解除 messageLoop 中 pool.Submit 的阻塞
+	// pool.Close 内部使用 sync.Once，messageLoop 的 defer 再次调用不会冲突
+	s.mu.RLock()
+	pool := s.pool
+	s.mu.RUnlock()
+	if pool != nil {
+		pool.Close()
+	}
+
+	// 等待 messageLoop goroutine 完全退出
+	s.loopWg.Wait()
 }
 
 // Unsubscribe 取消订阅并从注册表中移除
@@ -532,32 +633,30 @@ func (s *Subscriber) GetSubscriptionInfo() *SubscriptionInfo {
 }
 
 // Resubscribe 重新订阅（如果已停止）
+// 必须在 Stop() 之后调用。使用 stopMu 与 Stop 互斥，确保旧 goroutine
+// 完全退出后才重置字段并启动新 goroutine，防止竞态和泄漏。
 func (s *Subscriber) Resubscribe() error {
-	// 检查状态并立即标记为活跃，防止并发重复订阅
-	alreadyActive := syncx.WithLockReturnValue(&s.mu, func() bool {
-		if s.isActive {
-			return true
-		}
+	s.stopMu.Lock()
+	defer s.stopMu.Unlock()
 
-		// 立即标记为活跃，防止其他 goroutine 重复订阅
-		s.isActive = true
-
-		// 关闭旧的 pool
-		if s.pool != nil {
-			s.pool.Close()
-			s.pool = nil
-		}
-
-		// 重置 stopChan（需要新的 once）
-		s.stopChan = make(chan struct{})
-		s.once = sync.Once{}
-
-		return false
-	})
-
-	if alreadyActive {
+	// 检查是否仍在活跃状态
+	s.mu.RLock()
+	active := s.isActive
+	s.mu.RUnlock()
+	if active {
 		return fmt.Errorf("subscriber is already active")
 	}
+
+	// 确保 messageLoop goroutine 已完全退出（防御性，Stop 已等待）
+	s.loopWg.Wait()
+
+	// 旧的 pool 已在 Stop 中关闭，清理引用
+	s.mu.Lock()
+	s.pool = nil
+	// 重置 stopChan 以便新的 messageLoop 使用
+	s.stopChan = make(chan struct{})
+	s.isActive = true
+	s.mu.Unlock()
 
 	// 重新注册
 	syncx.WithLock(&s.pubsub.mu, func() {
@@ -655,7 +754,7 @@ func (p *PubSub) GetStats() *PubSubStats {
 // 便利函数
 
 // SimplePublish 简单发布消息
-func SimplePublish(client *redis.Client, channel string, message any) error {
+func SimplePublish(client redis.UniversalClient, channel string, message any) error {
 	pubsub := NewPubSub(client)
 	defer pubsub.Close()
 
@@ -668,7 +767,7 @@ func SimplePublish(client *redis.Client, channel string, message any) error {
 // 返回 PubSub 实例和 Subscriber，使用完毕后需要调用 pubsub.Close()
 //
 // 推荐使用 NewPubSub() + Subscribe() 以便更好地管理生命周期
-func SimpleSubscribe(client *redis.Client, channel string, handler MessageHandler) (*PubSub, *Subscriber, error) {
+func SimpleSubscribe(client redis.UniversalClient, channel string, handler MessageHandler) (*PubSub, *Subscriber, error) {
 	pubsub := NewPubSub(client)
 	subscriber, err := pubsub.Subscribe([]string{channel}, handler)
 	if err != nil {
@@ -733,6 +832,6 @@ func (p *PubSub) RequestResponse(ctx context.Context, requestChannel, responseCh
 // ============================================================================
 
 // GetClient 获取底层 Redis 客户端（用于高级操作）
-func (p *PubSub) GetClient() *redis.Client {
+func (p *PubSub) GetClient() redis.UniversalClient {
 	return p.client
 }

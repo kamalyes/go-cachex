@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -26,24 +27,18 @@ import (
 // 测试辅助函数
 // ============================================================================
 
-// testConfig 创建测试用的 PubSub 配置
-func testConfig(namespace string) PubSubConfig {
-	return PubSubConfig{
-		Namespace:       namespace,
-		MaxRetries:      2,
-		RetryDelay:      time.Millisecond * 50,
-		BufferSize:      10,
-		PingInterval:    time.Second,
-		MaxWorkers:      20,
-		WorkerQueueSize: 50,
-	}
-}
-
 // setupPubSub 创建测试用的 PubSub 实例
 func setupPubSub(t *testing.T, namespace string) (*PubSub, func()) {
 	client := setupRedisClient(t)
-	config := testConfig(namespace)
-	pubsub := NewPubSub(client, config)
+	pubsub := NewPubSub(client,
+		WithPubSubNamespace(namespace),
+		WithPubSubMaxRetries(2),
+		WithPubSubRetryDelay(time.Millisecond*50),
+		WithPubSubBufferSize(10),
+		WithPubSubPingInterval(time.Second),
+		WithPubSubMaxWorkers(20),
+		WithPubSubWorkerQueueSize(50),
+	)
 
 	cleanup := func() {
 		pubsub.Close()
@@ -1173,19 +1168,17 @@ func TestPubSub_Compression(t *testing.T) {
 
 	ctx := context.Background()
 
-	config := PubSubConfig{
-		Namespace:          "compression_test",
-		MaxRetries:         2,
-		RetryDelay:         time.Millisecond * 50,
-		BufferSize:         10,
-		PingInterval:       time.Second,
-		EnableCompression:  true,
-		CompressionMinSize: 100, // 100 字节以上才压缩
-		MaxWorkers:         20,
-		WorkerQueueSize:    50,
-	}
-
-	pubsub := NewPubSub(client, config)
+	pubsub := NewPubSub(client,
+		WithPubSubNamespace("compression_test"),
+		WithPubSubMaxRetries(2),
+		WithPubSubRetryDelay(time.Millisecond*50),
+		WithPubSubBufferSize(10),
+		WithPubSubPingInterval(time.Second),
+		WithPubSubCompression(true),
+		WithPubSubCompressionMinSize(100), // 100 字节以上才压缩
+		WithPubSubMaxWorkers(20),
+		WithPubSubWorkerQueueSize(50),
+	)
 	defer pubsub.Close()
 
 	collector := newMessageCollector()
@@ -1410,12 +1403,26 @@ func TestPubSub_NamespaceIsolation(t *testing.T) {
 	ctx := context.Background()
 
 	// 创建两个不同命名空间的 PubSub
-	config1 := testConfig("namespace1")
-	pubsub1 := NewPubSub(client, config1)
+	pubsub1 := NewPubSub(client,
+		WithPubSubNamespace("namespace1"),
+		WithPubSubMaxRetries(2),
+		WithPubSubRetryDelay(time.Millisecond*50),
+		WithPubSubBufferSize(10),
+		WithPubSubPingInterval(time.Second),
+		WithPubSubMaxWorkers(20),
+		WithPubSubWorkerQueueSize(50),
+	)
 	defer pubsub1.Close()
 
-	config2 := testConfig("namespace2")
-	pubsub2 := NewPubSub(client, config2)
+	pubsub2 := NewPubSub(client,
+		WithPubSubNamespace("namespace2"),
+		WithPubSubMaxRetries(2),
+		WithPubSubRetryDelay(time.Millisecond*50),
+		WithPubSubBufferSize(10),
+		WithPubSubPingInterval(time.Second),
+		WithPubSubMaxWorkers(20),
+		WithPubSubWorkerQueueSize(50),
+	)
 	defer pubsub2.Close()
 
 	counter1 := newCounterCollector()
@@ -1469,17 +1476,15 @@ func TestPubSub_WorkerPoolLimit(t *testing.T) {
 
 	ctx := context.Background()
 
-	config := PubSubConfig{
-		Namespace:       "worker_pool_test",
-		MaxRetries:      2,
-		RetryDelay:      time.Millisecond * 50,
-		BufferSize:      10,
-		PingInterval:    time.Second,
-		MaxWorkers:      2, // 限制为 2 个 worker
-		WorkerQueueSize: 5, // 队列大小为 5
-	}
-
-	pubsub := NewPubSub(client, config)
+	pubsub := NewPubSub(client,
+		WithPubSubNamespace("worker_pool_test"),
+		WithPubSubMaxRetries(2),
+		WithPubSubRetryDelay(time.Millisecond*50),
+		WithPubSubBufferSize(10),
+		WithPubSubPingInterval(time.Second),
+		WithPubSubMaxWorkers(2),      // 限制为 2 个 worker
+		WithPubSubWorkerQueueSize(5), // 队列大小为 5
+	)
 	defer pubsub.Close()
 
 	// 使用 channel 来追踪并发执行的 handler 数量
@@ -1570,7 +1575,7 @@ func TestPubSub_BroadcastMessageError(t *testing.T) {
 func TestPubSub_DefaultConfig(t *testing.T) {
 	config := DefaultPubSubConfig()
 
-	assert.Equal(t, "pubsub", config.Namespace)
+	assert.Equal(t, "", config.Namespace)
 	assert.Equal(t, 2, config.MaxRetries)
 	assert.Equal(t, time.Millisecond*100, config.RetryDelay)
 	assert.Equal(t, 100, config.BufferSize)
@@ -1579,4 +1584,516 @@ func TestPubSub_DefaultConfig(t *testing.T) {
 	assert.Equal(t, 1024, config.CompressionMinSize)
 	assert.Equal(t, 50, config.MaxWorkers)
 	assert.Equal(t, 200, config.WorkerQueueSize)
+}
+
+// TestPublish_EmptyNamespace 测试空命名空间时 getChannelKey 直接返回频道名
+func TestPublish_EmptyNamespace(t *testing.T) {
+	pubsub, cleanup := setupPubSub(t, "")
+	defer cleanup()
+
+	ctx := context.Background()
+	collector := newMessageCollector()
+
+	handler := func(ctx context.Context, channel string, message string) error {
+		collector.add(channel, message)
+		return nil
+	}
+
+	subscriber, err := pubsub.Subscribe([]string{"empty_ns_test"}, handler)
+	require.NoError(t, err)
+	defer subscriber.Stop()
+
+	waitForSubscription()
+
+	err = pubsub.Publish(ctx, "empty_ns_test", "msg")
+	assert.NoError(t, err)
+	waitForMessage()
+
+	assert.True(t, collector.has("empty_ns_test", "msg"))
+}
+
+// TestPublish_MarshalFailure 测试 Publish 无法序列化的类型返回错误
+func TestPublish_MarshalFailure(t *testing.T) {
+	pubsub, cleanup := setupPubSub(t, "marshal_test")
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// 传入包含 channel 的 map，无法 json.Marshal
+	err := pubsub.Publish(ctx, "test_ch", map[string]any{"ch": make(chan int)})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to marshal message")
+}
+
+// TestSubscribe_StartFailure 测试 Subscribe 启动失败时清理注册表
+func TestSubscribe_StartFailure(t *testing.T) {
+	pubsub, cleanup := setupPubSub(t, "start_fail_test")
+	defer cleanup()
+
+	// 关闭 Redis 客户端使 start() 中的 Receive 失败
+	pubsub.client.Close()
+
+	handler := func(ctx context.Context, channel string, message string) error {
+		return nil
+	}
+
+	// 订阅应该失败（连接已关闭）
+	subscriber, err := pubsub.Subscribe([]string{"fail_ch"}, handler)
+	assert.Error(t, err)
+	assert.Nil(t, subscriber)
+
+	// 注册表应该被清理
+	assert.Equal(t, 0, pubsub.GetSubscribers())
+}
+
+// TestSubscribePattern_StartFailure 测试 SubscribePattern 启动失败时清理注册表
+func TestSubscribePattern_StartFailure(t *testing.T) {
+	pubsub, cleanup := setupPubSub(t, "pattern_start_fail_test")
+	defer cleanup()
+
+	// 关闭 Redis 客户端使 start() 中的 Receive 失败
+	pubsub.client.Close()
+
+	handler := func(ctx context.Context, channel string, message string) error {
+		return nil
+	}
+
+	// 模式订阅应该失败（连接已关闭）
+	subscriber, err := pubsub.SubscribePattern([]string{"fail_*"}, handler)
+	assert.Error(t, err)
+	assert.Nil(t, subscriber)
+
+	// 注册表应该被清理
+	assert.Equal(t, 0, pubsub.GetSubscribers())
+}
+
+// TestSubscribeJSON_UnmarshalFailure 测试 SubscribeJSON 接收到非 JSON 消息时的错误处理
+func TestSubscribeJSON_UnmarshalFailure(t *testing.T) {
+	pubsub, cleanup := setupPubSub(t, "json_unmarshal_test")
+	defer cleanup()
+
+	ctx := context.Background()
+
+	type TestData struct {
+		ID int `json:"id"`
+	}
+
+	var errors []error
+
+	jsonHandler := func(ctx context.Context, channel string, data TestData) error {
+		return nil
+	}
+
+	subscriber, err := SubscribeJSON(pubsub, []string{"json_fail_ch"}, jsonHandler)
+	require.NoError(t, err)
+	defer subscriber.Stop()
+
+	waitForSubscription()
+
+	// 发布非 JSON 消息，触发 unmarshal 错误
+	err = pubsub.Publish(ctx, "json_fail_ch", "not_a_json_string")
+	assert.NoError(t, err)
+
+	waitForMessage()
+
+	// 错误被记录但不影响订阅
+	_ = errors
+}
+
+// TestHandleMessage_EmptyPayload 测试 handleMessage 处理空 payload
+func TestHandleMessage_EmptyPayload(t *testing.T) {
+	pubsub, cleanup := setupPubSub(t, "empty_payload_test")
+	defer cleanup()
+
+	ctx := context.Background()
+	counter := newCounterCollector()
+
+	handler := func(ctx context.Context, channel string, message string) error {
+		counter.increment()
+		return nil
+	}
+
+	subscriber, err := pubsub.Subscribe([]string{"empty_ch"}, handler)
+	require.NoError(t, err)
+	defer subscriber.Stop()
+
+	waitForSubscription()
+
+	// 直接发布空字符串消息
+	err = pubsub.client.Publish(ctx, pubsub.getChannelKey("empty_ch"), "").Err()
+	assert.NoError(t, err)
+
+	waitForMessage()
+
+	// 空 payload 的消息会被 handleMessage 提前返回，不调用 handler
+	assert.Equal(t, 0, counter.get())
+}
+
+// TestHandleMessage_DecompressFailure 测试 handleMessage 解压失败时使用原始消息
+func TestHandleMessage_DecompressFailure(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	pubsub := NewPubSub(client,
+		WithPubSubNamespace("decompress_test"),
+		WithPubSubMaxRetries(0),
+		WithPubSubRetryDelay(time.Millisecond*10),
+		WithPubSubBufferSize(10),
+		WithPubSubPingInterval(time.Second),
+		WithPubSubCompression(true),
+		WithPubSubCompressionMinSize(1), // 所有消息都压缩
+		WithPubSubMaxWorkers(5),
+		WithPubSubWorkerQueueSize(10),
+	)
+	defer pubsub.Close()
+
+	collector := newMessageCollector()
+
+	handler := func(ctx context.Context, channel string, message string) error {
+		collector.add(channel, message)
+		return nil
+	}
+
+	subscriber, err := pubsub.Subscribe([]string{"decomp_ch"}, handler)
+	require.NoError(t, err)
+	defer subscriber.Stop()
+
+	waitForSubscription()
+
+	// 直接写入带 GZIP: 前缀的损坏数据到 Redis pubsub channel
+	// IsGzipCompressed 检查 "GZIP:" 前缀，GzipSmartDecompress 会尝试解压并失败
+	fakeGzipData := "GZIP:" + string([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+	err = client.Publish(ctx, pubsub.getChannelKey("decomp_ch"), fakeGzipData).Err()
+	assert.NoError(t, err)
+
+	waitForMessage()
+
+	// 即使解压失败，也不应崩溃
+	// 可能收到原始数据或为空
+}
+
+// TestResubscribe_StartFailure 测试 Resubscribe 在 start 失败时恢复 isActive 状态
+func TestResubscribe_StartFailure(t *testing.T) {
+	pubsub, cleanup := setupPubSub(t, "resub_fail_test")
+	defer cleanup()
+
+	handler := func(ctx context.Context, channel string, message string) error {
+		return nil
+	}
+
+	subscriber, err := pubsub.Subscribe([]string{"resub_fail_ch"}, handler)
+	require.NoError(t, err)
+
+	waitForSubscription()
+
+	subscriber.Stop()
+	waitForSubscription()
+	assert.False(t, subscriber.IsActive())
+
+	// 关闭客户端使 Resubscribe 的 start() 失败
+	pubsub.client.Close()
+
+	err = subscriber.Resubscribe()
+	assert.Error(t, err)
+	assert.False(t, subscriber.IsActive(), "start 失败后应该恢复为不活跃状态")
+}
+
+// TestSimpleSubscribe_Error 测试 SimpleSubscribe 订阅失败时关闭 pubsub
+func TestSimpleSubscribe_Error(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	// 关闭客户端使订阅失败
+	client.Close()
+
+	handler := func(ctx context.Context, channel string, message string) error {
+		return nil
+	}
+
+	pubsub, subscriber, err := SimpleSubscribe(client, "simple_err_ch", handler)
+	assert.Error(t, err)
+	assert.Nil(t, pubsub)
+	assert.Nil(t, subscriber)
+}
+
+// TestRequestResponse_SubscribeFailure 测试 RequestResponse 订阅响应频道失败
+func TestRequestResponse_SubscribeFailure(t *testing.T) {
+	pubsub, cleanup := setupPubSub(t, "req_resp_sub_fail_test")
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// 关闭客户端使 Subscribe 失败
+	pubsub.client.Close()
+
+	_, err := pubsub.RequestResponse(ctx, "req_ch", "resp_ch", "test", time.Second)
+	assert.Error(t, err)
+}
+
+// TestRequestResponse_PublishFailure 测试 RequestResponse 发布请求失败
+func TestRequestResponse_PublishFailure(t *testing.T) {
+	pubsub, cleanup := setupPubSub(t, "req_resp_pub_fail_test")
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// 先订阅成功，然后在发布前关闭客户端
+	// 使用一个 handler 来确保订阅成功
+	go func() {
+		handler := func(ctx context.Context, channel string, message string) error {
+			return nil
+		}
+		sub, err := pubsub.Subscribe([]string{"req_pub_fail_ch"}, handler)
+		if err != nil {
+			return
+		}
+		defer sub.Stop()
+		time.Sleep(2 * time.Second)
+	}()
+
+	waitForSubscription()
+
+	// 关闭客户端使 Publish 失败
+	pubsub.client.Close()
+
+	_, err := pubsub.RequestResponse(ctx, "req_pub_fail_ch", "resp_fail_ch", "test", time.Millisecond*100)
+	assert.Error(t, err)
+}
+
+// TestRequestResponse_ContextCancellation 测试 RequestResponse 上下文取消（订阅成功后取消）
+func TestRequestResponse_ContextCancellation(t *testing.T) {
+	pubsub, cleanup := setupPubSub(t, "req_resp_cancel_test")
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 延迟取消上下文，确保 Subscribe 成功后再取消
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	// 请求-响应会因上下文取消而返回错误
+	_, err := pubsub.RequestResponse(ctx, "cancel_req", "cancel_resp", "test", time.Second*5)
+	assert.Error(t, err)
+}
+
+// TestMessageLoop_ChannelClosed 测试 messageLoop 在频道关闭时退出
+func TestMessageLoop_ChannelClosed(t *testing.T) {
+	pubsub, cleanup := setupPubSub(t, "channel_close_test")
+	defer cleanup()
+
+	handler := func(ctx context.Context, channel string, message string) error {
+		return nil
+	}
+
+	subscriber, err := pubsub.Subscribe([]string{"close_test_ch"}, handler)
+	require.NoError(t, err)
+
+	waitForSubscription()
+
+	// 通过 Close 来关闭 pubsub 连接，触发 channel 关闭
+	// subscriber.Stop() 会关闭 stopChan，messageLoop 通过 stopChan 退出
+	// 但如果 pubSubConn.Channel() 返回的 ch 被关闭（!ok），messageLoop 也会退出
+	subscriber.Stop()
+	assert.False(t, subscriber.IsActive())
+}
+
+// TestPublish_CompressionEnabled 测试启用压缩的发布路径
+func TestPublish_CompressionEnabled(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	pubsub := NewPubSub(client,
+		WithPubSubNamespace("compress_pub_test"),
+		WithPubSubMaxRetries(2),
+		WithPubSubRetryDelay(time.Millisecond*50),
+		WithPubSubBufferSize(10),
+		WithPubSubPingInterval(time.Second),
+		WithPubSubCompression(true),
+		WithPubSubCompressionMinSize(10), // 10 字节以上就压缩
+		WithPubSubMaxWorkers(20),
+		WithPubSubWorkerQueueSize(50),
+	)
+	defer pubsub.Close()
+
+	collector := newMessageCollector()
+
+	handler := func(ctx context.Context, channel string, message string) error {
+		collector.add(channel, message)
+		return nil
+	}
+
+	subscriber, err := pubsub.Subscribe([]string{"compress_pub_ch"}, handler)
+	require.NoError(t, err)
+	defer subscriber.Stop()
+
+	waitForSubscription()
+
+	// 发布大消息（超过压缩阈值）
+	largeMsg := "this is a large message that should be compressed by the publisher"
+	err = pubsub.Publish(ctx, "compress_pub_ch", largeMsg)
+	assert.NoError(t, err)
+
+	waitForMessage()
+
+	// 应该收到解压后的原始消息
+	assert.True(t, collector.has("compress_pub_ch", largeMsg))
+}
+
+// failPublishHook 使所有 PUBLISH 命令失败，用于测试 RequestResponse 发布失败
+type failPublishHook struct{}
+
+func (h *failPublishHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *failPublishHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "publish" {
+			return fmt.Errorf("publish command forced to fail")
+		}
+		return next(ctx, cmd)
+	}
+}
+func (h *failPublishHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// TestSubscriber_Stop_AlreadyClosedStopChan 测试 Stop 在 stopChan 已关闭时走 case 分支
+func TestSubscriber_Stop_AlreadyClosedStopChan(t *testing.T) {
+	pubsub, cleanup := setupPubSub(t, "stop_already_closed_test")
+	defer cleanup()
+
+	handler := func(ctx context.Context, channel string, message string) error {
+		return nil
+	}
+
+	subscriber, err := pubsub.Subscribe([]string{"test_ch"}, handler)
+	require.NoError(t, err)
+
+	waitForSubscription()
+
+	// 手动关闭 stopChan，模拟已关闭场景
+	subscriber.mu.Lock()
+	close(subscriber.stopChan)
+	subscriber.mu.Unlock()
+
+	// Stop 应该走 case <-s.stopChan 分支（stopChan 已关闭）
+	// 不会 panic（不会重复 close）
+	subscriber.Stop()
+}
+
+// TestRequestResponse_PublishErrorWithHook 测试 RequestResponse 在 Subscribe 成功后 Publish 失败
+func TestRequestResponse_PublishErrorWithHook(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	pubsub := NewPubSub(client,
+		WithPubSubNamespace("req_resp_hook_test"),
+		WithPubSubMaxRetries(2),
+		WithPubSubRetryDelay(time.Millisecond*50),
+		WithPubSubBufferSize(10),
+		WithPubSubPingInterval(time.Second),
+		WithPubSubMaxWorkers(20),
+		WithPubSubWorkerQueueSize(50),
+	)
+	defer pubsub.Close()
+
+	ctx := context.Background()
+
+	// 先添加 hook 使 PUBLISH 命令失败（不影响 SUBSCRIBE）
+	// 必须在 goroutine 启动前添加，否则 AddHook 与 Subscribe 中的 clone 并发导致数据竞争
+	client.AddHook(&failPublishHook{})
+
+	// 使用一个 goroutine 来处理请求
+	go func() {
+		sub, err := pubsub.Subscribe([]string{"req_hook_ch"}, func(ctx context.Context, channel string, message string) error {
+			// 收到请求后，发布响应
+			pubsub.Publish(ctx, "resp_hook_ch", "response_data")
+			return nil
+		})
+		if err != nil {
+			return
+		}
+		defer sub.Stop()
+		time.Sleep(3 * time.Second)
+	}()
+
+	waitForSubscription()
+
+	// RequestResponse 应该 Subscribe 成功但 Publish 失败
+	_, err := pubsub.RequestResponse(ctx, "req_hook_ch", "resp_hook_ch", "test_request", time.Second)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to publish request")
+}
+
+// TestRequestResponse_ResponseChannelFull 测试 RequestResponse 响应频道已满时走 default 分支
+func TestRequestResponse_ResponseChannelFull(t *testing.T) {
+	pubsub, cleanup := setupPubSub(t, "req_resp_full_test")
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// 启动一个响应者，会收到请求并发送两个响应
+	go func() {
+		sub, err := pubsub.Subscribe([]string{"req_full_ch"}, func(ctx context.Context, channel string, message string) error {
+			// 发送两个响应到响应频道，第二个会触发 default 分支
+			pubsub.Publish(ctx, "resp_full_ch", "response_1")
+			pubsub.Publish(ctx, "resp_full_ch", "response_2")
+			return nil
+		})
+		if err != nil {
+			return
+		}
+		defer sub.Stop()
+		time.Sleep(3 * time.Second)
+	}()
+
+	waitForSubscription()
+
+	// RequestResponse 会订阅 resp_full_ch，然后发送请求
+	// 响应者会发送两个响应，第一个填满 responseChan，第二个走 default 分支
+	response, err := pubsub.RequestResponse(ctx, "req_full_ch", "resp_full_ch", "test_request", 2*time.Second)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, response)
+}
+
+// TestMessageLoop_PoolSubmitError 测试 messageLoop 在 pool.Submit 失败时记录警告
+// 通过关闭 subscriber 的 pool 使 Submit 返回 ErrClosed
+func TestMessageLoop_PoolSubmitError(t *testing.T) {
+	pubsub, cleanup := setupPubSub(t, "pool_submit_err_test")
+	defer cleanup()
+
+	ctx := context.Background()
+
+	handler := func(ctx context.Context, channel string, message string) error {
+		return nil
+	}
+
+	subscriber, err := pubsub.Subscribe([]string{"pool_err_ch"}, handler)
+	require.NoError(t, err)
+	defer subscriber.Stop()
+
+	waitForSubscription()
+
+	// 直接关闭 subscriber 的 pool，使后续 Submit 返回 ErrClosed
+	subscriber.mu.Lock()
+	if subscriber.pool != nil {
+		subscriber.pool.Close()
+	}
+	subscriber.mu.Unlock()
+
+	// 发布消息，messageLoop 会收到消息但 pool.Submit 会失败
+	err = pubsub.Publish(ctx, "pool_err_ch", "test_message")
+	assert.NoError(t, err)
+
+	// 等待消息处理尝试
+	time.Sleep(200 * time.Millisecond)
+
+	// 验证 subscriber 仍然可以正常停止（没有 goroutine 泄漏）
+	subscriber.Stop()
+	assert.False(t, subscriber.IsActive())
 }

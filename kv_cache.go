@@ -160,7 +160,7 @@ type BatchLoader[K comparable, V any] func(ctx context.Context, keys []K) (map[K
 //	cache := cachex.NewKVCache[string, string](redisClient, "game_library",
 //	    loadFunc, cachex.KVCacheConfig{...})
 type KVCache[K comparable, V any] struct {
-	client      *redis.Client
+	client      redis.UniversalClient
 	config      KVCacheConfig
 	loader      KVLoader[K, V]
 	batchLoader BatchLoader[K, V] // 按需批量回源加载器（可选）
@@ -203,7 +203,7 @@ type invalidateMsg struct {
 
 // NewKVCache 创建 KV 缓存实例
 func NewKVCache[K comparable, V any](
-	client *redis.Client,
+	client redis.UniversalClient,
 	name string,
 	loader KVLoader[K, V],
 	config KVCacheConfig,
@@ -229,7 +229,7 @@ func NewKVCache[K comparable, V any](
 		stopChan:     make(chan struct{}),
 		logger:       config.Logger,
 		instanceID:   fmt.Sprintf("%d-%d", time.Now().UnixNano(), randomID()),
-		invalidateCh: fmt.Sprintf("%s:%s:invalidate", config.Namespace, name),
+		invalidateCh: config.Namespace + ":" + name + ":invalidate",
 	}
 
 	// 解析可选的 BatchLoader（按需批量回源加载器）
@@ -265,10 +265,7 @@ func (c *KVCache[K, V]) startInvalidationSubscriber() {
 	if c.client == nil {
 		return
 	}
-	c.pubsub = NewPubSub(c.client, PubSubConfig{
-		Namespace: "",
-		Logger:    c.logger,
-	})
+	c.pubsub = NewPubSub(c.client, WithPubSubLogger(c.logger))
 	_, err := c.pubsub.Subscribe([]string{c.invalidateCh}, func(ctx context.Context, channel, message string) error {
 		var msg invalidateMsg
 		if err := json.Unmarshal([]byte(message), &msg); err != nil {
@@ -334,7 +331,7 @@ func (c *KVCache[K, V]) buildInvalidationMsg(op string, keys []string) string {
 
 // redisKey 获取 Redis Hash 键名
 func (c *KVCache[K, V]) redisKey() string {
-	return fmt.Sprintf("%s:%s", c.config.Namespace, c.name)
+	return c.config.Namespace + ":" + c.name
 }
 
 // encodeValue 将 V 序列化为 Redis Hash value 字符串
@@ -587,7 +584,7 @@ func (c *KVCache[K, V]) SetMany(ctx context.Context, items map[K]V) error {
 }
 
 // Client 返回底层 Redis 客户端，供上层组件（如 ModelKVCache）构建 Pipeline 批量写入
-func (c *KVCache[K, V]) Client() *redis.Client { return c.client }
+func (c *KVCache[K, V]) Client() redis.UniversalClient { return c.client }
 
 // GetManyToPipe 将 HMGet 命令追加到给定 pipeline（不立即执行），返回 *redis.SliceCmd 供 Exec 后读取
 // 调用方负责执行 pipeline（pipe.Exec）与解析结果
@@ -886,7 +883,7 @@ func (c *KVCache[K, V]) Stop() {
 
 var (
 	// globalRedisClient 全局 Redis 客户端，由宿主服务在启动阶段通过 SetGlobalRedisClient 注入
-	globalRedisClient *redis.Client
+	globalRedisClient redis.UniversalClient
 
 	// globalLogger 全局日志记录器，由宿主服务通过 SetLogger 注入
 	// 所有后续创建的 KVCache 实例若未单独指定 Logger，将复用此日志器
@@ -899,7 +896,7 @@ var (
 
 // SetGlobalRedisClient 注入全局 Redis 客户端
 // 必须在调用 RegisterKV 之前完成注入，否则 RegisterKV 将 panic
-func SetGlobalRedisClient(client *redis.Client) {
+func SetGlobalRedisClient(client redis.UniversalClient) {
 	globalRedisClient = client
 }
 

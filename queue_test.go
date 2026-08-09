@@ -12,7 +12,10 @@ package cachex
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +24,83 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// failNthCmdHook 在第 N 条命令（1-based）执行时注入错误，其余正常转发
+type failNthCmdHook struct {
+	counter int32
+	failAt  int32
+	err     error
+}
+
+func (h *failNthCmdHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *failNthCmdHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if atomic.AddInt32(&h.counter, 1) == h.failAt {
+			return h.err
+		}
+		return next(ctx, cmd)
+	}
+}
+func (h *failNthCmdHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// shortBLPopResultHook 使 BLPop 返回长度为 1 的切片，触发 len(result) < 2 分支
+type shortBLPopResultHook struct{}
+
+func (h *shortBLPopResultHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *shortBLPopResultHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if err := next(ctx, cmd); err != nil {
+			return err
+		}
+		if ss, ok := cmd.(*redis.StringSliceCmd); ok && cmd.Name() == "blpop" {
+			ss.SetVal([]string{"only_one"})
+		}
+		return nil
+	}
+}
+func (h *shortBLPopResultHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// evalResultHook 替换 EVAL 命令的返回值
+type evalResultHook struct {
+	result interface{}
+}
+
+func (h *evalResultHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *evalResultHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if c, ok := cmd.(*redis.Cmd); ok && cmd.Name() == "eval" {
+			c.SetVal(h.result)
+			return nil
+		}
+		return next(ctx, cmd)
+	}
+}
+func (h *evalResultHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// cmdErrorHook 使指定名称的命令返回注入的错误
+type cmdErrorHook struct {
+	cmdName string
+	err     error
+}
+
+func (h *cmdErrorHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *cmdErrorHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == h.cmdName {
+			return h.err
+		}
+		return next(ctx, cmd)
+	}
+}
+func (h *cmdErrorHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
 
 // setupRedisClient 创建基于 miniredis 的本地内存 Redis 客户端，供测试离线运行
 // 每次调用启动一个独立 miniredis 实例，通过 tb.Cleanup 自动关闭，无需外部 Redis 服务
@@ -638,6 +718,626 @@ func TestQueueHandler_Stats(t *testing.T) {
 	assert.Equal(t, string(QueueTypeFIFO), stats.QueueType)
 	assert.Equal(t, int64(5), stats.Length)
 	assert.Equal(t, int64(0), stats.FailedCount) // 应该没有失败任务
+}
+
+// newTestQueue 创建基于 miniredis 的队列处理器（用于补充测试，独立于 setupRedisClient）
+func newTestQueue(t *testing.T, namespace string, config QueueConfig) (*QueueHandler, *redis.Client, *miniredis.Miniredis) {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	queue := NewQueueHandler(client, namespace, config)
+	return queue, client, mr
+}
+
+// TestQueueHandler_DequeueNonBlocking 验证非阻塞出队（覆盖 DequeueNonBlocking 与 dequeueWithTimeout 的 timeout=0 分支）
+func TestQueueHandler_DequeueNonBlocking(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{BatchSize: 10})
+	defer client.Close()
+	ctx := context.Background()
+
+	t.Run("FIFO非阻塞出队", func(t *testing.T) {
+		queueName := "nb_fifo"
+		require.NoError(t, queue.Enqueue(ctx, queueName, QueueTypeFIFO, &QueueItem{Data: "a"}))
+		require.NoError(t, queue.Enqueue(ctx, queueName, QueueTypeFIFO, &QueueItem{Data: "b"}))
+
+		item, err := queue.DequeueNonBlocking(ctx, queueName, QueueTypeFIFO)
+		assert.NoError(t, err)
+		require.NotNil(t, item)
+		assert.Equal(t, "a", item.Data) // FIFO 先进先出
+
+		// 空队列出队返回 nil
+		require.NoError(t, queue.Clear(ctx, queueName, QueueTypeFIFO))
+		item, err = queue.DequeueNonBlocking(ctx, queueName, QueueTypeFIFO)
+		assert.NoError(t, err)
+		assert.Nil(t, item, "空队列出队应返回 nil")
+	})
+
+	t.Run("LIFO非阻塞出队", func(t *testing.T) {
+		queueName := "nb_lifo"
+		require.NoError(t, queue.Enqueue(ctx, queueName, QueueTypeLIFO, &QueueItem{Data: "x"}))
+		require.NoError(t, queue.Enqueue(ctx, queueName, QueueTypeLIFO, &QueueItem{Data: "y"}))
+
+		item, err := queue.DequeueNonBlocking(ctx, queueName, QueueTypeLIFO)
+		assert.NoError(t, err)
+		require.NotNil(t, item)
+		assert.Equal(t, "y", item.Data) // LIFO 后进先出
+
+		// 空队列出队返回 nil
+		require.NoError(t, queue.Clear(ctx, queueName, QueueTypeLIFO))
+		item, err = queue.DequeueNonBlocking(ctx, queueName, QueueTypeLIFO)
+		assert.NoError(t, err)
+		assert.Nil(t, item, "空队列出队应返回 nil")
+	})
+
+	t.Run("Priority非阻塞出队", func(t *testing.T) {
+		queueName := "nb_priority"
+		require.NoError(t, queue.Enqueue(ctx, queueName, QueueTypePriority, &QueueItem{Data: "low", Priority: 1}))
+		require.NoError(t, queue.Enqueue(ctx, queueName, QueueTypePriority, &QueueItem{Data: "high", Priority: 10}))
+
+		item, err := queue.DequeueNonBlocking(ctx, queueName, QueueTypePriority)
+		assert.NoError(t, err)
+		require.NotNil(t, item)
+		assert.Equal(t, "high", item.Data) // 最高优先级先出
+
+		// 空队列出队返回 nil（ZPopMax 返回空）
+		require.NoError(t, queue.Clear(ctx, queueName, QueueTypePriority))
+		item, err = queue.DequeueNonBlocking(ctx, queueName, QueueTypePriority)
+		assert.NoError(t, err)
+		assert.Nil(t, item, "空队列出队应返回 nil")
+	})
+}
+
+// TestQueueHandler_GetLockKey 验证 getLockKey 生成的键名格式
+func TestQueueHandler_GetLockKey(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "myns", QueueConfig{})
+	defer client.Close()
+
+	// getLockKey 是未导出方法，通过 AcquireLock/ReleaseLock 间接覆盖；这里直接验证格式
+	lockKey := queue.getLockKey("order_queue")
+	assert.Equal(t, "myns:lock:queue:order_queue", lockKey)
+}
+
+// TestQueueHandler_DistributedLock 验证启用分布式锁时的 AcquireLock/ReleaseLock
+func TestQueueHandler_DistributedLock(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{
+		LockTimeout:           time.Minute,
+		EnableDistributedLock: true,
+	})
+	defer client.Close()
+	ctx := context.Background()
+	queueName := "dist_lock"
+
+	// worker1 获取锁成功
+	acquired, err := queue.AcquireLock(ctx, queueName, "worker1")
+	assert.NoError(t, err)
+	assert.True(t, acquired, "首次获取锁应成功")
+
+	// worker2 获取锁失败（锁已被 worker1 持有）
+	acquired, err = queue.AcquireLock(ctx, queueName, "worker2")
+	assert.NoError(t, err)
+	assert.False(t, acquired, "锁已被持有时应获取失败")
+
+	// worker2 释放锁不应影响 worker1 的锁（Lua 脚本校验 lockValue）
+	assert.NoError(t, queue.ReleaseLock(ctx, queueName, "worker2"))
+	// worker2 仍可获取失败
+	acquired, _ = queue.AcquireLock(ctx, queueName, "worker2")
+	assert.False(t, acquired, "非持有者释放后锁仍被 worker1 持有")
+
+	// worker1 释放锁
+	assert.NoError(t, queue.ReleaseLock(ctx, queueName, "worker1"))
+	// 之后 worker2 可获取
+	acquired, err = queue.AcquireLock(ctx, queueName, "worker2")
+	assert.NoError(t, err)
+	assert.True(t, acquired, "worker1 释放后 worker2 应获取成功")
+}
+
+// TestQueueHandler_DistributedLockError 验证分布式锁在 Redis 错误时返回错误
+func TestQueueHandler_DistributedLockError(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	queue := NewQueueHandler(client, "test", QueueConfig{
+		LockTimeout:           time.Minute,
+		EnableDistributedLock: true,
+	})
+	ctx := context.Background()
+
+	// 关闭 miniredis 使 SetNX 失败
+	mr.Close()
+	acquired, err := queue.AcquireLock(ctx, "any", "worker1")
+	assert.Error(t, err)
+	assert.False(t, acquired)
+
+	// ReleaseLock 的 Eval 在 Redis 不可用时返回错误
+	err = queue.ReleaseLock(ctx, "any", "worker1")
+	assert.Error(t, err)
+}
+
+// TestQueueHandler_GetStatsDelayed 验证 GetStats 对延时队列统计 DelayedCount 分支
+func TestQueueHandler_GetStatsDelayed(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{})
+	defer client.Close()
+	ctx := context.Background()
+	queueName := "stats_delayed"
+
+	// 入队延时任务
+	require.NoError(t, queue.Enqueue(ctx, queueName, QueueTypeDelayed, &QueueItem{Data: "d1", DelayTime: 5}))
+	require.NoError(t, queue.Enqueue(ctx, queueName, QueueTypeDelayed, &QueueItem{Data: "d2", DelayTime: 10}))
+
+	stats, err := queue.GetStats(ctx, queueName, QueueTypeDelayed)
+	assert.NoError(t, err)
+	require.NotNil(t, stats)
+	assert.Equal(t, int64(2), stats.Length, "延时队列长度应为 2")
+	assert.Equal(t, int64(2), stats.DelayedCount, "DelayedCount 应为 2")
+}
+
+// TestQueueHandler_ContainsBranches 验证 Contains 的各分支
+func TestQueueHandler_ContainsBranches(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{BatchSize: 10})
+	defer client.Close()
+	ctx := context.Background()
+
+	t.Run("空队列返回false", func(t *testing.T) {
+		// 长度为 0 时直接返回 false
+		contains, err := queue.Contains(ctx, "empty_queue", QueueTypeFIFO, "any")
+		assert.NoError(t, err)
+		assert.False(t, contains, "空队列应返回 false")
+	})
+
+	t.Run("数量超过1000被截断", func(t *testing.T) {
+		queueName := "big_queue"
+		// 入队 1001 个任务，触发 count > 1000 截断分支
+		for i := 0; i < 1001; i++ {
+			require.NoError(t, queue.Enqueue(ctx, queueName, QueueTypeFIFO, &QueueItem{Data: fmt.Sprintf("task%d", i)}))
+		}
+		// Contains 应正常返回（不报错），仅检查前 1000 个
+		contains, err := queue.Contains(ctx, queueName, QueueTypeFIFO, "nonexistent")
+		assert.NoError(t, err)
+		assert.False(t, contains, "不存在的 ID 应返回 false")
+	})
+}
+
+// TestQueueHandler_UnsupportedType 验证不支持队列类型的默认分支
+func TestQueueHandler_UnsupportedType(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{})
+	defer client.Close()
+	ctx := context.Background()
+	invalidType := QueueType("invalid")
+
+	// Enqueue 默认分支
+	err := queue.Enqueue(ctx, "q", invalidType, &QueueItem{Data: "x"})
+	assert.Error(t, err)
+
+	// Dequeue 默认分支
+	_, err = queue.Dequeue(ctx, "q", invalidType)
+	assert.Error(t, err)
+
+	// DequeueNonBlocking 默认分支
+	_, err = queue.DequeueNonBlocking(ctx, "q", invalidType)
+	assert.Error(t, err)
+
+	// Length 默认分支
+	_, err = queue.Length(ctx, "q", invalidType)
+	assert.Error(t, err)
+
+	// Peek 默认分支
+	_, err = queue.Peek(ctx, "q", invalidType, 1)
+	assert.Error(t, err)
+}
+
+// TestQueueHandler_MarshalError 验证 Enqueue 在序列化失败时返回错误
+func TestQueueHandler_MarshalError(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{})
+	defer client.Close()
+	ctx := context.Background()
+
+	// Data 为 channel 无法被 json.Marshal 序列化
+	err := queue.Enqueue(ctx, "q", QueueTypeFIFO, &QueueItem{Data: make(chan int)})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to marshal queue item")
+}
+
+// TestQueueHandler_DequeueUnmarshalError 验证出队时反序列化失败返回错误
+func TestQueueHandler_DequeueUnmarshalError(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{})
+	defer client.Close()
+	ctx := context.Background()
+
+	t.Run("FIFO反序列化错误", func(t *testing.T) {
+		queueName := "bad_fifo"
+		// 直接推送非法 JSON 到队列
+		require.NoError(t, client.RPush(ctx, queue.getQueueKey(queueName, QueueTypeFIFO), "not-json").Err())
+
+		_, err := queue.DequeueNonBlocking(ctx, queueName, QueueTypeFIFO)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to unmarshal queue item")
+	})
+
+	t.Run("Priority反序列化错误", func(t *testing.T) {
+		queueName := "bad_priority"
+		// ZAdd 非法 JSON 成员
+		require.NoError(t, client.ZAdd(ctx, queue.getQueueKey(queueName, QueueTypePriority), redis.Z{Score: 1, Member: "not-json"}).Err())
+
+		_, err := queue.DequeueNonBlocking(ctx, queueName, QueueTypePriority)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to unmarshal queue item")
+	})
+
+	t.Run("Delayed反序列化错误", func(t *testing.T) {
+		queueName := "bad_delayed"
+		// 向延时 key 推入非法 JSON，score 为当前时间（立即到期）
+		require.NoError(t, client.ZAdd(ctx, queue.getDelayKey(queueName), redis.Z{Score: float64(time.Now().Unix()), Member: "not-json"}).Err())
+
+		_, err := queue.Dequeue(ctx, queueName, QueueTypeDelayed)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to unmarshal delayed queue item")
+	})
+}
+
+// TestQueueHandler_DelayedProcessError 验证 processDelayedQueue 在 Redis 错误时返回错误
+func TestQueueHandler_DelayedProcessError(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	queue := NewQueueHandler(client, "test", QueueConfig{})
+	ctx := context.Background()
+
+	// 关闭 miniredis 使 ZRangeByScoreWithScores 失败
+	mr.Close()
+	_, err := queue.Dequeue(ctx, "any", QueueTypeDelayed)
+	assert.Error(t, err)
+}
+
+// TestQueueHandler_GetFailedItemsErrors 验证 GetFailedItems 的错误分支
+func TestQueueHandler_GetFailedItemsErrors(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{})
+	defer client.Close()
+	ctx := context.Background()
+	queueName := "failed_items"
+
+	t.Run("反序列化错误被跳过", func(t *testing.T) {
+		failedKey := fmt.Sprintf("%s:failed:%s", "test", queueName)
+		// 推入非法 JSON 到失败队列
+		require.NoError(t, client.LPush(ctx, failedKey, "not-json").Err())
+		// 再推入合法 JSON
+		validItem, _ := json.Marshal(&QueueItem{Data: "valid"})
+		require.NoError(t, client.LPush(ctx, failedKey, validItem).Err())
+
+		items, err := queue.GetFailedItems(ctx, queueName, 0, 10)
+		assert.NoError(t, err, "反序列化错误应被跳过而非返回")
+		require.Len(t, items, 1)
+		assert.Equal(t, "valid", items[0].Data)
+	})
+
+	t.Run("Redis错误返回错误", func(t *testing.T) {
+		mr := miniredis.RunT(t)
+		c2 := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		q2 := NewQueueHandler(c2, "test", QueueConfig{})
+		mr.Close() // 关闭使 LRange 失败
+		_, err := q2.GetFailedItems(ctx, "any", 0, 10)
+		assert.Error(t, err)
+		c2.Close()
+	})
+}
+
+// TestQueueHandler_BatchDequeuePriority 验证 BatchDequeue 对优先级队列的循环出队路径
+func TestQueueHandler_BatchDequeuePriority(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{BatchSize: 10})
+	defer client.Close()
+	ctx := context.Background()
+	queueName := "batch_priority"
+
+	// 入队 3 个不同优先级任务
+	require.NoError(t, queue.Enqueue(ctx, queueName, QueueTypePriority, &QueueItem{Data: "low", Priority: 1}))
+	require.NoError(t, queue.Enqueue(ctx, queueName, QueueTypePriority, &QueueItem{Data: "mid", Priority: 5}))
+	require.NoError(t, queue.Enqueue(ctx, queueName, QueueTypePriority, &QueueItem{Data: "high", Priority: 10}))
+
+	// 批量出队（Priority 走 DequeueNonBlocking 循环路径）
+	items, err := queue.BatchDequeue(ctx, queueName, QueueTypePriority, 5)
+	assert.NoError(t, err)
+	assert.Len(t, items, 3, "应批量出队 3 个任务")
+	// 按优先级从高到低
+	assert.Equal(t, "high", items[0].Data)
+	assert.Equal(t, "mid", items[1].Data)
+	assert.Equal(t, "low", items[2].Data)
+}
+
+// TestQueueHandler_BatchDequeueLuaError 验证 batchDequeueLua 在 Eval 失败时返回错误
+func TestQueueHandler_BatchDequeueLuaError(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	queue := NewQueueHandler(client, "test", QueueConfig{BatchSize: 10})
+	ctx := context.Background()
+
+	// 预先入队一个任务
+	require.NoError(t, queue.Enqueue(ctx, "lua_err", QueueTypeFIFO, &QueueItem{Data: "x"}))
+	// 关闭 miniredis 使 Eval 失败
+	mr.Close()
+	_, err := queue.BatchDequeue(ctx, "lua_err", QueueTypeFIFO, 5)
+	assert.Error(t, err)
+}
+
+// TestQueueHandler_PeekErrors 验证 Peek 在 Redis 错误时返回错误
+func TestQueueHandler_PeekErrors(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	queue := NewQueueHandler(client, "test", QueueConfig{BatchSize: 10})
+	ctx := context.Background()
+
+	// 预先入队
+	require.NoError(t, queue.Enqueue(ctx, "peek_err", QueueTypePriority, &QueueItem{Data: "x", Priority: 1}))
+	require.NoError(t, queue.Enqueue(ctx, "peek_d", QueueTypeDelayed, &QueueItem{Data: "y", DelayTime: 0}))
+
+	// 关闭 miniredis 使各 Peek 命令失败
+	mr.Close()
+
+	_, err := queue.Peek(ctx, "peek_err", QueueTypeFIFO, 1)
+	assert.Error(t, err)
+	_, err = queue.Peek(ctx, "peek_err", QueueTypeLIFO, 1)
+	assert.Error(t, err)
+	_, err = queue.Peek(ctx, "peek_err", QueueTypePriority, 1)
+	assert.Error(t, err)
+	_, err = queue.Peek(ctx, "peek_d", QueueTypeDelayed, 1)
+	assert.Error(t, err)
+}
+
+// TestQueueHandler_LengthDelayed 验证 Length 对延时队列分支
+func TestQueueHandler_LengthDelayed(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{})
+	defer client.Close()
+	ctx := context.Background()
+
+	require.NoError(t, queue.Enqueue(ctx, "len_d", QueueTypeDelayed, &QueueItem{Data: "d", DelayTime: 5}))
+	length, err := queue.Length(ctx, "len_d", QueueTypeDelayed)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), length)
+}
+
+// TestQueueHandler_ContainsError 验证 Contains 在 Length/Peek 失败时返回错误
+func TestQueueHandler_ContainsError(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	queue := NewQueueHandler(client, "test", QueueConfig{})
+	ctx := context.Background()
+
+	// 入队一个任务使长度>0
+	require.NoError(t, queue.Enqueue(ctx, "contains_err", QueueTypeFIFO, &QueueItem{Data: "x"}))
+	// 关闭 miniredis 使 Length 或 Peek 失败
+	mr.Close()
+	_, err := queue.Contains(ctx, "contains_err", QueueTypeFIFO, "x")
+	assert.Error(t, err)
+}
+
+// TestQueueHandler_DequeueNonBlockingRedisError 验证非阻塞出队在 Redis 错误时返回错误
+// 覆盖 FIFO/LIFO 的 LPop 错误分支和 Priority 的 ZPopMax 错误分支
+func TestQueueHandler_DequeueNonBlockingRedisError(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("FIFO LPop错误", func(t *testing.T) {
+		mr := miniredis.RunT(t)
+		client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		queue := NewQueueHandler(client, "test", QueueConfig{})
+		// 预先入队一个任务使队列非空
+		require.NoError(t, queue.Enqueue(ctx, "fifo_err", QueueTypeFIFO, &QueueItem{Data: "x"}))
+		// 关闭 miniredis 使 LPop 返回连接错误（非 redis.Nil）
+		mr.Close()
+		_, err := queue.DequeueNonBlocking(ctx, "fifo_err", QueueTypeFIFO)
+		assert.Error(t, err)
+	})
+
+	t.Run("LIFO LPop错误", func(t *testing.T) {
+		mr := miniredis.RunT(t)
+		client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		queue := NewQueueHandler(client, "test", QueueConfig{})
+		require.NoError(t, queue.Enqueue(ctx, "lifo_err", QueueTypeLIFO, &QueueItem{Data: "x"}))
+		mr.Close()
+		_, err := queue.DequeueNonBlocking(ctx, "lifo_err", QueueTypeLIFO)
+		assert.Error(t, err)
+	})
+
+	t.Run("Priority ZPopMax错误", func(t *testing.T) {
+		mr := miniredis.RunT(t)
+		client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		queue := NewQueueHandler(client, "test", QueueConfig{})
+		require.NoError(t, queue.Enqueue(ctx, "pri_err", QueueTypePriority, &QueueItem{Data: "x", Priority: 1}))
+		mr.Close()
+		_, err := queue.DequeueNonBlocking(ctx, "pri_err", QueueTypePriority)
+		assert.Error(t, err)
+	})
+}
+
+// TestQueueHandler_DequeueBLPopError 验证 Dequeue（timeout>0）在 BLPop 非 redis.Nil 错误时返回错误
+func TestQueueHandler_DequeueBLPopError(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	queue := NewQueueHandler(client, "test", QueueConfig{})
+	ctx := context.Background()
+	// 关闭 miniredis 使 BLPop 返回连接错误（非 redis.Nil）
+	mr.Close()
+	_, err := queue.Dequeue(ctx, "blpop_err", QueueTypeFIFO)
+	assert.Error(t, err)
+}
+
+// TestQueueHandler_DequeueBLPopShortResult 验证 BLPop 返回长度不足时返回 nil
+// 通过 hook 使 BLPop 返回单元素切片，触发 len(result) < 2 分支
+func TestQueueHandler_DequeueBLPopShortResult(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{})
+	defer client.Close()
+	ctx := context.Background()
+
+	// 入队一个任务使队列非空
+	require.NoError(t, queue.Enqueue(ctx, "short_blpop", QueueTypeFIFO, &QueueItem{Data: "x"}))
+
+	// 添加 hook 使 BLPop 返回长度为 1 的切片
+	client.AddHook(&shortBLPopResultHook{})
+
+	item, err := queue.Dequeue(ctx, "short_blpop", QueueTypeFIFO)
+	assert.NoError(t, err)
+	assert.Nil(t, item, "BLPop 返回长度不足时应返回 nil")
+}
+
+// TestQueueHandler_BatchDequeuePriorityError 验证 BatchDequeue 对 Priority 在 Redis 错误时返回错误
+func TestQueueHandler_BatchDequeuePriorityError(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	queue := NewQueueHandler(client, "test", QueueConfig{BatchSize: 10})
+	ctx := context.Background()
+	// 预先入队使队列非空
+	require.NoError(t, queue.Enqueue(ctx, "batch_pri_err", QueueTypePriority, &QueueItem{Data: "x", Priority: 1}))
+	// 关闭 miniredis 使 DequeueNonBlocking 中的 ZPopMax 失败
+	mr.Close()
+	_, err := queue.BatchDequeue(ctx, "batch_pri_err", QueueTypePriority, 5)
+	assert.Error(t, err)
+}
+
+// TestQueueHandler_BatchDequeueLIFO 验证 BatchDequeue 对 LIFO 队列的 Lua 批量出队路径
+func TestQueueHandler_BatchDequeueLIFO(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{BatchSize: 10})
+	defer client.Close()
+	ctx := context.Background()
+	queueName := "batch_lifo"
+
+	// 入队 3 个任务
+	for i := 0; i < 3; i++ {
+		require.NoError(t, queue.Enqueue(ctx, queueName, QueueTypeLIFO, &QueueItem{Data: fmt.Sprintf("item%d", i)}))
+	}
+
+	// 批量出队（LIFO 走 batchDequeueLua 的 LIFO 分支）
+	items, err := queue.BatchDequeue(ctx, queueName, QueueTypeLIFO, 5)
+	assert.NoError(t, err)
+	assert.Len(t, items, 3)
+	// LIFO: 后入先出
+	assert.Equal(t, "item2", items[0].Data)
+	assert.Equal(t, "item1", items[1].Data)
+	assert.Equal(t, "item0", items[2].Data)
+}
+
+// TestQueueHandler_BatchDequeueLuaUnmarshalError 验证 batchDequeueLua 在 JSON 反序列化失败时跳过
+func TestQueueHandler_BatchDequeueLuaUnmarshalError(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{BatchSize: 10})
+	defer client.Close()
+	ctx := context.Background()
+	queueName := "batch_lua_bad"
+
+	// 直接推入非法 JSON 到 FIFO 队列
+	queueKey := fmt.Sprintf("test:queue:%s:%s", string(QueueTypeFIFO), queueName)
+	require.NoError(t, client.RPush(ctx, queueKey, "not-json").Err())
+	// 再推入合法 JSON
+	validItem, _ := json.Marshal(&QueueItem{Data: "valid"})
+	require.NoError(t, client.RPush(ctx, queueKey, validItem).Err())
+
+	// BatchDequeue 应跳过非法 JSON，只返回合法项
+	items, err := queue.BatchDequeue(ctx, queueName, QueueTypeFIFO, 5)
+	assert.NoError(t, err)
+	require.Len(t, items, 1)
+	assert.Equal(t, "valid", items[0].Data)
+}
+
+// TestQueueHandler_BatchDequeueLuaUnexpectedResult 验证 batchDequeueLua 在 Eval 返回非切片类型时报错
+func TestQueueHandler_BatchDequeueLuaUnexpectedResult(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{BatchSize: 10})
+	defer client.Close()
+	ctx := context.Background()
+	queueName := "batch_lua_unexpected"
+
+	// 预先入队一个任务使队列非空
+	require.NoError(t, queue.Enqueue(ctx, queueName, QueueTypeFIFO, &QueueItem{Data: "x"}))
+
+	// 添加 hook 使 EVAL 返回 int64（非 []interface{}）
+	client.AddHook(&evalResultHook{result: int64(42)})
+
+	_, err := queue.BatchDequeue(ctx, queueName, QueueTypeFIFO, 5)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "unexpected lua result type")
+}
+
+// TestQueueHandler_BatchDequeueLuaNonStringElement 验证 batchDequeueLua 在元素类型断言失败时跳过
+func TestQueueHandler_BatchDequeueLuaNonStringElement(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{BatchSize: 10})
+	defer client.Close()
+	ctx := context.Background()
+	queueName := "batch_lua_nonstr"
+
+	// 预先入队一个任务使队列非空
+	require.NoError(t, queue.Enqueue(ctx, queueName, QueueTypeFIFO, &QueueItem{Data: "x"}))
+
+	// 添加 hook 使 EVAL 返回包含非字符串元素的切片
+	client.AddHook(&evalResultHook{result: []interface{}{int64(42), "valid-json"}})
+
+	// 应跳过非字符串元素，继续处理合法的
+	items, err := queue.BatchDequeue(ctx, queueName, QueueTypeFIFO, 5)
+	assert.NoError(t, err)
+	// "valid-json" 不是合法的 QueueItem JSON，也会被 Unmarshal 跳过
+	assert.Empty(t, items)
+}
+
+// TestQueueHandler_PeekUnmarshalError 验证 Peek 在 JSON 反序列化失败时跳过
+func TestQueueHandler_PeekUnmarshalError(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{BatchSize: 10})
+	defer client.Close()
+	ctx := context.Background()
+	queueName := "peek_bad"
+
+	// 直接推入非法 JSON 到 FIFO 队列
+	queueKey := fmt.Sprintf("test:queue:%s:%s", string(QueueTypeFIFO), queueName)
+	require.NoError(t, client.RPush(ctx, queueKey, "not-json").Err())
+	// 再推入合法 JSON
+	validItem, _ := json.Marshal(&QueueItem{Data: "valid"})
+	require.NoError(t, client.RPush(ctx, queueKey, validItem).Err())
+
+	// Peek 应跳过非法 JSON，只返回合法项
+	items, err := queue.Peek(ctx, queueName, QueueTypeFIFO, 5)
+	assert.NoError(t, err)
+	require.Len(t, items, 1)
+	assert.Equal(t, "valid", items[0].Data)
+}
+
+// TestQueueHandler_ContainsPeekError 验证 Contains 在 Length 成功但 Peek 失败时返回错误
+// 使用 hook 使第一条命令（Length）正常、第二条命令（Peek）失败
+func TestQueueHandler_ContainsPeekError(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{BatchSize: 10})
+	defer client.Close()
+	ctx := context.Background()
+	queueName := "contains_peek_err"
+
+	// 入队一个任务使 Length > 0
+	require.NoError(t, queue.Enqueue(ctx, queueName, QueueTypeFIFO, &QueueItem{Data: "x"}))
+
+	// 添加 hook：第 1 条命令（LLen=Length）正常，第 2 条命令（LRange=Peek）失败
+	client.AddHook(&failNthCmdHook{failAt: 2, err: errors.New("injected peek error")})
+
+	_, err := queue.Contains(ctx, queueName, QueueTypeFIFO, "any")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "injected peek error")
+}
+
+// TestQueueHandler_GetStatsError 验证 GetStats 在 Length 失败时返回错误
+func TestQueueHandler_GetStatsError(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	queue := NewQueueHandler(client, "test", QueueConfig{})
+	ctx := context.Background()
+
+	// 关闭 miniredis 使 Length 失败
+	mr.Close()
+	_, err := queue.GetStats(ctx, "any", QueueTypeFIFO)
+	assert.Error(t, err)
+}
+
+// TestQueueHandler_DequeueNonBlockingPriorityNil 验证 Priority ZPopMax 返回 redis.Nil 时返回 nil
+// 通过 hook 使 ZPopMax 返回 redis.Nil，触发 zErr == redis.Nil 分支
+func TestQueueHandler_DequeueNonBlockingPriorityNil(t *testing.T) {
+	queue, client, _ := newTestQueue(t, "test", QueueConfig{BatchSize: 10})
+	defer client.Close()
+	ctx := context.Background()
+
+	// 预先入队一个任务使队列非空
+	require.NoError(t, queue.Enqueue(ctx, "pri_nil", QueueTypePriority, &QueueItem{Data: "x", Priority: 1}))
+
+	// 添加 hook 使 ZPopMax 返回 redis.Nil 错误
+	client.AddHook(&cmdErrorHook{cmdName: "zpopmax", err: redis.Nil})
+
+	item, err := queue.DequeueNonBlocking(ctx, "pri_nil", QueueTypePriority)
+	assert.NoError(t, err)
+	assert.Nil(t, item, "ZPopMax 返回 redis.Nil 时应返回 nil")
 }
 
 // 基准测试

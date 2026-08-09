@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -300,16 +299,14 @@ func TestLockManager(t *testing.T) {
 	defer client.Close()
 
 	ctx := context.Background()
-	config := LockConfig{
-		TTL:              time.Minute,
-		RetryInterval:    time.Millisecond * 100,
-		MaxRetries:       5,
-		Namespace:        "test",
-		EnableWatchdog:   false,
-		WatchdogInterval: time.Second * 30,
-	}
-
-	manager := NewLockManager(client, config)
+	manager := NewLockManager(client,
+		WithLockTTL(time.Minute),
+		WithLockRetryInterval(time.Millisecond*100),
+		WithLockMaxRetries(5),
+		WithLockNamespace("test"),
+		WithLockWatchdog(false),
+		WithLockWatchdogInterval(time.Second*30),
+	)
 
 	// 获取锁
 	lock1 := manager.GetLock("resource1")
@@ -1003,25 +1000,12 @@ func TestDistributedLock_WatchdogIsLockedError(t *testing.T) {
 	time.Sleep(time.Millisecond * 300)
 }
 
-// TestLockManager_PanicOnNonRedisClient 覆盖 NewLockManager panic
-func TestLockManager_PanicOnNonRedisClient(t *testing.T) {
-	// 传入 *redis.ClusterClient（非 *redis.Client）应 panic
-	clusterClient := redis.NewClusterClient(&redis.ClusterOptions{
-		Addrs: []string{"localhost:6379"},
-	})
-	defer clusterClient.Close()
-
-	assert.Panics(t, func() {
-		NewLockManager(clusterClient)
-	})
-}
-
 // TestLockManager_ReleaseLockNotFound 覆盖 ReleaseLock 中锁不存在
 func TestLockManager_ReleaseLockNotFound(t *testing.T) {
 	client := setupRedisClient(t)
 	defer client.Close()
 	ctx := context.Background()
-	mgr := NewLockManager(client, LockConfig{TTL: time.Minute, Namespace: "test"})
+	mgr := NewLockManager(client, WithLockTTL(time.Minute), WithLockNamespace("test"))
 
 	err := mgr.ReleaseLock(ctx, "non_existent")
 	assert.ErrorIs(t, err, ErrLockNotFound)
@@ -1031,11 +1015,7 @@ func TestLockManager_ReleaseLockNotFound(t *testing.T) {
 func TestLockManager_ReleaseAllLocksWithError(t *testing.T) {
 	client := setupRedisClient(t)
 	ctx := context.Background()
-	mgr := NewLockManager(client, LockConfig{
-		TTL:            time.Minute,
-		Namespace:      "test",
-		EnableWatchdog: false,
-	})
+	mgr := NewLockManager(client, WithLockTTL(time.Minute), WithLockNamespace("test"), WithLockWatchdog(false))
 
 	lock1 := mgr.GetLock("release_err_1")
 	_, err := lock1.TryLock(ctx)
@@ -1114,11 +1094,7 @@ func TestDistributedLock_CleanupExpiredLocks(t *testing.T) {
 	client := setupRedisClient(t)
 	defer client.Close()
 	ctx := context.Background()
-	mgr := NewLockManager(client, LockConfig{
-		TTL:            time.Millisecond * 100,
-		Namespace:      "test",
-		EnableWatchdog: false,
-	})
+	mgr := NewLockManager(client, WithLockTTL(time.Millisecond*100), WithLockNamespace("test"), WithLockWatchdog(false))
 
 	lock1 := mgr.GetLock("expired_1")
 	_, err := lock1.TryLock(ctx)
@@ -1384,4 +1360,69 @@ func TestLockWithRetry_UnlockFail(t *testing.T) {
 	})
 	// LockWithRetry 返回 fn 的结果（nil），Unlock 失败只记录日志
 	assert.NoError(t, err)
+}
+
+// TestDistributedLock_WatchdogStopChanExit 覆盖 watchdog 的 case <-stopChan 分支
+// 用超大 WatchdogInterval 确保 ticker 不触发，Unlock 后 watchdog 仅能通过 <-stopChan 退出
+// 依赖缓冲为 1 的 stopChan：stopWatchdogLocked 的非阻塞 send 必然成功送达
+func TestDistributedLock_WatchdogStopChanExit(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	config := LockConfig{
+		TTL:              time.Minute,
+		Namespace:        "test",
+		EnableWatchdog:   true,
+		WatchdogInterval: time.Hour, // 超大间隔，ticker 不会触发
+	}
+	lock := NewDistributedLock(client, "wd_stop_chan", config)
+
+	acquired, err := lock.TryLock(ctx)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	// watchdog 此时阻塞在 select（ticker 1 小时后才触发）
+	// Unlock -> resetState -> stopWatchdogLocked 向缓冲通道发送信号
+	// watchdog 下一次 select 命中 <-stopChan 退出（唯一退出路径，ticker 与 ctx 都未触发）
+	err = lock.Unlock(ctx)
+	assert.NoError(t, err)
+
+	// 等待 watchdog goroutine 通过 <-stopChan 退出
+	time.Sleep(time.Millisecond * 100)
+
+	// 验证本地状态已清理、stopChan 已置 nil
+	lock.mu.Lock()
+	isAcq := lock.acquired
+	stopCh := lock.stopChan
+	lock.mu.Unlock()
+	assert.False(t, isAcq, "Unlock 后 acquired 应被清理")
+	assert.Nil(t, stopCh, "stopChan 应被置 nil")
+}
+
+// TestDistributedLock_TryLockSetNXError 覆盖 TryLock 中 SetNX 错误分支（line 152-154）
+func TestDistributedLock_TryLockSetNXError(t *testing.T) {
+	client := setupRedisClient(t)
+	ctx := context.Background()
+	config := LockConfig{TTL: time.Minute, Namespace: "test", EnableWatchdog: false}
+	lock := NewDistributedLock(client, "trylock_setnx_err", config)
+
+	// 关闭 client 导致 SetNX 命令出错
+	client.Close()
+	acquired, err := lock.TryLock(ctx)
+	assert.Error(t, err)
+	assert.False(t, acquired, "SetNX 错误时不应获取锁")
+}
+
+// TestDistributedLock_LockTryLockError 覆盖 Lock 中 TryLock 返回错误的分支（line 186-187）
+func TestDistributedLock_LockTryLockError(t *testing.T) {
+	client := setupRedisClient(t)
+	ctx := context.Background()
+	config := LockConfig{TTL: time.Minute, Namespace: "test", EnableWatchdog: false}
+	lock := NewDistributedLock(client, "lock_trylock_err", config)
+
+	// 关闭 client 导致 TryLock 的 SetNX 错误，Lock 应立即返回该错误而非阻塞
+	client.Close()
+	err := lock.Lock(ctx)
+	assert.Error(t, err)
 }

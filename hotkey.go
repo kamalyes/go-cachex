@@ -49,25 +49,27 @@ func (s *SQLDataLoader[K, V]) Load(ctx context.Context) (map[K]V, error) {
 
 // HotKeyCache 热key缓存
 type HotKeyCache[K comparable, V any] struct {
-	client          *redis.Client
+	client          redis.UniversalClient
 	config          HotKeyConfig
 	loader          DataLoader[K, V]
 	keyName         string
+	redisKey        string // 预计算的 Redis 键名，避免每次 fmt.Sprintf
 	mu              sync.RWMutex
 	localCache      map[K]V
 	lastRefreshTime time.Time
 	stopChan        chan struct{}
 	once            sync.Once
 	logger          logger.ILogger
-	// 防止本地缓存无界增长
-	accessOrder   []K          // 访问顺序，用于 LRU 驱逐
-	accessOrderMu sync.Mutex   // 保护 accessOrder
-	cleanupTicker *time.Ticker // 定期清理过期数据
+	// 防止本地缓存无界增长（由 mu 保护，避免单独锁带来的锁顺序问题）
+	accessOrder   []K            // 插入顺序，用于 FIFO 驱逐
+	cleanupTicker *time.Ticker   // 定期清理过期数据
+	stopMu        sync.Mutex     // 保护 stopChan/cleanupTicker 等字段的同步访问
+	wg            sync.WaitGroup // 跟踪后台 goroutine（autoRefresh/cleanupExpired）
 }
 
 // NewHotKeyCache 创建热key缓存
 func NewHotKeyCache[K comparable, V any](
-	client *redis.Client,
+	client redis.UniversalClient,
 	keyName string,
 	loader DataLoader[K, V],
 	config HotKeyConfig,
@@ -83,6 +85,7 @@ func NewHotKeyCache[K comparable, V any](
 		config:        config,
 		loader:        loader,
 		keyName:       keyName,
+		redisKey:      config.Namespace + ":" + keyName, // 预计算，避免热路径 fmt.Sprintf
 		localCache:    make(map[K]V),
 		accessOrder:   make([]K, 0),
 		stopChan:      make(chan struct{}),
@@ -92,26 +95,29 @@ func NewHotKeyCache[K comparable, V any](
 
 	// 启动自动刷新
 	if config.EnableAutoRefresh {
+		cache.wg.Add(1)
 		syncx.Go().
 			OnPanic(func(r interface{}) {
 				cache.logger.Errorf("Panic in autoRefresh: %v", r)
 			}).
-			Exec(cache.autoRefresh)
+			Exec(func() {
+				defer cache.wg.Done()
+				cache.autoRefresh()
+			})
 	}
 
 	// 启动定期清理
+	cache.wg.Add(1)
 	syncx.Go().
 		OnPanic(func(r interface{}) {
 			cache.logger.Errorf("Panic in cleanup: %v", r)
 		}).
-		Exec(cache.cleanupExpired)
+		Exec(func() {
+			defer cache.wg.Done()
+			cache.cleanupExpired()
+		})
 
 	return cache
-}
-
-// getRedisKey 获取Redis键名
-func (h *HotKeyCache[K, V]) getRedisKey() string {
-	return fmt.Sprintf("%s:%s", h.config.Namespace, h.keyName)
 }
 
 // Get 获取单个值
@@ -157,18 +163,18 @@ func (h *HotKeyCache[K, V]) GetAll(ctx context.Context) (map[K]V, error) {
 
 // LoadAll 从Redis或数据源加载所有数据
 func (h *HotKeyCache[K, V]) LoadAll(ctx context.Context) (map[K]V, error) {
-	redisKey := h.getRedisKey()
-
 	// 先尝试从Redis获取
-	cachedData, err := h.client.Get(ctx, redisKey).Result()
+	cachedData, err := h.client.Get(ctx, h.redisKey).Result()
 	if err == nil && cachedData != "" {
 		var data map[K]V
 		if err := json.Unmarshal([]byte(cachedData), &data); err == nil {
 			// 更新本地缓存
 			h.mu.Lock()
 			h.localCache = make(map[K]V, len(data))
+			h.accessOrder = make([]K, 0, len(data))
 			for k, v := range data {
 				h.localCache[k] = v
+				h.accessOrder = append(h.accessOrder, k)
 			}
 			h.lastRefreshTime = time.Now()
 			h.mu.Unlock()
@@ -187,14 +193,17 @@ func (h *HotKeyCache[K, V]) LoadAll(ctx context.Context) (map[K]V, error) {
 	if len(data) > 0 {
 		jsonData, err := json.Marshal(data)
 		if err == nil {
-			h.client.SetEx(ctx, redisKey, string(jsonData), h.config.DefaultTTL)
+			// 直接传 []byte 给 SetEx，避免 string(jsonData) 拷贝
+			h.client.SetEx(ctx, h.redisKey, jsonData, h.config.DefaultTTL)
 		}
 
 		// 更新本地缓存
 		h.mu.Lock()
 		h.localCache = make(map[K]V, len(data))
+		h.accessOrder = make([]K, 0, len(data))
 		for k, v := range data {
 			h.localCache[k] = v
+			h.accessOrder = append(h.accessOrder, k)
 		}
 		h.lastRefreshTime = time.Now()
 		h.mu.Unlock()
@@ -207,6 +216,10 @@ func (h *HotKeyCache[K, V]) LoadAll(ctx context.Context) (map[K]V, error) {
 func (h *HotKeyCache[K, V]) Set(ctx context.Context, key K, value V) error {
 	// 更新本地缓存
 	h.mu.Lock()
+	// 仅在新增键时记录插入顺序，避免重复
+	if _, exists := h.localCache[key]; !exists {
+		h.accessOrder = append(h.accessOrder, key)
+	}
 	h.localCache[key] = value
 	h.mu.Unlock()
 
@@ -219,8 +232,10 @@ func (h *HotKeyCache[K, V]) SetAll(ctx context.Context, data map[K]V) error {
 	// 更新本地缓存
 	h.mu.Lock()
 	h.localCache = make(map[K]V, len(data))
+	h.accessOrder = make([]K, 0, len(data))
 	for k, v := range data {
 		h.localCache[k] = v
+		h.accessOrder = append(h.accessOrder, k)
 	}
 	h.lastRefreshTime = time.Now()
 	h.mu.Unlock()
@@ -254,8 +269,8 @@ func (h *HotKeyCache[K, V]) SaveToRedis(ctx context.Context) error {
 		return fmt.Errorf("failed to marshal data: %w", err)
 	}
 
-	redisKey := h.getRedisKey()
-	return h.client.SetEx(ctx, redisKey, string(jsonData), h.config.DefaultTTL).Err()
+	// 直接传 []byte 给 SetEx，避免 string(jsonData) 拷贝
+	return h.client.SetEx(ctx, h.redisKey, jsonData, h.config.DefaultTTL).Err()
 }
 
 // Refresh 手动刷新缓存
@@ -274,12 +289,12 @@ func (h *HotKeyCache[K, V]) Clear(ctx context.Context) error {
 	// 这样避免GetAll重新加载数据
 	h.mu.Lock()
 	h.localCache = make(map[K]V)
+	h.accessOrder = make([]K, 0)
 	h.lastRefreshTime = time.Now()
 	h.mu.Unlock()
 
 	// 删除Redis缓存
-	redisKey := h.getRedisKey()
-	return h.client.Del(ctx, redisKey).Err()
+	return h.client.Del(ctx, h.redisKey).Err()
 }
 
 // Exists 检查键是否存在
@@ -346,6 +361,7 @@ func (h *HotKeyCache[K, V]) autoRefresh() {
 
 // Stop 停止自动刷新和清理
 func (h *HotKeyCache[K, V]) Stop() {
+	h.stopMu.Lock()
 	h.once.Do(func() {
 		// 停止自动刷新和清理
 		close(h.stopChan)
@@ -353,6 +369,9 @@ func (h *HotKeyCache[K, V]) Stop() {
 			h.cleanupTicker.Stop()
 		}
 	})
+	h.stopMu.Unlock()
+	// 等待所有后台 goroutine 退出
+	h.wg.Wait()
 }
 
 // cleanupExpired 定期清理过期数据，防止本地缓存无界增长
@@ -365,22 +384,31 @@ func (h *HotKeyCache[K, V]) cleanupExpired() {
 			h.mu.Lock()
 			cacheSize := len(h.localCache)
 
-			// 如果超过最大限制，执行 LRU 驱逐
+			// 如果超过最大限制，执行 FIFO 驱逐
 			if cacheSize > h.config.MaxLocalCacheSize {
 				// 计算需要驱逐的数量（驱逐 20% 的数据）
 				toEvict := mathx.IfClamp(cacheSize/5, 1, cacheSize)
 
-				// 从访问顺序列表中移除最旧的条目
-				h.accessOrderMu.Lock()
-				for i := 0; i < toEvict && len(h.accessOrder) > 0; i++ {
-					key := h.accessOrder[0]
-					h.accessOrder = h.accessOrder[1:]
-					delete(h.localCache, key)
+				// 从插入顺序列表头部移除最旧的条目
+				// accessOrder 中可能包含已通过 Delete 删除的陈旧条目，跳过它们
+				evicted := 0
+				newOrder := make([]K, 0, len(h.accessOrder))
+				for _, key := range h.accessOrder {
+					if evicted < toEvict {
+						if _, exists := h.localCache[key]; exists {
+							delete(h.localCache, key)
+							evicted++
+							continue
+						}
+						// 陈旧条目（已被 Delete），直接丢弃不加入 newOrder
+						continue
+					}
+					newOrder = append(newOrder, key)
 				}
-				h.accessOrderMu.Unlock()
+				h.accessOrder = newOrder
 
 				h.logger.Warnf("HotKeyCache %s evicted %d entries (size: %d -> %d)",
-					h.keyName, toEvict, cacheSize, len(h.localCache))
+					h.keyName, evicted, cacheSize, len(h.localCache))
 			}
 			h.mu.Unlock()
 		}
@@ -402,8 +430,7 @@ func (h *HotKeyCache[K, V]) GetStats(ctx context.Context) (*HotKeyStats, error) 
 	h.mu.RUnlock()
 
 	// 获取Redis TTL
-	redisKey := h.getRedisKey()
-	ttl, err := h.client.TTL(ctx, redisKey).Result()
+	ttl, err := h.client.TTL(ctx, h.redisKey).Result()
 	if err != nil {
 		ttl = 0
 	}
@@ -418,28 +445,56 @@ func (h *HotKeyCache[K, V]) GetStats(ctx context.Context) (*HotKeyStats, error) 
 
 // HotKeyManager 热key管理器
 type HotKeyManager struct {
-	client *redis.Client
+	client redis.UniversalClient
 	config HotKeyConfig
 	caches map[string]interface{} // 存储不同类型的缓存
 	mu     sync.RWMutex
 }
 
-// NewHotKeyManager 创建热key管理器
-func NewHotKeyManager(redisClient redis.UniversalClient, config ...HotKeyConfig) *HotKeyManager {
-	// 类型断言为*redis.Client
-	client, ok := redisClient.(*redis.Client)
-	if !ok {
-		panic("HotKeyManager requires *redis.Client, cluster mode not supported yet")
-	}
+// HotKeyOption 热key管理器配置项
+type HotKeyOption func(*HotKeyConfig)
 
+// WithHotKeyTTL 设置默认 TTL
+func WithHotKeyTTL(ttl time.Duration) HotKeyOption {
+	return func(c *HotKeyConfig) { c.DefaultTTL = ttl }
+}
+
+// WithHotKeyRefreshInterval 设置自动刷新间隔
+func WithHotKeyRefreshInterval(d time.Duration) HotKeyOption {
+	return func(c *HotKeyConfig) { c.RefreshInterval = d }
+}
+
+// WithHotKeyAutoRefresh 是否启用自动刷新
+func WithHotKeyAutoRefresh(enable bool) HotKeyOption {
+	return func(c *HotKeyConfig) { c.EnableAutoRefresh = enable }
+}
+
+// WithHotKeyNamespace 设置命名空间
+func WithHotKeyNamespace(ns string) HotKeyOption {
+	return func(c *HotKeyConfig) { c.Namespace = ns }
+}
+
+// WithHotKeyLogger 设置日志记录器
+func WithHotKeyLogger(l logger.ILogger) HotKeyOption {
+	return func(c *HotKeyConfig) { c.Logger = l }
+}
+
+// WithHotKeyMaxLocalCacheSize 设置本地缓存最大条目数
+func WithHotKeyMaxLocalCacheSize(n int) HotKeyOption {
+	return func(c *HotKeyConfig) { c.MaxLocalCacheSize = n }
+}
+
+// NewHotKeyManager 创建热key管理器
+func NewHotKeyManager(client redis.UniversalClient, opts ...HotKeyOption) *HotKeyManager {
 	cfg := HotKeyConfig{
 		DefaultTTL:        time.Hour,
 		RefreshInterval:   time.Minute * 5,
 		EnableAutoRefresh: true,
 		Namespace:         "hotkey",
+		MaxLocalCacheSize: 10000,
 	}
-	if len(config) > 0 {
-		cfg = config[0]
+	for _, opt := range opts {
+		opt(&cfg)
 	}
 
 	return &HotKeyManager{

@@ -56,6 +56,7 @@ func NewMultiLevelCache[T any](redisClient redis.UniversalClient, config MultiLe
 	config.L1Size = mathx.IfLeZero(config.L1Size, 1000)
 	config.L1TTL = mathx.IfLeZero(config.L1TTL, time.Minute*5)
 	config.L2TTL = mathx.IfLeZero(config.L2TTL, time.Hour)
+	config.Namespace = mathx.IfNotEmpty(config.Namespace, "mlc") // 空 namespace 默认 "mlc"
 
 	// 创建L1本地缓存
 	l1Cache := NewLRUOptimizedHandler(config.L1Size)
@@ -66,18 +67,13 @@ func NewMultiLevelCache[T any](redisClient redis.UniversalClient, config MultiLe
 		compression = CompressionGzip
 	}
 
-	// 类型断言为*redis.Client (AdvancedCache需要)
-	client, ok := redisClient.(*redis.Client)
-	if !ok {
-		panic("MultiLevelCache requires *redis.Client for AdvancedCache, cluster mode not supported yet")
-	}
-
+	// AdvancedCache 已支持 UniversalClient，无需类型断言
 	l2CacheConfig := AdvancedCacheConfig{
 		DefaultTTL:  config.L2TTL,
 		Namespace:   config.Namespace,
 		Compression: compression,
 	}
-	l2Cache := NewAdvancedCache[T](client, l2CacheConfig)
+	l2Cache := NewAdvancedCache[T](redisClient, l2CacheConfig)
 
 	mlc := &MultiLevelCache[T]{
 		config:      config,
@@ -224,9 +220,9 @@ func (m *MultiLevelCache[T]) recordL2Set() {
 
 // Clear 清空所有缓存
 func (m *MultiLevelCache[T]) Clear(ctx context.Context) error {
-	// L1没有Clear方法,手动实现
-	// LRUOptimizedHandler没有导出Clear,我们需要重新创建
-	m.l1Cache = NewLRUOptimizedHandler(m.config.L1Size)
+	// 使用 LRUOptimizedHandler.Clear 清空 L1 缓存
+	// 不再替换整个 handler 实例，避免与并发 Get/Set 的数据竞争
+	m.l1Cache.Clear()
 
 	// L2清空所有匹配命名空间的key
 	return m.l2Cache.Clear(ctx, m.config.Namespace+"*")

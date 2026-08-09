@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/kamalyes/go-toolbox/pkg/mathx"
+	"github.com/kamalyes/go-toolbox/pkg/syncx"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -58,7 +59,7 @@ type CacheBuilder struct {
 func NewCacheBuilder(redisClient redis.UniversalClient, namespace string) *CacheBuilder {
 	return &CacheBuilder{
 		strategy: CacheStrategy{
-			Namespace:        namespace,
+			Namespace:        mathx.IfNotEmpty(namespace, "cache"), // 空 namespace 默认 "cache"
 			DefaultTTL:       time.Hour,
 			Compression:      CompressionNone,
 			RefreshThreshold: 0.2, // 剩余20%时自动刷新
@@ -134,35 +135,34 @@ func (b *CacheBuilder) OnError(fn func(ctx context.Context, err error)) *CacheBu
 func (b *CacheBuilder) Build() *SmartCache {
 	// 初始化组件
 	if b.strategy.EnableLock {
-		lockConfig := LockConfig{
-			TTL:            b.strategy.LockTimeout,
-			RetryInterval:  time.Millisecond * 50,
-			MaxRetries:     10,
-			Namespace:      b.strategy.Namespace,
-			EnableWatchdog: true,
-		}
-		b.lockManager = NewLockManager(b.redisClient, lockConfig)
+		b.lockManager = NewLockManager(b.redisClient,
+			WithLockTTL(b.strategy.LockTimeout),
+			WithLockRetryInterval(time.Millisecond*50),
+			WithLockMaxRetries(10),
+			WithLockNamespace(b.strategy.Namespace),
+			WithLockWatchdog(true),
+		)
 	}
 
 	if b.strategy.EnableHotKey {
-		hotkeyConfig := HotKeyConfig{
-			DefaultTTL:        b.strategy.DefaultTTL,
-			RefreshInterval:   time.Minute * 5,
-			EnableAutoRefresh: true,
-			Namespace:         b.strategy.Namespace,
-		}
-		b.hotKeyMgr = NewHotKeyManager(b.redisClient, hotkeyConfig)
+		b.hotKeyMgr = NewHotKeyManager(b.redisClient,
+			WithHotKeyTTL(b.strategy.DefaultTTL),
+			WithHotKeyRefreshInterval(time.Minute*5),
+			WithHotKeyAutoRefresh(true),
+			WithHotKeyNamespace(b.strategy.Namespace),
+		)
 	}
 
 	if b.strategy.EnablePubSub {
-		pubsubConfig := PubSubConfig{
-			Namespace:  b.strategy.Namespace,
-			MaxRetries: 3,
-			RetryDelay: time.Millisecond * 100,
-			BufferSize: 100,
-		}
-		b.pubsub = NewPubSub(b.redisClient, pubsubConfig)
+		b.pubsub = NewPubSub(b.redisClient,
+			WithPubSubNamespace(b.strategy.Namespace),
+			WithPubSubMaxRetries(3),
+			WithPubSubRetryDelay(time.Millisecond*100),
+			WithPubSubBufferSize(100),
+		)
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
 
 	return &SmartCache{
 		strategy:    b.strategy,
@@ -170,6 +170,8 @@ func (b *CacheBuilder) Build() *SmartCache {
 		lockManager: b.lockManager,
 		hotKeyMgr:   b.hotKeyMgr,
 		pubsub:      b.pubsub,
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 }
 
@@ -180,6 +182,11 @@ type SmartCache struct {
 	lockManager *LockManager
 	hotKeyMgr   *HotKeyManager
 	pubsub      *PubSub
+
+	// 生命周期管理：跟踪后台刷新 goroutine，防止泄漏
+	ctx       context.Context
+	cancel    context.CancelFunc
+	refreshWg sync.WaitGroup
 
 	// singleflight用于防止缓存击穿
 	loadGroup sync.Map // map[string]*singleCall
@@ -367,7 +374,7 @@ func (c *SmartCache) loadWithLock(ctx context.Context, key, fullKey string) (int
 
 		// 使用分布式锁(可选,如果需要跨进程互斥)
 		if c.lockManager != nil {
-			lockKey := fmt.Sprintf("lock:%s", fullKey)
+			lockKey := "lock:" + fullKey
 			lock := c.lockManager.GetLock(lockKey)
 
 			if err := lock.Lock(ctx); err != nil {
@@ -413,24 +420,27 @@ func (c *SmartCache) checkAndRefresh(ctx context.Context, fullKey, key string) {
 	// 计算剩余时间百分比
 	remaining := float64(ttl) / float64(c.strategy.DefaultTTL)
 
-	// 低于阈值时异步刷新
+	// 低于阈值时异步刷新，使用 SmartCache 的 ctx 和 refreshWg 跟踪 goroutine
 	if remaining < c.strategy.RefreshThreshold && c.strategy.OnCacheMiss != nil {
-		go func() {
-			freshCtx := context.Background()
-			data, err := c.strategy.OnCacheMiss(freshCtx, key)
-			if err == nil {
-				c.redis.Set(freshCtx, fullKey, data, c.strategy.DefaultTTL)
-			}
-		}()
+		syncx.Go(c.ctx).
+			WithWaitGroup(&c.refreshWg).
+			OnPanic(func(r interface{}) {
+				if c.strategy.OnError != nil {
+					c.strategy.OnError(ctx, fmt.Errorf("panic in checkAndRefresh: %v", r))
+				}
+			}).
+			Exec(func() {
+				data, err := c.strategy.OnCacheMiss(c.ctx, key)
+				if err == nil {
+					c.redis.Set(c.ctx, fullKey, data, c.strategy.DefaultTTL)
+				}
+			})
 	}
 }
 
-// buildKey 构建完整key
+// buildKey 构建完整key（用 string + 替代 fmt.Sprintf，零分配）
 func (c *SmartCache) buildKey(key string) string {
-	if c.strategy.KeyPattern != "" {
-		return fmt.Sprintf("%s:%s", c.strategy.Namespace, key)
-	}
-	return fmt.Sprintf("%s:%s", c.strategy.Namespace, key)
+	return c.strategy.Namespace + ":" + key
 }
 
 // Subscribe 订阅缓存事件
@@ -447,6 +457,13 @@ func (c *SmartCache) Subscribe(ctx context.Context, event string, handler func(d
 
 // Close 关闭缓存
 func (c *SmartCache) Close() error {
+	// 取消所有后台刷新 goroutine
+	if c.cancel != nil {
+		c.cancel()
+	}
+	// 等待后台刷新 goroutine 退出，防止泄漏
+	c.refreshWg.Wait()
+
 	if c.lockManager != nil {
 		c.lockManager.ReleaseAllLocks(context.Background())
 	}

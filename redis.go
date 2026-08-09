@@ -23,12 +23,19 @@ package cachex
 import (
 	"context"
 	"errors"
-	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/kamalyes/go-toolbox/pkg/idgen"
+	"github.com/kamalyes/go-toolbox/pkg/osx"
 	"github.com/redis/go-redis/v9"
 )
+
+// 包级默认雪花算法 ID 生成器，兼容直接构造 RedisHandler 的场景（如测试）
+var defaultSnowflakeGenerator = func() *idgen.SnowflakeGenerator {
+	return idgen.NewSnowflakeGenerator(osx.GetWorkerIdForSnowflake(), osx.GetDatacenterId())
+}()
 
 // NewRedisOptions 创建推荐的Redis配置
 // 这个函数设置了一些推荐的默认值以避免常见的警告和问题
@@ -55,9 +62,10 @@ func NewRedisOptions(addr, password string, db int) *redis.Options {
 
 // RedisHandler 是 Redis 缓存的实现
 type RedisHandler struct {
-	redis     *redis.Client
-	ctx       context.Context
-	loadGroup sync.Map // map[string]*redisLoadCall for GetOrCompute coordination
+	redis       redis.UniversalClient
+	ctx         context.Context
+	loadGroup   sync.Map                  // map[string]*redisLoadCall for GetOrCompute coordination
+	idGenerator *idgen.SnowflakeGenerator // 雪花算法 ID 生成器（用于分布式锁值）
 }
 
 // redisLoadCall represents an in-flight loader call for RedisHandler GetOrCompute
@@ -76,7 +84,16 @@ func NewRedisHandler(cfg *redis.Options) (Handler, error) {
 	}
 
 	redis := redis.NewClient(cfg)
-	return &RedisHandler{redis: redis, ctx: context.Background()}, nil
+
+	// 初始化雪花算法 ID 生成器（用于分布式锁值，保证全局唯一）
+	workerID := osx.GetWorkerIdForSnowflake()
+	datacenterID := osx.GetDatacenterId()
+
+	return &RedisHandler{
+		redis:       redis,
+		ctx:         context.Background(),
+		idGenerator: idgen.NewSnowflakeGenerator(workerID, datacenterID),
+	}, nil
 }
 
 // NewRedisHandlerSimple 创建新的 RedisHandler，使用推荐的配置
@@ -88,8 +105,9 @@ func NewRedisHandlerSimple(addr, password string, db int) (Handler, error) {
 
 func (h *RedisHandler) WithCtx(ctx context.Context) *RedisHandler {
 	return &RedisHandler{
-		redis: h.redis,
-		ctx:   ctx,
+		redis:       h.redis,
+		ctx:         ctx,
+		idGenerator: h.idGenerator,
 	}
 }
 
@@ -391,7 +409,13 @@ func (h *RedisHandler) GetOrComputeWithCtx(ctx context.Context, key []byte, ttl 
 
 	// 使用Redis分布式锁防止跨实例的重复计算
 	lockKey := strKey + ":lock"
-	lockValue := fmt.Sprintf("%d", time.Now().UnixNano())
+	// 使用雪花算法生成全局唯一锁值，避免时间戳碰撞
+	// 兼容直接构造的 RedisHandler（如测试），idGenerator 为 nil 时回退到包级默认生成器
+	gen := h.idGenerator
+	if gen == nil {
+		gen = defaultSnowflakeGenerator
+	}
+	lockValue := strconv.FormatInt(gen.Generate(), 10)
 	lockTTL := 30 * time.Second
 
 	// 尝试获取分布式锁

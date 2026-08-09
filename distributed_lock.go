@@ -44,7 +44,7 @@ type LockConfig struct {
 
 // DistributedLock 分布式锁
 type DistributedLock struct {
-	client     *redis.Client
+	client     redis.UniversalClient
 	config     LockConfig
 	key        string         // 锁的键名
 	token      string         // 锁的令牌（用于确保只有持锁者能释放锁）
@@ -95,27 +95,28 @@ func (l *DistributedLock) resetState() {
 }
 
 // stopWatchdogLocked 停止看门狗 goroutine（调用者必须已持有 l.mu）
-// 通过发送信号让 watchdog 自然退出，不关闭 channel 避免与 watchdog 的 select 竞争
+// stopChan 为缓冲 1 的通道，非阻塞 send 必然成功（除非 watchdog 已退出且未消费上次信号），
+// watchdog 在下一次 select 即可通过 <-stopChan 退出；不 close 通道避免与 select 竞争
 func (l *DistributedLock) stopWatchdogLocked() {
 	if l.stopChan != nil {
 		select {
 		case l.stopChan <- struct{}{}:
 		default:
-			// channel 已满或已关闭，看门狗可能已退出
+			// 缓冲已满（上次停止信号未被消费，watchdog 可能已退出）
 		}
 		l.stopChan = nil
 	}
 }
 
 // NewDistributedLock 创建分布式锁
-func NewDistributedLock(client *redis.Client, key string, config LockConfig) *DistributedLock {
+func NewDistributedLock(client redis.UniversalClient, key string, config LockConfig) *DistributedLock {
 	config.TTL = mathx.IfNotZero(config.TTL, time.Minute*5)
 	config.RetryInterval = mathx.IfNotZero(config.RetryInterval, time.Millisecond*100)
 	config.MaxRetries = mathx.IfNotZero(config.MaxRetries, 10)
 	config.Namespace = mathx.IfNotEmpty(config.Namespace, "lock")
 	config.WatchdogInterval = mathx.IfNotZero(config.WatchdogInterval, config.TTL/3)
 
-	lockKey := fmt.Sprintf("%s:%s", config.Namespace, key)
+	lockKey := config.Namespace + ":" + key
 
 	return &DistributedLock{
 		client: client,
@@ -161,8 +162,10 @@ func (l *DistributedLock) TryLock(ctx context.Context) (bool, error) {
 
 		// 启动看门狗
 		if l.config.EnableWatchdog {
-			// 重新创建停止通道确保看门狗能正常工作
-			l.stopChan = make(chan struct{})
+			// 缓冲为 1 的停止通道：stopWatchdogLocked 的非阻塞 send 必然成功，
+			// watchdog 在下一次 select 即可通过 <-stopChan 可靠退出，
+			// 避免 watchdog 忙于 IsLocked/Extend 时 stop 信号丢失导致 goroutine 泄漏
+			l.stopChan = make(chan struct{}, 1)
 			syncx.Go(ctx).
 				OnPanic(func(r interface{}) {
 					l.logger.ErrorContext(ctx, "Panic in watchdog: %v", r)
@@ -409,21 +412,53 @@ func (l *DistributedLock) watchdog(ctx context.Context) {
 
 // LockManager 锁管理器
 type LockManager struct {
-	client *redis.Client
+	client redis.UniversalClient
 	config LockConfig
 	locks  map[string]*DistributedLock
 	mu     sync.RWMutex
 	logger logger.ILogger // 日志记录器
 }
 
-// NewLockManager 创建锁管理器
-func NewLockManager(redisClient redis.UniversalClient, config ...LockConfig) *LockManager {
-	// 类型断言为*redis.Client
-	client, ok := redisClient.(*redis.Client)
-	if !ok {
-		panic("LockManager requires *redis.Client, cluster mode not supported yet")
-	}
+// LockOption 锁管理器配置项
+type LockOption func(*LockConfig)
 
+// WithLockTTL 设置锁的 TTL
+func WithLockTTL(ttl time.Duration) LockOption {
+	return func(c *LockConfig) { c.TTL = ttl }
+}
+
+// WithLockRetryInterval 设置重试间隔
+func WithLockRetryInterval(d time.Duration) LockOption {
+	return func(c *LockConfig) { c.RetryInterval = d }
+}
+
+// WithLockMaxRetries 设置最大重试次数
+func WithLockMaxRetries(n int) LockOption {
+	return func(c *LockConfig) { c.MaxRetries = n }
+}
+
+// WithLockNamespace 设置命名空间
+func WithLockNamespace(ns string) LockOption {
+	return func(c *LockConfig) { c.Namespace = ns }
+}
+
+// WithLockWatchdog 是否启用看门狗自动续期
+func WithLockWatchdog(enable bool) LockOption {
+	return func(c *LockConfig) { c.EnableWatchdog = enable }
+}
+
+// WithLockWatchdogInterval 设置看门狗检查间隔
+func WithLockWatchdogInterval(d time.Duration) LockOption {
+	return func(c *LockConfig) { c.WatchdogInterval = d }
+}
+
+// WithLockLogger 设置日志记录器
+func WithLockLogger(l logger.ILogger) LockOption {
+	return func(c *LockConfig) { c.Logger = l }
+}
+
+// NewLockManager 创建锁管理器
+func NewLockManager(client redis.UniversalClient, opts ...LockOption) *LockManager {
 	cfg := LockConfig{
 		TTL:              time.Minute * 5,
 		RetryInterval:    time.Millisecond * 100,
@@ -432,8 +467,8 @@ func NewLockManager(redisClient redis.UniversalClient, config ...LockConfig) *Lo
 		EnableWatchdog:   true,
 		WatchdogInterval: time.Minute,
 	}
-	if len(config) > 0 {
-		cfg = config[0]
+	for _, opt := range opts {
+		opt(&cfg)
 	}
 
 	return &LockManager{
@@ -577,7 +612,7 @@ func (m *LockManager) CleanupExpiredLocks(ctx context.Context) error {
 }
 
 // LockWithRetry 带重试的锁获取工具函数
-func LockWithRetry(ctx context.Context, client *redis.Client, key string, config LockConfig, fn func() error) error {
+func LockWithRetry(ctx context.Context, client redis.UniversalClient, key string, config LockConfig, fn func() error) error {
 	lock := NewDistributedLock(client, key, config)
 
 	if err := lock.Lock(ctx); err != nil {
@@ -595,7 +630,7 @@ func LockWithRetry(ctx context.Context, client *redis.Client, key string, config
 }
 
 // MutexLock 互斥锁工具函数，确保同时只有一个操作在执行
-func MutexLock(ctx context.Context, client *redis.Client, key string, ttl time.Duration, fn func() error) error {
+func MutexLock(ctx context.Context, client redis.UniversalClient, key string, ttl time.Duration, fn func() error) error {
 	config := LockConfig{
 		TTL:           ttl,
 		MaxRetries:    30,

@@ -11,6 +11,8 @@
 package cachex
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -581,6 +583,428 @@ func TestTwoLevel_ConcurrencyAndPerformance(t *testing.T) {
 			assert.NoError(t, err, "%s should be in L1 after promotion", keyStr)
 		}
 	})
+}
+
+// errTTLHandler 嵌入 *LRUHandler 并覆盖 GetTTLWithCtx/GetTTL，
+// 用于覆盖 TwoLevelHandler.GetWithCtx 中 L2.GetTTLWithCtx 返回错误的分支
+type errTTLHandler struct {
+	*LRUHandler
+	ttlErr error
+}
+
+func (e *errTTLHandler) GetTTLWithCtx(ctx context.Context, key []byte) (time.Duration, error) {
+	return 0, e.ttlErr
+}
+
+func (e *errTTLHandler) GetTTL(key []byte) (time.Duration, error) {
+	return 0, e.ttlErr
+}
+
+// ============================================================
+// BatchGet / BatchGetWithCtx 测试
+// ============================================================
+
+func TestTwoLevel_BatchGet(t *testing.T) {
+	t.Run("空 keys 返回 nil", func(t *testing.T) {
+		l1 := NewLRUHandler(10)
+		l2 := NewLRUHandler(10)
+		defer l1.Close()
+		defer l2.Close()
+		two := NewTwoLevelHandler(l1, l2, true)
+		defer two.Close()
+
+		// 简化版
+		results, errs := two.BatchGet(nil)
+		assert.Nil(t, results)
+		assert.Nil(t, errs)
+
+		// 带 context 版
+		results, errs = two.BatchGetWithCtx(context.Background(), nil)
+		assert.Nil(t, results)
+		assert.Nil(t, errs)
+	})
+
+	t.Run("L1 全命中", func(t *testing.T) {
+		l1 := NewLRUHandler(10)
+		l2 := NewLRUHandler(10)
+		defer l1.Close()
+		defer l2.Close()
+		two := NewTwoLevelHandler(l1, l2, true)
+		defer two.Close()
+
+		require.NoError(t, two.Set([]byte("a"), []byte("va")))
+		require.NoError(t, two.Set([]byte("b"), []byte("vb")))
+
+		results, errs := two.BatchGet([][]byte{[]byte("a"), []byte("b")})
+		assert.Len(t, results, 2)
+		assert.Len(t, errs, 2)
+		assert.Equal(t, []byte("va"), results[0])
+		assert.Equal(t, []byte("vb"), results[1])
+		assert.NoError(t, errs[0])
+		assert.NoError(t, errs[1])
+	})
+
+	t.Run("L1 未命中 L2 命中并异步提升", func(t *testing.T) {
+		l1 := NewLRUHandler(10)
+		l2 := NewLRUHandler(10)
+		defer l1.Close()
+		defer l2.Close()
+		two := NewTwoLevelHandler(l1, l2, true)
+		defer two.Close()
+
+		// 仅在 L2 中写入
+		require.NoError(t, l2.Set([]byte("only_l2"), []byte("l2_val")))
+
+		results, errs := two.BatchGet([][]byte{[]byte("only_l2")})
+		assert.Len(t, results, 1)
+		assert.Equal(t, []byte("l2_val"), results[0])
+		assert.Len(t, errs, 1)
+		assert.NoError(t, errs[0])
+
+		// 等待异步提升到 L1
+		time.Sleep(20 * time.Millisecond)
+		val, err := l1.Get([]byte("only_l2"))
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("l2_val"), val)
+	})
+
+	t.Run("L1 和 L2 都未命中", func(t *testing.T) {
+		l1 := NewLRUHandler(10)
+		l2 := NewLRUHandler(10)
+		defer l1.Close()
+		defer l2.Close()
+		two := NewTwoLevelHandler(l1, l2, true)
+		defer two.Close()
+
+		results, errs := two.BatchGet([][]byte{[]byte("missing")})
+		assert.Len(t, results, 1)
+		assert.Nil(t, results[0])
+		assert.Len(t, errs, 1)
+		assert.ErrorIs(t, errs[0], ErrNotFound)
+	})
+
+	t.Run("混合命中场景", func(t *testing.T) {
+		l1 := NewLRUHandler(10)
+		l2 := NewLRUHandler(10)
+		defer l1.Close()
+		defer l2.Close()
+		two := NewTwoLevelHandler(l1, l2, true)
+		defer two.Close()
+
+		// a 在 L1 和 L2 都有（通过 two.Set 同步写入）
+		require.NoError(t, two.Set([]byte("a"), []byte("va")))
+		// b 仅在 L2
+		require.NoError(t, l2.Set([]byte("b"), []byte("vb")))
+		// c 不存在
+
+		results, errs := two.BatchGet([][]byte{[]byte("a"), []byte("b"), []byte("c")})
+		assert.Len(t, results, 3)
+		assert.Equal(t, []byte("va"), results[0])
+		assert.Equal(t, []byte("vb"), results[1])
+		assert.Nil(t, results[2])
+		assert.NoError(t, errs[0])
+		assert.NoError(t, errs[1])
+		assert.ErrorIs(t, errs[2], ErrNotFound)
+	})
+}
+
+// ============================================================
+// Stats 测试
+// ============================================================
+
+func TestTwoLevel_Stats(t *testing.T) {
+	l1 := NewLRUHandler(10)
+	l2 := NewLRUHandler(20)
+	defer l1.Close()
+	defer l2.Close()
+
+	two := NewTwoLevelHandler(l1, l2, true)
+	defer two.Close()
+
+	require.NoError(t, two.Set([]byte("k"), []byte("v")))
+
+	stats := two.Stats()
+	assert.Equal(t, "two_level", stats["cache_type"])
+	assert.NotNil(t, stats["l1_cache"])
+	assert.NotNil(t, stats["l2_cache"])
+
+	// 验证 L1 和 L2 统计是各自 handler 返回的 map
+	l1Stats := stats["l1_cache"].(map[string]interface{})
+	l2Stats := stats["l2_cache"].(map[string]interface{})
+	assert.Contains(t, l1Stats, "entries")
+	assert.Contains(t, l2Stats, "entries")
+}
+
+// ============================================================
+// GetOrCompute / GetOrComputeWithCtx 测试
+// ============================================================
+
+func TestTwoLevel_GetOrCompute(t *testing.T) {
+	t.Run("L1 命中", func(t *testing.T) {
+		l1 := NewLRUHandler(10)
+		l2 := NewLRUHandler(10)
+		defer l1.Close()
+		defer l2.Close()
+		two := NewTwoLevelHandler(l1, l2, true)
+		defer two.Close()
+
+		require.NoError(t, two.Set([]byte("k"), []byte("v")))
+
+		// loader 不应被调用
+		called := false
+		val, err := two.GetOrCompute([]byte("k"), 0, func() ([]byte, error) {
+			called = true
+			return nil, nil
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("v"), val)
+		assert.False(t, called)
+	})
+
+	t.Run("L1 未命中 L2 命中 ttl<=0 异步提升", func(t *testing.T) {
+		l1 := NewLRUHandler(10)
+		l2 := NewLRUHandler(10)
+		defer l1.Close()
+		defer l2.Close()
+		two := NewTwoLevelHandler(l1, l2, true)
+		defer two.Close()
+
+		// 仅在 L2 写入
+		require.NoError(t, l2.Set([]byte("l2_only"), []byte("l2_val")))
+
+		val, err := two.GetOrComputeWithCtx(context.Background(), []byte("l2_only"), 0, func(ctx context.Context) ([]byte, error) {
+			t.Fatal("loader 不应被调用")
+			return nil, nil
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("l2_val"), val)
+
+		// 等待异步提升
+		time.Sleep(20 * time.Millisecond)
+		v, err := l1.Get([]byte("l2_only"))
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("l2_val"), v)
+	})
+
+	t.Run("L1 未命中 L2 命中 ttl>0 异步提升", func(t *testing.T) {
+		l1 := NewExpiringHandler(10 * time.Millisecond)
+		l2 := NewExpiringHandler(10 * time.Millisecond)
+		defer l1.Close()
+		defer l2.Close()
+		two := NewTwoLevelHandler(l1, l2, true)
+		defer two.Close()
+
+		// 仅在 L2 写入（无 TTL）
+		require.NoError(t, l2.Set([]byte("l2_only"), []byte("l2_val")))
+
+		val, err := two.GetOrComputeWithCtx(context.Background(), []byte("l2_only"), 100*time.Millisecond, func(ctx context.Context) ([]byte, error) {
+			t.Fatal("loader 不应被调用")
+			return nil, nil
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("l2_val"), val)
+
+		// 等待异步提升（带 TTL）
+		time.Sleep(20 * time.Millisecond)
+		v, err := l1.Get([]byte("l2_only"))
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("l2_val"), v)
+	})
+
+	t.Run("两级都未命中 loader 成功 ttl<=0", func(t *testing.T) {
+		l1 := NewLRUHandler(10)
+		l2 := NewLRUHandler(10)
+		defer l1.Close()
+		defer l2.Close()
+		two := NewTwoLevelHandler(l1, l2, true)
+		defer two.Close()
+
+		val, err := two.GetOrCompute([]byte("compute"), 0, func() ([]byte, error) {
+			return []byte("computed"), nil
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("computed"), val)
+
+		// 两级缓存都应写入
+		v1, err := l1.Get([]byte("compute"))
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("computed"), v1)
+
+		v2, err := l2.Get([]byte("compute"))
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("computed"), v2)
+	})
+
+	t.Run("两级都未命中 loader 成功 ttl>0", func(t *testing.T) {
+		l1 := NewExpiringHandler(10 * time.Millisecond)
+		l2 := NewExpiringHandler(10 * time.Millisecond)
+		defer l1.Close()
+		defer l2.Close()
+		two := NewTwoLevelHandler(l1, l2, true)
+		defer two.Close()
+
+		val, err := two.GetOrComputeWithCtx(context.Background(), []byte("compute"), 100*time.Millisecond, func(ctx context.Context) ([]byte, error) {
+			return []byte("computed"), nil
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("computed"), val)
+
+		// 两级缓存都应写入（带 TTL）
+		v1, err := l1.Get([]byte("compute"))
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("computed"), v1)
+
+		v2, err := l2.Get([]byte("compute"))
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("computed"), v2)
+	})
+
+	t.Run("两级都未命中 loader 错误", func(t *testing.T) {
+		l1 := NewLRUHandler(10)
+		l2 := NewLRUHandler(10)
+		defer l1.Close()
+		defer l2.Close()
+		two := NewTwoLevelHandler(l1, l2, true)
+		defer two.Close()
+
+		loadErr := errors.New("loader failed")
+		val, err := two.GetOrCompute([]byte("fail"), 0, func() ([]byte, error) {
+			return nil, loadErr
+		})
+		assert.Nil(t, val)
+		assert.ErrorIs(t, err, loadErr)
+
+		// 缓存不应有值
+		_, err = l1.Get([]byte("fail"))
+		assert.ErrorIs(t, err, ErrNotFound)
+		_, err = l2.Get([]byte("fail"))
+		assert.ErrorIs(t, err, ErrNotFound)
+	})
+}
+
+// ============================================================
+// Close 错误分支测试
+// ============================================================
+
+func TestTwoLevel_CloseError(t *testing.T) {
+	t.Run("L2 Close 返回错误", func(t *testing.T) {
+		l1 := NewLRUHandler(10)
+		l2 := &errCloseHandler{LRUHandler: NewLRUHandler(10), closeErr: errors.New("l2 close error")}
+		two := NewTwoLevelHandler(l1, l2, true)
+
+		err := two.Close()
+		assert.Error(t, err)
+		assert.Equal(t, "l2 close error", err.Error())
+	})
+
+	t.Run("L1 和 L2 Close 都返回错误", func(t *testing.T) {
+		l1 := &errCloseHandler{LRUHandler: NewLRUHandler(10), closeErr: errors.New("l1 close error")}
+		l2 := &errCloseHandler{LRUHandler: NewLRUHandler(10), closeErr: errors.New("l2 close error")}
+		two := NewTwoLevelHandler(l1, l2, true)
+
+		err := two.Close()
+		assert.Error(t, err)
+		// lastErr 应为 L2 的错误（后赋值覆盖）
+		assert.Equal(t, "l2 close error", err.Error())
+	})
+}
+
+// ============================================================
+// SetWithCtx / SetWithTTLAndCtx 边界分支测试
+// ============================================================
+
+func TestTwoLevel_SetEdgeCases(t *testing.T) {
+	t.Run("SetWithCtx 异步模式 L1 错误", func(t *testing.T) {
+		l1 := NewLRUHandler(5)
+		l2 := NewLRUHandler(10)
+		defer l1.Close()
+		defer l2.Close()
+		two := NewTwoLevelHandler(l1, l2, false) // 异步模式
+		defer two.Close()
+
+		// nil key 触发 L1.SetWithCtx 错误
+		err := two.Set(nil, []byte("v"))
+		assert.ErrorIs(t, err, ErrInvalidKey)
+	})
+
+	t.Run("SetWithTTLAndCtx 同步模式 L1 错误", func(t *testing.T) {
+		l1 := NewLRUHandler(5)
+		l2 := NewLRUHandler(10)
+		defer l1.Close()
+		defer l2.Close()
+		two := NewTwoLevelHandler(l1, l2, true) // 同步模式
+		defer two.Close()
+
+		// nil key 触发 L1.SetWithTTLAndCtx 错误
+		err := two.SetWithTTL(nil, []byte("v"), time.Second)
+		assert.ErrorIs(t, err, ErrInvalidKey)
+	})
+
+	t.Run("SetWithTTLAndCtx 异步模式成功", func(t *testing.T) {
+		l1 := NewLRUHandler(5)
+		l2 := NewLRUHandler(10)
+		defer l1.Close()
+		defer l2.Close()
+		two := NewTwoLevelHandler(l1, l2, false) // 异步模式
+		defer two.Close()
+
+		err := two.SetWithTTL([]byte("k"), []byte("v"), 100*time.Millisecond)
+		assert.NoError(t, err)
+
+		// L1 应立即可用
+		val, err := l1.Get([]byte("k"))
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("v"), val)
+
+		// 等待异步写入 L2
+		time.Sleep(20 * time.Millisecond)
+		val2, err := l2.Get([]byte("k"))
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("v"), val2)
+	})
+
+	t.Run("SetWithTTLAndCtx 异步模式 L1 错误", func(t *testing.T) {
+		l1 := NewLRUHandler(5)
+		l2 := NewLRUHandler(10)
+		defer l1.Close()
+		defer l2.Close()
+		two := NewTwoLevelHandler(l1, l2, false) // 异步模式
+		defer two.Close()
+
+		// nil key 触发 L1.SetWithTTLAndCtx 错误
+		err := two.SetWithTTL(nil, []byte("v"), time.Second)
+		assert.ErrorIs(t, err, ErrInvalidKey)
+	})
+}
+
+// ============================================================
+// GetWithCtx 中 L2.GetTTL 返回错误的分支测试
+// ============================================================
+
+func TestTwoLevel_GetWithCtxTTLError(t *testing.T) {
+	l1 := NewLRUHandler(10)
+	l2 := &errTTLHandler{
+		LRUHandler: NewLRUHandler(10),
+		ttlErr:     errors.New("ttl read error"),
+	}
+	defer l1.Close()
+	defer l2.Close()
+
+	two := NewTwoLevelHandler(l1, l2, true)
+	defer two.Close()
+
+	// 仅在 L2 写入值（GetWithCtx 成功，但 GetTTLWithCtx 返回错误）
+	require.NoError(t, l2.Set([]byte("k"), []byte("v")))
+
+	// TwoLevel.Get 应从 L2 获取值，并走 GetTTL 错误的 else 分支提升到 L1
+	val, err := two.Get([]byte("k"))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("v"), val)
+
+	// L1 应通过 SetWithCtx（else 分支）被提升
+	val1, err := l1.Get([]byte("k"))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("v"), val1)
 }
 
 // ====================== Benchmark Tests ======================
