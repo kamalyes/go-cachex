@@ -483,6 +483,25 @@ func (h *LRUOptimizedHandler) Close() error {
 	return nil
 }
 
+// Clear 清空所有缓存条目但不关闭 handler，使其可以继续使用
+// 线程安全，可在并发访问时调用
+func (h *LRUOptimizedHandler) Clear() {
+	if atomic.LoadInt32(&h.closed) != 0 {
+		return
+	}
+
+	for _, shard := range h.shards {
+		shard.mu.Lock()
+		for k, entry := range shard.cache {
+			delete(shard.cache, k)
+			shard.removeEntry(entry)
+			shard.putEntry(entry)
+		}
+		atomic.StoreInt32(&shard.size, 0)
+		shard.mu.Unlock()
+	}
+}
+
 // BatchGetWithCtx 批量获取，减少锁开销
 func (h *LRUOptimizedHandler) BatchGetWithCtx(ctx context.Context, keys [][]byte) ([][]byte, []error) {
 	if len(keys) == 0 {

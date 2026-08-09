@@ -60,7 +60,7 @@ func main() {
 }
 
 // 演示高级缓存功能
-func demonstrateAdvancedCache(ctx context.Context, client *redis.Client) {
+func demonstrateAdvancedCache(ctx context.Context, client redis.UniversalClient) {
 	fmt.Println("1. 高级缓存功能演示")
 	fmt.Println("-------------------")
 
@@ -282,7 +282,7 @@ func demonstrateHotKey(ctx context.Context, client *redis.Client) {
 }
 
 // 演示分布式锁功能
-func demonstrateDistributedLock(ctx context.Context, client *redis.Client) {
+func demonstrateDistributedLock(ctx context.Context, client redis.UniversalClient) {
 	fmt.Println("4. 分布式锁功能演示")
 	fmt.Println("------------------")
 
@@ -319,8 +319,15 @@ func demonstrateDistributedLock(ctx context.Context, client *redis.Client) {
 	}
 
 	// 使用锁管理器
-	lockMgr := cachex.NewLockManager(client, config)
-	
+	lockMgr := cachex.NewLockManager(client,
+		cachex.WithLockTTL(config.TTL),
+		cachex.WithLockRetryInterval(config.RetryInterval),
+		cachex.WithLockMaxRetries(config.MaxRetries),
+		cachex.WithLockNamespace(config.Namespace),
+		cachex.WithLockWatchdog(config.EnableWatchdog),
+		cachex.WithLockWatchdogInterval(config.WatchdogInterval),
+	)
+
 	// 使用工具函数执行互斥操作
 	err := cachex.MutexLock(ctx, client, "resource_lock", time.Minute, func() error {
 		fmt.Println("✓ 在分布式锁保护下执行操作")

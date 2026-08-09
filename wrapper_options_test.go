@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestCacheWrapperWithTTL 测试 TTL 覆盖选项
@@ -360,4 +361,96 @@ func TestCacheWrapperDynamicOptions(t *testing.T) {
 	assert.LessOrEqual(t, ttl2, time.Minute*5+time.Second*10, "TTL should not significantly exceed 5 minutes")
 
 	client.Del(ctx, "user:789")
+}
+
+// TestWithDistributedLock_NilConfig 测试 nil 配置使用默认值
+func TestWithDistributedLock_NilConfig(t *testing.T) {
+	opts := &CacheOptions{}
+	WithDistributedLock(nil)(opts)
+	require.NotNil(t, opts.CacheDistributedLock)
+	assert.Equal(t, 500*time.Millisecond, opts.CacheDistributedLock.Timeout)
+	assert.Equal(t, 5*time.Second, opts.CacheDistributedLock.Expiration)
+	assert.True(t, opts.CacheDistributedLock.EnableWatchdog)
+}
+
+// TestWithDistributedLock_FullConfig 测试完整配置（非零值原样保留）
+func TestWithDistributedLock_FullConfig(t *testing.T) {
+	opts := &CacheOptions{}
+	orig := &CacheDistributedLock{
+		Timeout:        2 * time.Second,
+		Expiration:     10 * time.Second,
+		EnableWatchdog: false,
+	}
+	WithDistributedLock(orig)(opts)
+	require.NotNil(t, opts.CacheDistributedLock)
+	assert.Equal(t, 2*time.Second, opts.CacheDistributedLock.Timeout)
+	assert.Equal(t, 10*time.Second, opts.CacheDistributedLock.Expiration)
+	assert.False(t, opts.CacheDistributedLock.EnableWatchdog)
+}
+
+// TestWithDistributedLock_ZeroFieldsFillDefaults 测试非 nil 配置但零值字段填充默认值
+func TestWithDistributedLock_ZeroFieldsFillDefaults(t *testing.T) {
+	opts := &CacheOptions{}
+	// 传入非 nil 但 Timeout/Expiration 为零，应填充默认值；EnableWatchdog 为 false 应原样保留
+	WithDistributedLock(&CacheDistributedLock{EnableWatchdog: false})(opts)
+	require.NotNil(t, opts.CacheDistributedLock)
+	assert.Equal(t, 500*time.Millisecond, opts.CacheDistributedLock.Timeout)
+	assert.Equal(t, 5*time.Second, opts.CacheDistributedLock.Expiration)
+	assert.False(t, opts.CacheDistributedLock.EnableWatchdog)
+}
+
+// TestWhenThen_TrueCondition 测试 WhenThen 条件为 true 时应用 thenOpt
+func TestWhenThen_TrueCondition(t *testing.T) {
+	opts := &CacheOptions{}
+	thenTTL := 10 * time.Second
+	elseTTL := time.Minute
+	WhenThen(true, WithTTL(thenTTL), WithTTL(elseTTL))(opts)
+	require.NotNil(t, opts.TTLOverride)
+	assert.Equal(t, thenTTL, *opts.TTLOverride)
+}
+
+// TestWhenThen_FalseCondition 测试 WhenThen 条件为 false 时应用 elseOpt
+func TestWhenThen_FalseCondition(t *testing.T) {
+	opts := &CacheOptions{}
+	thenTTL := 10 * time.Second
+	elseTTL := time.Minute
+	WhenThen(false, WithTTL(thenTTL), WithTTL(elseTTL))(opts)
+	require.NotNil(t, opts.TTLOverride)
+	assert.Equal(t, elseTTL, *opts.TTLOverride)
+}
+
+// TestMatch_NoMatchWithDefault 测试 Match 无匹配但有默认选项
+func TestMatch_NoMatchWithDefault(t *testing.T) {
+	opts := &CacheOptions{}
+	defaultTTL := 30 * time.Second
+	cases := []Case{
+		NewCase(false, WithTTL(time.Hour)),
+		NewCase(false, WithTTL(time.Hour*2)),
+	}
+	Match(cases, WithTTL(defaultTTL))(opts)
+	require.NotNil(t, opts.TTLOverride)
+	assert.Equal(t, defaultTTL, *opts.TTLOverride)
+}
+
+// TestMatch_NoMatchNoDefault 测试 Match 无匹配且无默认选项（defaultOpt 为空）
+func TestMatch_NoMatchNoDefault(t *testing.T) {
+	opts := &CacheOptions{}
+	cases := []Case{
+		NewCase(false, WithTTL(time.Hour)),
+	}
+	Match(cases)(opts)
+	assert.Nil(t, opts.TTLOverride)
+}
+
+// TestMatch_FirstMatchWins 测试 Match 命中第一个匹配后立即返回
+func TestMatch_FirstMatchWins(t *testing.T) {
+	opts := &CacheOptions{}
+	matchedTTL := 5 * time.Second
+	cases := []Case{
+		NewCase(true, WithTTL(matchedTTL)),
+		NewCase(true, WithTTL(time.Hour)), // 不应被应用
+	}
+	Match(cases, WithTTL(time.Minute))(opts)
+	require.NotNil(t, opts.TTLOverride)
+	assert.Equal(t, matchedTTL, *opts.TTLOverride)
 }

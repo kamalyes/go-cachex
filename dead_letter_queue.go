@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/kamalyes/go-toolbox/pkg/idgen"
@@ -120,6 +121,7 @@ type deadLetterQueueImpl[T any] struct {
 	errorThreshold    int64                     // 错误阈值（绝对值）
 	criticalThreshold int64                     // 严重阈值（绝对值）
 	idGenerator       *idgen.SnowflakeGenerator // 雪花算法 ID 生成器
+	alertMu           sync.RWMutex              // 保护 alertCallback 和阈值字段的并发访问
 }
 
 // NewDeadLetterQueue 创建死信队列
@@ -203,7 +205,16 @@ func (d *deadLetterQueueImpl[T]) Push(ctx context.Context, queueKey string, data
 
 // checkAndAlert 检查队列长度并触发预警
 func (d *deadLetterQueueImpl[T]) checkAndAlert(queueKey string, length int64) {
-	if d.alertCallback == nil {
+	// 在锁内读取回调函数和阈值，避免与 SetAlertCallback/SetAlertThresholds 竞态
+	d.alertMu.RLock()
+	callback := d.alertCallback
+	warning := d.warningThreshold
+	errThold := d.errorThreshold
+	critical := d.criticalThreshold
+	maxSize := d.maxSize
+	d.alertMu.RUnlock()
+
+	if callback == nil {
 		return
 	}
 
@@ -212,21 +223,21 @@ func (d *deadLetterQueueImpl[T]) checkAndAlert(queueKey string, length int64) {
 	var message string
 
 	switch {
-	case length >= d.criticalThreshold:
+	case length >= critical:
 		level = AlertLevelCritical
-		threshold = d.criticalThreshold
+		threshold = critical
 		message = fmt.Sprintf("死信队列 '%s' 达到严重阈值！当前长度: %d, 最大容量: %d (%.1f%%)",
-			queueKey, length, d.maxSize, float64(length)/float64(d.maxSize)*100)
-	case length >= d.errorThreshold:
+			queueKey, length, maxSize, float64(length)/float64(maxSize)*100)
+	case length >= errThold:
 		level = AlertLevelError
-		threshold = d.errorThreshold
+		threshold = errThold
 		message = fmt.Sprintf("死信队列 '%s' 达到错误阈值！当前长度: %d, 最大容量: %d (%.1f%%)",
-			queueKey, length, d.maxSize, float64(length)/float64(d.maxSize)*100)
-	case length >= d.warningThreshold:
+			queueKey, length, maxSize, float64(length)/float64(maxSize)*100)
+	case length >= warning:
 		level = AlertLevelWarning
-		threshold = d.warningThreshold
+		threshold = warning
 		message = fmt.Sprintf("死信队列 '%s' 达到警告阈值！当前长度: %d, 最大容量: %d (%.1f%%)",
-			queueKey, length, d.maxSize, float64(length)/float64(d.maxSize)*100)
+			queueKey, length, maxSize, float64(length)/float64(maxSize)*100)
 	default:
 		return // 未达到任何阈值，不触发预警
 	}
@@ -235,14 +246,14 @@ func (d *deadLetterQueueImpl[T]) checkAndAlert(queueKey string, length int64) {
 		Level:     level,
 		QueueKey:  queueKey,
 		Length:    length,
-		MaxSize:   d.maxSize,
+		MaxSize:   maxSize,
 		Threshold: threshold,
 		Message:   message,
 		Timestamp: time.Now(),
 	}
 
 	// 异步触发回调，避免阻塞主流程
-	go d.alertCallback(event)
+	go callback(event)
 }
 
 // GetItems 获取死信队列数据（不移除）
@@ -316,11 +327,15 @@ func (d *deadLetterQueueImpl[T]) Clear(ctx context.Context, queueKey string) err
 
 // SetAlertCallback 设置预警回调
 func (d *deadLetterQueueImpl[T]) SetAlertCallback(callback AlertCallback) {
+	d.alertMu.Lock()
 	d.alertCallback = callback
+	d.alertMu.Unlock()
 }
 
 // SetAlertThresholds 设置预警阈值
 func (d *deadLetterQueueImpl[T]) SetAlertThresholds(warning, error, critical float64) {
+	d.alertMu.Lock()
+	defer d.alertMu.Unlock()
 	if warning > 0 && warning < 1 {
 		d.warningThreshold = int64(float64(d.maxSize) * warning)
 	}

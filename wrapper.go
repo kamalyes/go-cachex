@@ -30,7 +30,7 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/kamalyes/go-argus"
+	validator "github.com/kamalyes/go-argus"
 	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/kamalyes/go-toolbox/pkg/syncx"
 	"github.com/kamalyes/go-toolbox/pkg/zipx"
@@ -435,7 +435,7 @@ func Combine(opts ...CacheOption) CacheOption {
 //   - 合理设置过期时间以平衡性能和数据一致性
 //   - 大对象缓存会消耗更多内存，即使有压缩
 //   - 可通过 WithForceRefresh(true) 强制刷新缓存
-func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T], expiration time.Duration, opts ...CacheOption) CacheFunc[T] {
+func CacheWrapper[T any](client redis.UniversalClient, key string, cacheFunc CacheFunc[T], expiration time.Duration, opts ...CacheOption) CacheFunc[T] {
 	var wrappedFunc CacheFunc[T]
 	wrappedFunc = func(ctx context.Context) (T, error) {
 		var result T
@@ -670,7 +670,7 @@ func CacheWrapper[T any](client *redis.Client, key string, cacheFunc CacheFunc[T
 
 // updateCache 更新缓存的内部辅助函数
 // 实现延迟双删策略和重试机制
-func updateCache(client *redis.Client, key string, cacheData string, expiration time.Duration, options *CacheOptions) {
+func updateCache(client redis.UniversalClient, key string, cacheData string, expiration time.Duration, options *CacheOptions) {
 	ctx := context.Background()
 
 	// 第一次删除：清除可能存在的旧缓存数据

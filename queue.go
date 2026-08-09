@@ -14,9 +14,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
+	"github.com/kamalyes/go-toolbox/pkg/idgen"
 	"github.com/kamalyes/go-toolbox/pkg/mathx"
+	"github.com/kamalyes/go-toolbox/pkg/osx"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -52,46 +55,54 @@ type QueueConfig struct {
 
 // QueueHandler Redis队列处理器
 type QueueHandler struct {
-	client    *redis.Client
-	config    QueueConfig
-	namespace string // 命名空间前缀
+	client      redis.UniversalClient
+	config      QueueConfig
+	namespace   string                    // 命名空间前缀
+	idGenerator *idgen.SnowflakeGenerator // 雪花算法 ID 生成器
 }
 
 // NewQueueHandler 创建队列处理器
-func NewQueueHandler(client *redis.Client, namespace string, config QueueConfig) *QueueHandler {
+func NewQueueHandler(client redis.UniversalClient, namespace string, config QueueConfig) *QueueHandler {
 	// 使用 mathx.IfLeZero 设置默认值
 	config.MaxRetries = mathx.IfLeZero(config.MaxRetries, 3)
 	config.RetryDelay = mathx.IfLeZero(config.RetryDelay, time.Second*5)
 	config.BatchSize = mathx.IfLeZero(config.BatchSize, 10)
 	config.LockTimeout = mathx.IfLeZero(config.LockTimeout, time.Minute*5)
 	config.CleanupInterval = mathx.IfLeZero(config.CleanupInterval, time.Minute*10)
+	namespace = mathx.IfNotEmpty(namespace, "queue") // 空 namespace 默认 "queue"
+
+	// 初始化雪花算法 ID 生成器
+	workerID := osx.GetWorkerIdForSnowflake()
+	datacenterID := osx.GetDatacenterId()
 
 	return &QueueHandler{
-		client:    client,
-		config:    config,
-		namespace: namespace,
+		client:      client,
+		config:      config,
+		namespace:   namespace,
+		idGenerator: idgen.NewSnowflakeGenerator(workerID, datacenterID),
 	}
 }
 
-// getQueueKey 获取队列键名
+// getQueueKey 获取队列键名（用 string + 替代 fmt.Sprintf，零分配）
 func (q *QueueHandler) getQueueKey(queueName string, queueType QueueType) string {
-	return fmt.Sprintf("%s:queue:%s:%s", q.namespace, string(queueType), queueName)
+	return q.namespace + ":queue:" + string(queueType) + ":" + queueName
 }
 
 // getLockKey 获取锁键名
 func (q *QueueHandler) getLockKey(queueName string) string {
-	return fmt.Sprintf("%s:lock:queue:%s", q.namespace, queueName)
+	return q.namespace + ":lock:queue:" + queueName
 }
 
 // getDelayKey 获取延时队列键名
 func (q *QueueHandler) getDelayKey(queueName string) string {
-	return fmt.Sprintf("%s:delay:%s", q.namespace, queueName)
+	return q.namespace + ":delay:" + queueName
 }
 
 // Enqueue 入队操作
 func (q *QueueHandler) Enqueue(ctx context.Context, queueName string, queueType QueueType, item *QueueItem) error {
 	if item.ID == "" {
-		item.ID = fmt.Sprintf("%d_%d", time.Now().UnixNano(), time.Now().Unix())
+		// 使用雪花算法生成全局唯一 ID，避免时间戳碰撞
+		item.ID = strconv.FormatInt(q.idGenerator.Generate(), 10)
 	}
 	if item.CreatedAt == 0 {
 		item.CreatedAt = time.Now().Unix()
@@ -220,7 +231,7 @@ func (q *QueueHandler) processDelayedQueue(ctx context.Context, queueName string
 	// 获取到期的任务
 	result, err := q.client.ZRangeByScoreWithScores(ctx, delayKey, &redis.ZRangeBy{
 		Min:   "0",
-		Max:   fmt.Sprintf("%.0f", now),
+		Max:   strconv.FormatFloat(now, 'f', 0, 64),
 		Count: 1,
 	}).Result()
 

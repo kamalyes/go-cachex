@@ -1652,3 +1652,281 @@ func TestCaseMatching(t *testing.T) {
 		assert.Equal(t, "test_data", result)
 	})
 }
+
+// TestCacheWrapper_DecompressionFailure 测试缓存数据解压缩失败时回退到数据加载
+func TestCacheWrapper_DecompressionFailure(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	key := "test_decompress_failure"
+	// 写入无法被 Zlib 解压的损坏数据
+	client.Set(ctx, key, "corrupted_data_not_zlib", time.Minute)
+
+	callCount := int32(0)
+	dataLoader := func(ctx context.Context) (string, error) {
+		atomic.AddInt32(&callCount, 1)
+		return "fresh_data", nil
+	}
+
+	// 默认启用压缩，解压失败应回退执行 loader
+	cachedLoader := CacheWrapper(client, key, dataLoader, time.Minute)
+	result, err := cachedLoader(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "fresh_data", result)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&callCount))
+}
+
+// TestCacheWrapper_DeserializationFailure 测试缓存数据反序列化失败时回退到数据加载
+func TestCacheWrapper_DeserializationFailure(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	key := "test_deserialize_failure"
+	// 写入无法反序列化为目标类型的数据（跳过压缩，直接存无效 JSON）
+	client.Set(ctx, key, "not_valid_json{{{", time.Minute)
+
+	callCount := int32(0)
+	dataLoader := func(ctx context.Context) (int, error) {
+		atomic.AddInt32(&callCount, 1)
+		return 42, nil
+	}
+
+	// 跳过压缩直接反序列化，反序列化失败应回退执行 loader
+	cachedLoader := CacheWrapper(client, key, dataLoader, time.Minute, WithoutCompression())
+	result, err := cachedLoader(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, 42, result)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&callCount))
+}
+
+// TestCacheWrapper_RedisGetError 测试 Redis Get 返回非 Nil 错误时直接返回错误
+func TestCacheWrapper_RedisGetError(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	// 提前关闭客户端，使后续 Get 返回连接错误
+	client.Close()
+
+	ctx := context.Background()
+	dataLoader := func(ctx context.Context) (string, error) {
+		return "data", nil
+	}
+
+	cachedLoader := CacheWrapper(client, "test_redis_get_error", dataLoader, time.Minute)
+	_, err := cachedLoader(ctx)
+	assert.Error(t, err)
+}
+
+// TestUpdateCache_RetryOnError 测试 updateCache 在 Set 失败时触发重试逻辑
+func TestUpdateCache_RetryOnError(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	// 关闭客户端使 Set 失败，触发重试循环
+	client.Close()
+
+	opts := &CacheOptions{
+		RetryOnError: true,
+		RetryTimes:   2,
+	}
+	// 应在有限重试后退出，不会 panic
+	updateCache(client, "test_update_retry", "data", time.Minute, opts)
+}
+
+// TestUpdateCache_NoRetryOnSuccess 测试 updateCache 成功时执行延迟双删
+func TestUpdateCache_NoRetryOnSuccess(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	key := "test_update_success"
+	opts := &CacheOptions{
+		RetryOnError: true,
+		RetryTimes:   3,
+	}
+	updateCache(client, key, "cache_data", time.Minute, opts)
+
+	// 等待延迟双删异步完成
+	time.Sleep(200 * time.Millisecond)
+
+	// 验证缓存最终被设置
+	cached, err := client.Get(ctx, key).Result()
+	assert.NoError(t, err)
+	assert.Equal(t, "cache_data", cached)
+}
+
+// TestCacheWrapper_MarshalFailure 测试 json.Marshal 失败时返回错误但不缓存
+func TestCacheWrapper_MarshalFailure(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	key := "test_marshal_failure"
+	client.Del(ctx, key)
+
+	// 包含 channel 字段，无法被 json.Marshal 序列化
+	type Unserializable struct {
+		Ch chan int
+	}
+
+	dataLoader := func(ctx context.Context) (Unserializable, error) {
+		return Unserializable{Ch: make(chan int)}, nil
+	}
+
+	cachedLoader := CacheWrapper(client, key, dataLoader, time.Minute)
+	result, err := cachedLoader(ctx)
+	assert.Error(t, err)
+	// 返回的 result 仍包含有效数据（channel 存在）
+	assert.NotNil(t, result.Ch)
+
+	// 验证缓存未被设置（marshal 失败不缓存）
+	exists, err := client.Exists(ctx, key).Result()
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), exists)
+}
+
+// TestCacheWrapper_DistributedLockSkipCompress 测试分布式锁 + 跳过压缩的并发场景
+// 覆盖 tryGetFromCache 中 SkipCompress=true 分支
+func TestCacheWrapper_DistributedLockSkipCompress(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	key := "test_lock_skip_compress"
+	callCount := int32(0)
+
+	dataLoader := func(ctx context.Context) (*string, error) {
+		count := atomic.AddInt32(&callCount, 1)
+		time.Sleep(100 * time.Millisecond) // 模拟慢查询，增加锁竞争
+		result := fmt.Sprintf("data_%d", count)
+		return &result, nil
+	}
+
+	// 启用分布式锁 + 跳过压缩
+	cachedLoader := CacheWrapper(
+		client, key, dataLoader, time.Minute,
+		WithDistributedLock(&CacheDistributedLock{
+			Timeout:        3 * time.Second,
+			Expiration:     10 * time.Second,
+			EnableWatchdog: true,
+		}),
+		WithoutCompression(),
+	)
+
+	concurrency := 20
+	done := make(chan bool, concurrency)
+	results := make([]string, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		go func(index int) {
+			result, err := cachedLoader(ctx)
+			assert.NoError(t, err)
+			if result != nil {
+				results[index] = *result
+			}
+			done <- true
+		}(i)
+	}
+
+	for i := 0; i < concurrency; i++ {
+		<-done
+	}
+
+	dbCalls := atomic.LoadInt32(&callCount)
+	t.Logf("Total DB calls: %d (concurrency: %d)", dbCalls, concurrency)
+	// 分布式锁应限制 DB 查询次数
+	assert.LessOrEqual(t, dbCalls, int32(5), "分布式锁应该限制DB查询次数")
+
+	// 等待缓存稳定
+	time.Sleep(200 * time.Millisecond)
+
+	// 验证至少部分结果有效
+	validResults := 0
+	for _, r := range results {
+		if r != "" {
+			validResults++
+		}
+	}
+	assert.Greater(t, validResults, 0, "应有有效结果")
+}
+
+// TestCacheWrapper_DistributedLockTimeoutRetry 测试分布式锁获取超时后走重试读取缓存路径
+// 覆盖 lock.Lock 失败后的 tryGetFromCache 重试分支
+func TestCacheWrapper_DistributedLockTimeoutRetry(t *testing.T) {
+	client := setupRedisClient(t)
+	if client == nil {
+		return
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	key := "test_lock_timeout_retry"
+	callCount := int32(0)
+
+	dataLoader := func(ctx context.Context) (*string, error) {
+		atomic.AddInt32(&callCount, 1)
+		time.Sleep(300 * time.Millisecond) // 模拟慢查询，超过锁超时时间
+		result := "slow_data"
+		return &result, nil
+	}
+
+	// 锁超时时间很短（50ms），loader 耗时 300ms，使其他 goroutine 锁获取超时
+	cachedLoader := CacheWrapper(
+		client, key, dataLoader, time.Minute,
+		WithDistributedLock(&CacheDistributedLock{
+			Timeout:        50 * time.Millisecond,
+			Expiration:     10 * time.Second,
+			EnableWatchdog: true,
+		}),
+	)
+
+	concurrency := 5
+	done := make(chan bool, concurrency)
+	results := make([]string, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		go func(index int) {
+			result, err := cachedLoader(ctx)
+			if err == nil && result != nil {
+				results[index] = *result
+			}
+			done <- true
+		}(i)
+	}
+
+	for i := 0; i < concurrency; i++ {
+		<-done
+	}
+
+	// 等待缓存稳定
+	time.Sleep(200 * time.Millisecond)
+
+	// 验证至少有部分结果有效（锁超时的 goroutine 通过重试读取到缓存）
+	validResults := 0
+	for _, r := range results {
+		if r != "" {
+			validResults++
+		}
+	}
+	assert.Greater(t, validResults, 0, "应有有效结果")
+	t.Logf("DB calls: %d, valid results: %d", atomic.LoadInt32(&callCount), validResults)
+}

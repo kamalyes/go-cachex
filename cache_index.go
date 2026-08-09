@@ -56,11 +56,11 @@ return deleted
 //	// 删缓存时按分组原子删除
 //	mgr.DeleteByIndex(ctx, "idx:tenant")  // 删除该索引下所有缓存键
 type CacheIndexManager struct {
-	client *redis.Client
+	client redis.UniversalClient
 }
 
 // NewCacheIndexManager 创建缓存索引管理器
-func NewCacheIndexManager(client *redis.Client) *CacheIndexManager {
+func NewCacheIndexManager(client redis.UniversalClient) *CacheIndexManager {
 	return &CacheIndexManager{client: client}
 }
 
@@ -153,7 +153,7 @@ func (g *IndexGroup) AddIndexKeys(keys ...string) {
 func CacheWrapperWithIndex[T any](
 	manager *CacheIndexManager,
 	idxKey string,
-	client *redis.Client,
+	client redis.UniversalClient,
 	key string,
 	cacheFunc CacheFunc[T],
 	expiration time.Duration,

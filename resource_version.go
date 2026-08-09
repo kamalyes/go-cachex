@@ -13,7 +13,6 @@ package cachex
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -41,9 +40,9 @@ func NewVersionTracker(redisClient redis.UniversalClient, prefix string) *Versio
 	}
 }
 
-// GetVersionKey 获取资源版本的完整 Redis key
+// GetVersionKey 获取资源版本的完整 Redis key（用 string + 替代 fmt.Sprintf，零分配）
 func (v *VersionTracker) GetVersionKey(resourceID string) string {
-	return fmt.Sprintf("%s%s", v.prefix, resourceID)
+	return v.prefix + resourceID
 }
 
 // UpdateVersion 更新资源的版本号

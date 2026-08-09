@@ -342,3 +342,395 @@ func TestDeadLetterQueue_MultipleQueues(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, int64(3), length)
 }
+
+// TestAlertLevel_String 测试 AlertLevel 的 String 方法
+func TestAlertLevel_String(t *testing.T) {
+	assert.Equal(t, "INFO", AlertLevelInfo.String())
+	assert.Equal(t, "WARNING", AlertLevelWarning.String())
+	assert.Equal(t, "ERROR", AlertLevelError.String())
+	assert.Equal(t, "CRITICAL", AlertLevelCritical.String())
+	assert.Equal(t, "UNKNOWN", AlertLevel(999).String())
+}
+
+// TestDeadLetterQueue_CheckAndAlert_CriticalLevel 测试 checkAndAlert 触发严重阈值
+func TestDeadLetterQueue_CheckAndAlert_CriticalLevel(t *testing.T) {
+	_, dlq, cleanup := setupDLQTest(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	var alertLevel AlertLevel
+	dlq.SetAlertCallback(func(event AlertEvent) {
+		mu.Lock()
+		alertLevel = event.Level
+		mu.Unlock()
+	})
+
+	// maxSize=10, criticalThreshold=0.95 -> 9 个触发严重
+	for i := range 10 {
+		data := &TestData{
+			ID:      fmt.Sprintf("crit-%d", i),
+			Message: fmt.Sprintf("message %d", i),
+			Time:    time.Now(),
+		}
+		err := dlq.Push(ctx, testQueueKeyTest, data)
+		require.NoError(t, err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	level := alertLevel
+	mu.Unlock()
+	assert.Equal(t, AlertLevelCritical, level, "应触发严重级别预警")
+}
+
+// TestDeadLetterQueue_CheckAndAlert_ErrorLevel 测试 checkAndAlert 触发错误阈值
+func TestDeadLetterQueue_CheckAndAlert_ErrorLevel(t *testing.T) {
+	_, dlq, cleanup := setupDLQTest(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	var alertLevel AlertLevel
+	dlq.SetAlertCallback(func(event AlertEvent) {
+		mu.Lock()
+		alertLevel = event.Level
+		mu.Unlock()
+	})
+
+	// maxSize=10, errorThreshold=0.8 -> 8 个触发错误
+	for i := range 8 {
+		data := &TestData{
+			ID:      fmt.Sprintf("err-%d", i),
+			Message: fmt.Sprintf("message %d", i),
+			Time:    time.Now(),
+		}
+		err := dlq.Push(ctx, testQueueKeyTest, data)
+		require.NoError(t, err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	level := alertLevel
+	mu.Unlock()
+	assert.Equal(t, AlertLevelError, level, "应触发错误级别预警")
+}
+
+// TestDeadLetterQueue_CheckAndAlert_NoThreshold 测试 checkAndAlert 未达到阈值时不触发
+func TestDeadLetterQueue_CheckAndAlert_NoThreshold(t *testing.T) {
+	_, dlq, cleanup := setupDLQTest(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	var alertCount atomic.Int32
+	dlq.SetAlertCallback(func(event AlertEvent) {
+		alertCount.Add(1)
+	})
+
+	// 推送少量数据（不超过警告阈值 60%）
+	for i := range 3 {
+		data := &TestData{
+			ID:      fmt.Sprintf("low-%d", i),
+			Message: fmt.Sprintf("message %d", i),
+			Time:    time.Now(),
+		}
+		err := dlq.Push(ctx, testQueueKeyTest, data)
+		require.NoError(t, err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, int32(0), alertCount.Load(), "未达到阈值不应触发预警")
+}
+
+// TestDeadLetterQueue_Remove_ZeroCount 测试 Remove 在 count <= 0 时直接返回
+func TestDeadLetterQueue_Remove_ZeroCount(t *testing.T) {
+	_, dlq, cleanup := setupDLQTest(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// 推送数据
+	for i := range 3 {
+		data := &TestData{
+			ID:      fmt.Sprintf("zero-%d", i),
+			Message: fmt.Sprintf("message %d", i),
+			Time:    time.Now(),
+		}
+		err := dlq.Push(ctx, testQueueKeyTest, data)
+		require.NoError(t, err)
+	}
+
+	// count=0 应直接返回，不移除任何数据
+	err := dlq.Remove(ctx, testQueueKeyTest, 0)
+	assert.NoError(t, err)
+
+	// 验证队列长度不变
+	length, err := dlq.GetLength(ctx, testQueueKeyTest)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(3), length, "Remove(0) 不应移除任何数据")
+}
+
+// TestDeadLetterQueue_GetItems_DefaultCount 测试 GetItems 在 count <= 0 时使用默认值
+func TestDeadLetterQueue_GetItems_DefaultCount(t *testing.T) {
+	_, dlq, cleanup := setupDLQTest(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// 推送数据
+	for i := range 5 {
+		data := &TestData{
+			ID:      fmt.Sprintf("default-%d", i),
+			Message: fmt.Sprintf("message %d", i),
+			Time:    time.Now(),
+		}
+		err := dlq.Push(ctx, testQueueKeyTest, data)
+		require.NoError(t, err)
+	}
+
+	// count=0 应使用默认值 10
+	items, err := dlq.GetItems(ctx, testQueueKeyTest, 0)
+	assert.NoError(t, err)
+	assert.Len(t, items, 5)
+}
+
+// TestDeadLetterQueue_GetItems_EmptyQueue 测试 GetItems 在空队列时返回空切片
+func TestDeadLetterQueue_GetItems_EmptyQueue(t *testing.T) {
+	_, dlq, cleanup := setupDLQTest(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	items, err := dlq.GetItems(ctx, "nonexistent_queue", 10)
+	assert.NoError(t, err)
+	assert.Empty(t, items)
+}
+
+// TestDeadLetterQueue_SetAlertThresholds_InvalidValues 测试 SetAlertThresholds 忽略无效值
+func TestDeadLetterQueue_SetAlertThresholds_InvalidValues(t *testing.T) {
+	_, dlq, cleanup := setupDLQTest(t)
+	defer cleanup()
+
+	// 设置无效阈值（0 或 >=1 应被忽略）
+	dlq.SetAlertThresholds(0, 1.5, -0.5)
+
+	// 不应 panic
+	assert.NotNil(t, dlq)
+}
+
+// TestDeadLetterQueue_Clear_Error 测试 Clear 在 queueHandler 失败时返回错误
+func TestDeadLetterQueue_Clear_Error(t *testing.T) {
+	client := setupRedisClient(t)
+
+	queueConfig := QueueConfig{
+		MaxRetries:  3,
+		RetryDelay:  time.Second,
+		BatchSize:   10,
+		LockTimeout: time.Minute,
+	}
+	queueHandler := NewQueueHandler(client, "test:dlq:", queueConfig)
+
+	dlqConfig := DeadLetterQueueConfig{
+		MaxSize:           10,
+		WarningThreshold:  0.6,
+		ErrorThreshold:    0.8,
+		CriticalThreshold: 0.95,
+	}
+	dlq := NewDeadLetterQueue[*TestData](queueHandler, dlqConfig)
+
+	// 关闭客户端使 Clear 失败
+	client.Close()
+
+	err := dlq.Clear(context.Background(), testQueueKeyTest)
+	assert.Error(t, err)
+}
+
+// TestDeadLetterQueue_GetLength_Error 测试 GetLength 在 queueHandler 失败时返回错误
+func TestDeadLetterQueue_GetLength_Error(t *testing.T) {
+	client := setupRedisClient(t)
+
+	queueConfig := QueueConfig{
+		MaxRetries:  3,
+		RetryDelay:  time.Second,
+		BatchSize:   10,
+		LockTimeout: time.Minute,
+	}
+	queueHandler := NewQueueHandler(client, "test:dlq:", queueConfig)
+
+	dlqConfig := DeadLetterQueueConfig{
+		MaxSize: 10,
+	}
+	dlq := NewDeadLetterQueue[*TestData](queueHandler, dlqConfig)
+
+	// 关闭客户端使 Length 失败
+	client.Close()
+
+	_, err := dlq.GetLength(context.Background(), testQueueKeyTest)
+	assert.Error(t, err)
+}
+
+// unmarshalFailingType 是一个自定义类型，其 UnmarshalJSON 总是返回错误
+type unmarshalFailingType struct {
+	Value string
+}
+
+func (u *unmarshalFailingType) UnmarshalJSON(data []byte) error {
+	return fmt.Errorf("unmarshal always fails")
+}
+
+// TestDeadLetterQueue_Push_EnqueueError 测试 Push 在 Enqueue 失败时返回错误
+func TestDeadLetterQueue_Push_EnqueueError(t *testing.T) {
+	client := setupRedisClient(t)
+
+	queueConfig := QueueConfig{
+		MaxRetries:  3,
+		RetryDelay:  time.Second,
+		BatchSize:   10,
+		LockTimeout: time.Minute,
+	}
+	queueHandler := NewQueueHandler(client, "test:dlq:", queueConfig)
+
+	dlq := NewDeadLetterQueue[*TestData](queueHandler, DeadLetterQueueConfig{MaxSize: 10})
+
+	// 关闭客户端使 Enqueue 失败
+	client.Close()
+
+	err := dlq.Push(context.Background(), testQueueKeyTest, &TestData{ID: "1", Message: "test"})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "push to dead letter queue failed")
+}
+
+// TestDeadLetterQueue_Push_LengthError 测试 Push 在 Enqueue 成功但 Length 失败时返回错误
+func TestDeadLetterQueue_Push_LengthError(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	// 使用 hook 使第 2 条命令（LLen）失败，第 1 条命令（RPush）正常
+	client.AddHook(&failNthCmdHook{failAt: 2, err: fmt.Errorf("forced LLen error")})
+
+	queueConfig := QueueConfig{
+		MaxRetries:  3,
+		RetryDelay:  time.Second,
+		BatchSize:   10,
+		LockTimeout: time.Minute,
+	}
+	queueHandler := NewQueueHandler(client, "test:dlq:", queueConfig)
+
+	dlq := NewDeadLetterQueue[*TestData](queueHandler, DeadLetterQueueConfig{MaxSize: 10})
+
+	err := dlq.Push(context.Background(), testQueueKeyTest, &TestData{ID: "1", Message: "test"})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "get queue length failed")
+}
+
+// TestDeadLetterQueue_GetItems_PeekError 测试 GetItems 在 Peek 失败时返回错误
+func TestDeadLetterQueue_GetItems_PeekError(t *testing.T) {
+	client := setupRedisClient(t)
+
+	queueConfig := QueueConfig{
+		MaxRetries:  3,
+		RetryDelay:  time.Second,
+		BatchSize:   10,
+		LockTimeout: time.Minute,
+	}
+	queueHandler := NewQueueHandler(client, "test:dlq:", queueConfig)
+
+	dlq := NewDeadLetterQueue[*TestData](queueHandler, DeadLetterQueueConfig{MaxSize: 10})
+
+	// 先推送数据
+	err := dlq.Push(context.Background(), testQueueKeyTest, &TestData{ID: "1", Message: "test"})
+	require.NoError(t, err)
+
+	// 关闭客户端使 Peek 失败
+	client.Close()
+
+	_, err = dlq.GetItems(context.Background(), testQueueKeyTest, 10)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "get dead letter items failed")
+}
+
+// TestDeadLetterQueue_GetItems_TypeAssertionSuccess 测试 GetItems 类型断言成功路径
+func TestDeadLetterQueue_GetItems_TypeAssertionSuccess(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	queueConfig := QueueConfig{
+		MaxRetries:  3,
+		RetryDelay:  time.Second,
+		BatchSize:   10,
+		LockTimeout: time.Minute,
+	}
+	queueHandler := NewQueueHandler(client, "test:dlq:", queueConfig)
+
+	// 使用 string 类型，JSON 往返后类型信息不丢失
+	dlq := NewDeadLetterQueue[string](queueHandler, DeadLetterQueueConfig{MaxSize: 10})
+
+	ctx := context.Background()
+
+	// 推送字符串数据
+	err := dlq.Push(ctx, testQueueKeyTest, "hello_world")
+	require.NoError(t, err)
+
+	// 获取数据，类型断言应成功
+	items, err := dlq.GetItems(ctx, testQueueKeyTest, 10)
+	assert.NoError(t, err)
+	require.Len(t, items, 1)
+	assert.Equal(t, "hello_world", items[0])
+}
+
+// TestDeadLetterQueue_GetItems_UnmarshalError 测试 GetItems JSON 反序列化失败时跳过数据
+func TestDeadLetterQueue_GetItems_UnmarshalError(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	queueConfig := QueueConfig{
+		MaxRetries:  3,
+		RetryDelay:  time.Second,
+		BatchSize:   10,
+		LockTimeout: time.Minute,
+	}
+	queueHandler := NewQueueHandler(client, "test:dlq:", queueConfig)
+
+	// 使用自定义类型，其 UnmarshalJSON 总是失败
+	dlq := NewDeadLetterQueue[*unmarshalFailingType](queueHandler, DeadLetterQueueConfig{MaxSize: 10})
+
+	ctx := context.Background()
+
+	// 推送数据（Marshal 使用默认行为，可以成功）
+	err := dlq.Push(ctx, testQueueKeyTest, &unmarshalFailingType{Value: "test"})
+	require.NoError(t, err)
+
+	// 获取数据时，类型断言失败，JSON 重新反序列化也失败，应返回空切片
+	items, err := dlq.GetItems(ctx, testQueueKeyTest, 10)
+	assert.NoError(t, err)
+	assert.Empty(t, items, "反序列化失败的数据应被跳过")
+}
+
+// TestDeadLetterQueue_Remove_BatchDequeueError 测试 Remove 在 BatchDequeue 失败时返回错误
+func TestDeadLetterQueue_Remove_BatchDequeueError(t *testing.T) {
+	client := setupRedisClient(t)
+
+	queueConfig := QueueConfig{
+		MaxRetries:  3,
+		RetryDelay:  time.Second,
+		BatchSize:   10,
+		LockTimeout: time.Minute,
+	}
+	queueHandler := NewQueueHandler(client, "test:dlq:", queueConfig)
+
+	dlq := NewDeadLetterQueue[*TestData](queueHandler, DeadLetterQueueConfig{MaxSize: 10})
+
+	// 先推送数据
+	err := dlq.Push(context.Background(), testQueueKeyTest, &TestData{ID: "1", Message: "test"})
+	require.NoError(t, err)
+
+	// 关闭客户端使 BatchDequeue 失败
+	client.Close()
+
+	err = dlq.Remove(context.Background(), testQueueKeyTest, 1)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "remove dead letter items failed")
+}

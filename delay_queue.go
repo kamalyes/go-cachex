@@ -111,7 +111,7 @@ type delayTaskEnvelope[T any] struct {
 // 基于 Redis ZSET（score=执行时间戳）+ Hash（存储任务体）实现，
 // 通过 Lua 脚本保证多实例下的原子出队，适合跨实例的延迟任务协调。
 type DelayQueue[T any] struct {
-	client *redis.Client
+	client redis.UniversalClient
 	config DelayQueueConfig
 
 	mu        sync.Mutex
@@ -123,7 +123,7 @@ type DelayQueue[T any] struct {
 
 // NewDelayQueue 创建延迟队列
 // client 必须是非 nil 的 Redis 客户端；config 为空时使用默认配置
-func NewDelayQueue[T any](client *redis.Client, config ...DelayQueueConfig) *DelayQueue[T] {
+func NewDelayQueue[T any](client redis.UniversalClient, config ...DelayQueueConfig) *DelayQueue[T] {
 	cfg := DefaultDelayQueueConfig()
 	if len(config) > 0 {
 		c := config[0]
@@ -154,21 +154,21 @@ func NewDelayQueue[T any](client *redis.Client, config ...DelayQueueConfig) *Del
 // ========== 键名生成 ==========
 
 func (q *DelayQueue[T]) zsetKey(queueName string) string {
-	return fmt.Sprintf("%s:zset:%s", q.config.Namespace, queueName)
+	return q.config.Namespace + ":zset:" + queueName
 }
 
 func (q *DelayQueue[T]) hashKey(queueName string) string {
-	return fmt.Sprintf("%s:hash:%s", q.config.Namespace, queueName)
+	return q.config.Namespace + ":hash:" + queueName
 }
 
 func (q *DelayQueue[T]) deadKey(queueName string) string {
-	return fmt.Sprintf("%s:dead:%s", q.config.Namespace, queueName)
+	return q.config.Namespace + ":dead:" + queueName
 }
 
 // processingKey 处理中 ZSet 的 key，score = 可见性超时时间戳
 // 任务从 ready 出队后进入 processing，ACK 后删除；超时未 ACK 的任务由 requeueStale 移回 ready
 func (q *DelayQueue[T]) processingKey(queueName string) string {
-	return fmt.Sprintf("%s:processing:%s", q.config.Namespace, queueName)
+	return q.config.Namespace + ":processing:" + queueName
 }
 
 // ========== Lua 脚本 ==========

@@ -116,6 +116,7 @@ var (
 	ErrDecompressFailed   = fmt.Errorf("decompress data failed")
 	ErrUnknownPersistMode = fmt.Errorf("unknown persistence mode")
 	ErrGetRedisLenFailed  = fmt.Errorf("failed to get redis queue length")
+	ErrNoData             = fmt.Errorf("no data available") // 队列无数据（超时/空），用于零分配判断
 )
 
 // DefaultDurableChannelConfig 默认配置
@@ -447,7 +448,7 @@ func (dc *DurableChannel[T]) pullFromRedis(ctx context.Context) (T, error) {
 	result, err := dc.client.BLPop(ctx, dc.config.PollInterval, dc.queueKey).Result()
 	if err != nil {
 		if err == redis.Nil {
-			return zero, nil // 超时，无数据
+			return zero, ErrNoData // 超时，无数据
 		}
 		// 检查是否是 context 取消
 		if ctx.Err() != nil {
@@ -477,7 +478,7 @@ func (dc *DurableChannel[T]) pullFromRedisNonBlocking(ctx context.Context) (T, e
 	result, err := dc.client.LPop(ctx, dc.queueKey).Result()
 	if err != nil {
 		if err == redis.Nil {
-			return zero, nil // 队列为空
+			return zero, ErrNoData // 队列为空
 		}
 		return zero, fmt.Errorf("%w: %w", ErrPullFailed, err)
 	}
@@ -514,6 +515,9 @@ func (dc *DurableChannel[T]) startWorker(id int) {
 
 				// 从 Redis 拉取消息（使用 dc.ctx，确保可以被取消）
 				data, err := dc.pullFromRedis(dc.ctx)
+				if err == ErrNoData {
+					continue // 超时，无数据（哨兵错误判断，零分配）
+				}
 				if err != nil {
 					// 检查是否是 context 取消导致的错误
 					if dc.ctx.Err() != nil {
@@ -522,12 +526,6 @@ func (dc *DurableChannel[T]) startWorker(id int) {
 					}
 					dc.logger.Warnf("Worker %d pull failed: %v", id, err)
 					time.Sleep(time.Second)
-					continue
-				}
-
-				// 检查是否为零值（超时）
-				var zero T
-				if fmt.Sprintf("%v", data) == fmt.Sprintf("%v", zero) {
 					continue
 				}
 
@@ -569,14 +567,11 @@ func (dc *DurableChannel[T]) recoverMessages() {
 		for i := int64(0); i < length && i < int64(dc.config.BufferSize); i++ {
 			// 使用非阻塞拉取
 			data, err := dc.pullFromRedisNonBlocking(dc.ctx)
+			if err == ErrNoData {
+				break // 队列为空（哨兵错误判断，零分配）
+			}
 			if err != nil {
 				dc.logger.Warnf("Failed to recover message: %v", err)
-				break
-			}
-
-			// 检查是否为零值（队列为空）
-			var zero T
-			if fmt.Sprintf("%v", data) == fmt.Sprintf("%v", zero) {
 				break
 			}
 

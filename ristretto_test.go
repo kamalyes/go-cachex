@@ -11,6 +11,8 @@
 package cachex
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -643,4 +645,364 @@ func TestRistrettoHandler_MissingMethods(t *testing.T) {
 		assert.Equal(t, []byte("computed"), val2)
 		assert.Equal(t, 1, callCount)
 	})
+}
+
+// TestRistrettoHandler_NilCacheBranches 测试所有方法的 nil cache 分支
+func TestRistrettoHandler_NilCacheBranches(t *testing.T) {
+	nilHandler := &RistrettoHandler{cache: nil}
+	ctx := context.Background()
+
+	t.Run("GetWithCtx nil cache", func(t *testing.T) {
+		_, err := nilHandler.GetWithCtx(ctx, []byte("key"))
+		assert.ErrorIs(t, err, ErrNotInitialized)
+	})
+
+	t.Run("GetTTLWithCtx nil cache", func(t *testing.T) {
+		_, err := nilHandler.GetTTLWithCtx(ctx, []byte("key"))
+		assert.ErrorIs(t, err, ErrNotInitialized)
+	})
+
+	t.Run("SetWithCtx nil cache", func(t *testing.T) {
+		err := nilHandler.SetWithCtx(ctx, []byte("key"), []byte("val"))
+		assert.ErrorIs(t, err, ErrNotInitialized)
+	})
+
+	t.Run("SetWithTTLAndCtx nil cache", func(t *testing.T) {
+		err := nilHandler.SetWithTTLAndCtx(ctx, []byte("key"), []byte("val"), time.Second)
+		assert.ErrorIs(t, err, ErrNotInitialized)
+	})
+
+	t.Run("DelWithCtx nil cache", func(t *testing.T) {
+		err := nilHandler.DelWithCtx(ctx, []byte("key"))
+		assert.ErrorIs(t, err, ErrNotInitialized)
+	})
+
+	t.Run("BatchGetWithCtx nil cache", func(t *testing.T) {
+		results, errs := nilHandler.BatchGetWithCtx(ctx, [][]byte{[]byte("key1"), []byte("key2")})
+		assert.Len(t, results, 2)
+		assert.Len(t, errs, 2)
+		assert.ErrorIs(t, errs[0], ErrNotInitialized)
+		assert.ErrorIs(t, errs[1], ErrNotInitialized)
+	})
+
+	t.Run("GetOrComputeWithCtx nil cache", func(t *testing.T) {
+		_, err := nilHandler.GetOrComputeWithCtx(ctx, []byte("key"), time.Second, func(ctx context.Context) ([]byte, error) {
+			return []byte("val"), nil
+		})
+		assert.ErrorIs(t, err, ErrNotInitialized)
+	})
+
+	t.Run("Stats nil cache", func(t *testing.T) {
+		stats := nilHandler.Stats()
+		assert.NotNil(t, stats)
+		assert.Equal(t, false, stats["initialized"])
+	})
+
+	t.Run("Close nil cache", func(t *testing.T) {
+		err := nilHandler.Close()
+		assert.ErrorIs(t, err, ErrNotInitialized)
+	})
+}
+
+// TestRistrettoHandler_NilKeyBranches 测试 nil key 分支
+func TestRistrettoHandler_NilKeyBranches(t *testing.T) {
+	handler, err := NewDefaultRistrettoHandler()
+	require.NoError(t, err)
+	defer handler.Close()
+
+	ctx := context.Background()
+
+	t.Run("GetWithCtx nil key", func(t *testing.T) {
+		_, err := handler.GetWithCtx(ctx, nil)
+		assert.ErrorIs(t, err, ErrInvalidKey)
+	})
+
+	t.Run("GetTTLWithCtx nil key", func(t *testing.T) {
+		_, err := handler.GetTTLWithCtx(ctx, nil)
+		assert.ErrorIs(t, err, ErrInvalidKey)
+	})
+
+	t.Run("SetWithCtx nil key", func(t *testing.T) {
+		err := handler.SetWithCtx(ctx, nil, []byte("val"))
+		assert.ErrorIs(t, err, ErrInvalidKey)
+	})
+
+	t.Run("SetWithTTLAndCtx nil key", func(t *testing.T) {
+		err := handler.SetWithTTLAndCtx(ctx, nil, []byte("val"), time.Second)
+		assert.ErrorIs(t, err, ErrInvalidKey)
+	})
+
+	t.Run("DelWithCtx nil key", func(t *testing.T) {
+		err := handler.DelWithCtx(ctx, nil)
+		assert.ErrorIs(t, err, ErrInvalidKey)
+	})
+
+	t.Run("GetOrComputeWithCtx nil key", func(t *testing.T) {
+		_, err := handler.GetOrComputeWithCtx(ctx, nil, time.Second, func(ctx context.Context) ([]byte, error) {
+			return []byte("val"), nil
+		})
+		assert.ErrorIs(t, err, ErrInvalidKey)
+	})
+}
+
+// TestRistrettoHandler_NewRistrettoHandler_NilConfig 测试 NewRistrettoHandler 的 nil config 分支
+func TestRistrettoHandler_NewRistrettoHandler_NilConfig(t *testing.T) {
+	handler, err := NewRistrettoHandler(nil)
+	require.NoError(t, err)
+	defer handler.Close()
+
+	// 验证 handler 正常工作
+	assert.NoError(t, handler.Set([]byte("test"), []byte("value")))
+	val, err := handler.Get([]byte("test"))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("value"), val)
+}
+
+// TestRistrettoHandler_NewRistrettoHandler_InvalidConfig 测试 NewRistrettoHandler 的无效 config 分支
+func TestRistrettoHandler_NewRistrettoHandler_InvalidConfig(t *testing.T) {
+	// NumCounters 为 0 会导致 ristretto.NewCache 返回错误
+	config := &RistrettoConfig{
+		NumCounters: 0,
+		MaxCost:     1 << 20,
+		BufferItems: 64,
+	}
+	_, err := NewRistrettoHandler(config)
+	assert.Error(t, err)
+}
+
+// TestRistrettoHandler_NewDefaultRistrettoHandler_Error 测试 NewDefaultRistrettoHandler 的错误分支
+func TestRistrettoHandler_NewDefaultRistrettoHandler_Error(t *testing.T) {
+	// 通过先创建一个默认配置然后修改为无效来测试错误分支
+	// 由于 NewDefaultRistrettoHandler 内部使用固定配置，我们需要间接测试
+	// 直接测试 createCache 的错误分支
+	config := &RistrettoConfig{
+		NumCounters: -1,
+		MaxCost:     1 << 20,
+		BufferItems: 64,
+	}
+	_, err := createCache(config)
+	assert.Error(t, err)
+}
+
+// TestRistrettoHandler_GetTTLWithCtx_NotFound 测试 GetTTLWithCtx 的 !ok 分支
+func TestRistrettoHandler_GetTTLWithCtx_NotFound(t *testing.T) {
+	handler, err := NewDefaultRistrettoHandler()
+	require.NoError(t, err)
+	defer handler.Close()
+
+	// 获取不存在的 key 的 TTL
+	_, err = handler.GetTTLWithCtx(context.Background(), []byte("nonexistent-key"))
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+// TestRistrettoHandler_SetWithCtx_CapacityExceeded 测试 SetWithCtx 的 !ok 分支
+func TestRistrettoHandler_SetWithCtx_CapacityExceeded(t *testing.T) {
+	// 创建一个缓存并直接关闭它（不通过 handler），使 cache 非 nil 但已关闭
+	config := NewDefaultRistrettoConfig()
+	cache, err := createCache(config)
+	require.NoError(t, err)
+	cache.Close()
+
+	handler := &RistrettoHandler{cache: cache}
+	err = handler.SetWithCtx(context.Background(), []byte("key"), []byte("val"))
+	assert.ErrorIs(t, err, ErrCapacityExceeded)
+}
+
+// TestRistrettoHandler_SetWithTTLAndCtx_CapacityExceeded 测试 SetWithTTLAndCtx 的 !ok 分支
+func TestRistrettoHandler_SetWithTTLAndCtx_CapacityExceeded(t *testing.T) {
+	// 创建一个缓存并直接关闭它（不通过 handler），使 cache 非 nil 但已关闭
+	config := NewDefaultRistrettoConfig()
+	cache, err := createCache(config)
+	require.NoError(t, err)
+	cache.Close()
+
+	handler := &RistrettoHandler{cache: cache}
+	err = handler.SetWithTTLAndCtx(context.Background(), []byte("key"), []byte("val"), time.Second)
+	assert.ErrorIs(t, err, ErrCapacityExceeded)
+}
+
+// TestRistrettoHandler_BatchGetWithCtx_EmptyKeys 测试 BatchGetWithCtx 的空 keys 分支
+func TestRistrettoHandler_BatchGetWithCtx_EmptyKeys(t *testing.T) {
+	handler, err := NewDefaultRistrettoHandler()
+	require.NoError(t, err)
+	defer handler.Close()
+
+	results, errs := handler.BatchGetWithCtx(context.Background(), [][]byte{})
+	assert.Nil(t, results)
+	assert.Nil(t, errs)
+}
+
+// TestRistrettoHandler_BatchGetWithCtx_EmptyKeyInBatch 测试 BatchGetWithCtx 的空 key 分支
+func TestRistrettoHandler_BatchGetWithCtx_EmptyKeyInBatch(t *testing.T) {
+	handler, err := NewDefaultRistrettoHandler()
+	require.NoError(t, err)
+	defer handler.Close()
+
+	// 设置一个有效值
+	handler.Set([]byte("valid-key"), []byte("valid-value"))
+
+	// 批量中包含空 key 和有效 key
+	results, errs := handler.BatchGetWithCtx(context.Background(), [][]byte{
+		[]byte("valid-key"),
+		[]byte{}, // 空 key
+		nil,      // nil key
+		[]byte("nonexistent"),
+	})
+	assert.Len(t, results, 4)
+	assert.Len(t, errs, 4)
+	assert.NoError(t, errs[0])
+	assert.Equal(t, []byte("valid-value"), results[0])
+	assert.ErrorIs(t, errs[1], ErrInvalidKey)
+	assert.ErrorIs(t, errs[2], ErrInvalidKey)
+	assert.ErrorIs(t, errs[3], ErrNotFound)
+}
+
+// TestRistrettoHandler_GetOrComputeWithCtx_CtxCancelled 测试 GetOrComputeWithCtx 的 ctx 取消分支
+func TestRistrettoHandler_GetOrComputeWithCtx_CtxCancelled(t *testing.T) {
+	handler, err := NewDefaultRistrettoHandler()
+	require.NoError(t, err)
+	defer handler.Close()
+
+	// 创建已取消的上下文
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = handler.GetOrComputeWithCtx(ctx, []byte("cancelled-key"), time.Second, func(ctx context.Context) ([]byte, error) {
+		return []byte("should not be computed"), nil
+	})
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+// TestRistrettoHandler_GetOrComputeWithCtx_LoaderError 测试 GetOrComputeWithCtx 的 loader 错误分支
+func TestRistrettoHandler_GetOrComputeWithCtx_LoaderError(t *testing.T) {
+	handler, err := NewDefaultRistrettoHandler()
+	require.NoError(t, err)
+	defer handler.Close()
+
+	testErr := errors.New("loader failed")
+	_, err = handler.GetOrComputeWithCtx(context.Background(), []byte("error-key"), time.Second, func(ctx context.Context) ([]byte, error) {
+		return nil, testErr
+	})
+	assert.ErrorIs(t, err, testErr)
+}
+
+// TestRistrettoHandler_GetOrComputeWithCtx_TTLZero 测试 GetOrComputeWithCtx 的 ttl<=0 分支
+func TestRistrettoHandler_GetOrComputeWithCtx_TTLZero(t *testing.T) {
+	handler, err := NewDefaultRistrettoHandler()
+	require.NoError(t, err)
+	defer handler.Close()
+
+	result, err := handler.GetOrComputeWithCtx(context.Background(), []byte("zero-ttl-key"), 0, func(ctx context.Context) ([]byte, error) {
+		return []byte("computed-zero-ttl"), nil
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("computed-zero-ttl"), result)
+
+	// 验证值已缓存（使用 Set 而非 SetWithTTL）
+	cached, err := handler.Get([]byte("zero-ttl-key"))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte("computed-zero-ttl"), cached)
+}
+
+// TestRistrettoHandler_GetOrComputeWithCtx_AllTTLBranches 测试 GetOrComputeWithCtx 的所有 TTL 分支
+func TestRistrettoHandler_GetOrComputeWithCtx_AllTTLBranches(t *testing.T) {
+	t.Run("negative TTL (never expire)", func(t *testing.T) {
+		handler, err := NewDefaultRistrettoHandler()
+		require.NoError(t, err)
+		defer handler.Close()
+
+		// ttl = -1 表示永不过期
+		result, err := handler.GetOrComputeWithCtx(context.Background(), []byte("neg-ttl-key"), -1, func(ctx context.Context) ([]byte, error) {
+			return []byte("never-expires"), nil
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("never-expires"), result)
+	})
+
+	t.Run("positive TTL", func(t *testing.T) {
+		handler, err := NewDefaultRistrettoHandler()
+		require.NoError(t, err)
+		defer handler.Close()
+
+		result, err := handler.GetOrComputeWithCtx(context.Background(), []byte("pos-ttl-key"), time.Minute, func(ctx context.Context) ([]byte, error) {
+			return []byte("with-ttl"), nil
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("with-ttl"), result)
+	})
+}
+
+// TestRistrettoHandler_Stats_WithMetrics 测试 Stats 启用 metrics 的分支
+func TestRistrettoHandler_Stats_WithMetrics(t *testing.T) {
+	config := NewDefaultRistrettoConfig()
+	config.EnableMetrics()
+
+	handler, err := NewRistrettoHandler(config)
+	require.NoError(t, err)
+	defer handler.Close()
+
+	// 执行一些操作以产生统计
+	handler.Set([]byte("stats-key"), []byte("value"))
+	handler.Get([]byte("stats-key"))
+	handler.Get([]byte("nonexistent"))
+
+	stats := handler.Stats()
+	assert.NotNil(t, stats)
+	assert.Equal(t, true, stats["initialized"])
+	// 验证统计字段存在
+	assert.Contains(t, stats, "hits")
+	assert.Contains(t, stats, "misses")
+}
+
+// TestRistrettoHandler_SetWithTTLAndCtx_AllBranches 测试 SetWithTTLAndCtx 的所有 TTL 分支
+func TestRistrettoHandler_SetWithTTLAndCtx_AllBranches(t *testing.T) {
+	handler, err := NewDefaultRistrettoHandler()
+	require.NoError(t, err)
+	defer handler.Close()
+
+	ctx := context.Background()
+
+	t.Run("TTL = -1 (never expire)", func(t *testing.T) {
+		err := handler.SetWithTTLAndCtx(ctx, []byte("forever-key"), []byte("forever"), -1)
+		assert.NoError(t, err)
+		val, err := handler.Get([]byte("forever-key"))
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("forever"), val)
+	})
+
+	t.Run("TTL = 0 (immediate expire)", func(t *testing.T) {
+		err := handler.SetWithTTLAndCtx(ctx, []byte("immediate-key"), []byte("immediate"), 0)
+		assert.NoError(t, err)
+		// 等待一小段时间让过期生效
+		time.Sleep(10 * time.Millisecond)
+		_, err = handler.Get([]byte("immediate-key"))
+		assert.ErrorIs(t, err, ErrNotFound)
+	})
+
+	t.Run("TTL = positive", func(t *testing.T) {
+		err := handler.SetWithTTLAndCtx(ctx, []byte("ttl-key"), []byte("ttl-value"), time.Hour)
+		assert.NoError(t, err)
+		val, err := handler.Get([]byte("ttl-key"))
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("ttl-value"), val)
+	})
+
+	t.Run("Invalid TTL (< -1)", func(t *testing.T) {
+		err := handler.SetWithTTLAndCtx(ctx, []byte("invalid"), []byte("val"), -2*time.Second)
+		assert.ErrorIs(t, err, ErrInvalidTTL)
+	})
+}
+
+// TestRistrettoHandler_Close_Twice 测试 Close 后再 Close
+func TestRistrettoHandler_Close_Twice(t *testing.T) {
+	handler, err := NewDefaultRistrettoHandler()
+	require.NoError(t, err)
+
+	// 第一次 Close
+	err = handler.Close()
+	assert.NoError(t, err)
+
+	// 第二次 Close（cache 为 nil）
+	err = handler.Close()
+	assert.ErrorIs(t, err, ErrNotInitialized)
 }

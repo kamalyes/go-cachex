@@ -135,8 +135,8 @@ func TestInt64KeyCodec(t *testing.T) {
 func TestGenericTTLCache_PubSub_DeleteInvalidation(t *testing.T) {
 	client, _ := newGenericTestRedis(t)
 
-	ps1 := NewPubSub(client, PubSubConfig{MaxWorkers: 5, WorkerQueueSize: 10})
-	ps2 := NewPubSub(client, PubSubConfig{MaxWorkers: 5, WorkerQueueSize: 10})
+	ps1 := NewPubSub(client, WithPubSubMaxWorkers(5), WithPubSubWorkerQueueSize(10))
+	ps2 := NewPubSub(client, WithPubSubMaxWorkers(5), WithPubSubWorkerQueueSize(10))
 	t.Cleanup(func() {
 		ps1.Close()
 		ps2.Close()
@@ -173,8 +173,8 @@ func TestGenericTTLCache_PubSub_DeleteInvalidation(t *testing.T) {
 func TestGenericTTLCache_PubSub_ClearInvalidation(t *testing.T) {
 	client, _ := newGenericTestRedis(t)
 
-	ps1 := NewPubSub(client, PubSubConfig{MaxWorkers: 5, WorkerQueueSize: 10})
-	ps2 := NewPubSub(client, PubSubConfig{MaxWorkers: 5, WorkerQueueSize: 10})
+	ps1 := NewPubSub(client, WithPubSubMaxWorkers(5), WithPubSubWorkerQueueSize(10))
+	ps2 := NewPubSub(client, WithPubSubMaxWorkers(5), WithPubSubWorkerQueueSize(10))
 	t.Cleanup(func() {
 		ps1.Close()
 		ps2.Close()
@@ -209,8 +209,8 @@ func TestGenericTTLCache_PubSub_ClearInvalidation(t *testing.T) {
 func TestGenericTTLCache_PubSub_IntKey(t *testing.T) {
 	client, _ := newGenericTestRedis(t)
 
-	ps1 := NewPubSub(client, PubSubConfig{MaxWorkers: 5, WorkerQueueSize: 10})
-	ps2 := NewPubSub(client, PubSubConfig{MaxWorkers: 5, WorkerQueueSize: 10})
+	ps1 := NewPubSub(client, WithPubSubMaxWorkers(5), WithPubSubWorkerQueueSize(10))
+	ps2 := NewPubSub(client, WithPubSubMaxWorkers(5), WithPubSubWorkerQueueSize(10))
 	t.Cleanup(func() {
 		ps1.Close()
 		ps2.Close()
@@ -242,7 +242,7 @@ func TestGenericTTLCache_PubSub_IntKey(t *testing.T) {
 func TestGenericTTLCache_PubSub_IgnoreSelfMessage(t *testing.T) {
 	client, _ := newGenericTestRedis(t)
 
-	ps := NewPubSub(client, PubSubConfig{MaxWorkers: 5, WorkerQueueSize: 10})
+	ps := NewPubSub(client, WithPubSubMaxWorkers(5), WithPubSubWorkerQueueSize(10))
 	t.Cleanup(func() { ps.Close() })
 
 	const channel = "test:generic:self"
@@ -263,8 +263,8 @@ func TestGenericTTLCache_PubSub_IgnoreSelfMessage(t *testing.T) {
 func TestGenericTTLCache_PubSub_Stop(t *testing.T) {
 	client, _ := newGenericTestRedis(t)
 
-	ps1 := NewPubSub(client, PubSubConfig{MaxWorkers: 5, WorkerQueueSize: 10})
-	ps2 := NewPubSub(client, PubSubConfig{MaxWorkers: 5, WorkerQueueSize: 10})
+	ps1 := NewPubSub(client, WithPubSubMaxWorkers(5), WithPubSubWorkerQueueSize(10))
+	ps2 := NewPubSub(client, WithPubSubMaxWorkers(5), WithPubSubWorkerQueueSize(10))
 	t.Cleanup(func() {
 		ps1.Close()
 		ps2.Close()
@@ -304,8 +304,8 @@ func (c *GenericTTLCache[K, V]) LoadExist(key K) bool {
 func TestGenericTTLCache_PubSub_Invalidate(t *testing.T) {
 	client, _ := newGenericTestRedis(t)
 
-	ps1 := NewPubSub(client, PubSubConfig{MaxWorkers: 5, WorkerQueueSize: 10})
-	ps2 := NewPubSub(client, PubSubConfig{MaxWorkers: 5, WorkerQueueSize: 10})
+	ps1 := NewPubSub(client, WithPubSubMaxWorkers(5), WithPubSubWorkerQueueSize(10))
+	ps2 := NewPubSub(client, WithPubSubMaxWorkers(5), WithPubSubWorkerQueueSize(10))
 	t.Cleanup(func() {
 		ps1.Close()
 		ps2.Close()
@@ -345,8 +345,8 @@ func TestGenericTTLCache_PubSub_Invalidate(t *testing.T) {
 func TestGenericTTLCache_DeleteLocal(t *testing.T) {
 	client, _ := newGenericTestRedis(t)
 
-	ps1 := NewPubSub(client, PubSubConfig{MaxWorkers: 5, WorkerQueueSize: 10})
-	ps2 := NewPubSub(client, PubSubConfig{MaxWorkers: 5, WorkerQueueSize: 10})
+	ps1 := NewPubSub(client, WithPubSubMaxWorkers(5), WithPubSubWorkerQueueSize(10))
+	ps2 := NewPubSub(client, WithPubSubMaxWorkers(5), WithPubSubWorkerQueueSize(10))
 	t.Cleanup(func() {
 		ps1.Close()
 		ps2.Close()

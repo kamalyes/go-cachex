@@ -417,6 +417,304 @@ func TestCachePattern_WriteBehind(t *testing.T) {
 	assert.Equal(t, "async_value", dbValue)
 }
 
+// TestMultiLevelCache_Clear 测试清空所有缓存
+func TestMultiLevelCache_Clear(t *testing.T) {
+	mr := miniredis.RunT(t)
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+
+	config := MultiLevelConfig{
+		Namespace: "test",
+		L1Size:    100,
+		L1TTL:     time.Minute,
+		L2TTL:     time.Hour,
+	}
+	cache := NewMultiLevelCache[string](client, config)
+
+	// 设置一些数据
+	cache.Set(ctx, "key1", "value1")
+	cache.Set(ctx, "key2", "value2")
+
+	// 验证 L1 有数据
+	stats := cache.GetStats()
+	assert.Greater(t, stats["l1_sets"], int64(0))
+
+	// 清空缓存
+	err := cache.Clear(ctx)
+	assert.NoError(t, err)
+
+	// 验证 L1 已清空
+	cache.stats.RLock()
+	l1Size := len(cache.l1Cache.shards[0].cache)
+	cache.stats.RUnlock()
+	t.Logf("L1 shard[0] size after clear: %d", l1Size)
+}
+
+// TestCachePattern_WriteThrough_DBError 测试 WriteThrough 在 DB 写入失败时返回错误
+func TestCachePattern_WriteThrough_DBError(t *testing.T) {
+	mr := miniredis.RunT(t)
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+
+	config := MultiLevelConfig{
+		Namespace: "test",
+		L1Size:    100,
+		L1TTL:     time.Minute,
+		L2TTL:     time.Hour,
+	}
+	cache := NewMultiLevelCache[string](client, config)
+	pattern := NewCachePattern(cache)
+
+	dbWriter := func(val string) error {
+		return fmt.Errorf("db write failed")
+	}
+
+	err := pattern.WriteThrough(ctx, "key1", "value1", dbWriter)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "db write failed")
+}
+
+// TestCachePattern_WriteBehind_SetError 测试 WriteBehind 在缓存设置失败时返回错误
+func TestCachePattern_WriteBehind_SetError(t *testing.T) {
+	mr := miniredis.RunT(t)
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+
+	config := MultiLevelConfig{
+		Namespace: "test",
+		L1Size:    100,
+		L1TTL:     time.Minute,
+		L2TTL:     time.Hour,
+	}
+	cache := NewMultiLevelCache[string](client, config)
+	pattern := NewCachePattern(cache)
+
+	// 关闭 miniredis 使 Set 失败
+	mr.Close()
+
+	dbWriter := func(val string) error {
+		return nil
+	}
+
+	err := pattern.WriteBehind(ctx, "key1", "value1", dbWriter)
+	assert.Error(t, err)
+}
+
+// TestCachePattern_WriteBehind_DBError 测试 WriteBehind 在 DB 写入失败时删除缓存
+func TestCachePattern_WriteBehind_DBError(t *testing.T) {
+	mr := miniredis.RunT(t)
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+
+	config := MultiLevelConfig{
+		Namespace: "test",
+		L1Size:    100,
+		L1TTL:     time.Minute,
+		L2TTL:     time.Hour,
+	}
+	cache := NewMultiLevelCache[string](client, config)
+	pattern := NewCachePattern(cache)
+
+	dbWriteCount := int32(0)
+	dbWriter := func(val string) error {
+		atomic.AddInt32(&dbWriteCount, 1)
+		return fmt.Errorf("db write failed")
+	}
+
+	err := pattern.WriteBehind(ctx, "key1", "value1", dbWriter)
+	assert.NoError(t, err, "WriteBehind 应立即返回成功")
+
+	// 等待异步 DB 写入
+	time.Sleep(200 * time.Millisecond)
+
+	assert.Equal(t, int32(1), atomic.LoadInt32(&dbWriteCount), "DB writer 应被调用")
+}
+
+// TestCachePattern_CacheAside_WriteError 测试 CacheAside Write 在 DB 写入失败时返回错误
+func TestCachePattern_CacheAside_WriteError(t *testing.T) {
+	mr := miniredis.RunT(t)
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+
+	config := MultiLevelConfig{
+		Namespace: "test",
+		L1Size:    100,
+		L1TTL:     time.Minute,
+		L2TTL:     time.Hour,
+	}
+	cache := NewMultiLevelCache[string](client, config)
+	pattern := NewCachePattern(cache)
+
+	dbLoader := func() (string, error) {
+		return "db_value", nil
+	}
+	dbWriter := func(val string) error {
+		return fmt.Errorf("write failed")
+	}
+
+	op := pattern.CacheAside(ctx, "key1", dbLoader, dbWriter)
+
+	err := op.Write("value1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "write failed")
+}
+
+// TestMultiLevelCache_Get_NoLoader 测试 Get 在缓存未命中且无 loader 时返回错误
+func TestMultiLevelCache_Get_NoLoader(t *testing.T) {
+	mr := miniredis.RunT(t)
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+
+	config := MultiLevelConfig{
+		Namespace: "test",
+		L1Size:    100,
+		L1TTL:     time.Minute,
+		L2TTL:     time.Hour,
+	}
+	cache := NewMultiLevelCache[string](client, config)
+
+	_, err := cache.Get(ctx, "nonexistent", nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "no loader")
+}
+
+// TestMultiLevelCache_Get_LoaderError 测试 Get 在 loader 失败时返回错误
+func TestMultiLevelCache_Get_LoaderError(t *testing.T) {
+	mr := miniredis.RunT(t)
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+
+	config := MultiLevelConfig{
+		Namespace: "test",
+		L1Size:    100,
+		L1TTL:     time.Minute,
+		L2TTL:     time.Hour,
+	}
+	cache := NewMultiLevelCache[string](client, config)
+
+	loader := func() (string, error) {
+		return "", fmt.Errorf("loader error")
+	}
+
+	_, err := cache.Get(ctx, "key1", loader)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "loader error")
+}
+
+// TestMultiLevelCache_Get_L1UnmarshalError 测试 Get 在 L1 缓存反序列化失败时回退到 L2
+func TestMultiLevelCache_Get_L1UnmarshalError(t *testing.T) {
+	mr := miniredis.RunT(t)
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+
+	config := MultiLevelConfig{
+		Namespace: "test",
+		L1Size:    100,
+		L1TTL:     time.Minute,
+		L2TTL:     time.Hour,
+	}
+	cache := NewMultiLevelCache[int](client, config)
+
+	// 向 L1 写入损坏的数据（无法反序列化为 int）
+	cache.l1Cache.SetWithTTL([]byte("bad_key"), []byte("not_an_int"), time.Minute)
+
+	loader := func() (int, error) {
+		return 42, nil
+	}
+
+	// Get 应在 L1 反序列化失败时回退
+	val, err := cache.Get(ctx, "bad_key", loader)
+	assert.NoError(t, err)
+	assert.Equal(t, 42, val)
+}
+
+// TestMultiLevelCache_CalculateHitRate 测试命中率计算
+func TestMultiLevelCache_CalculateHitRate(t *testing.T) {
+	mr := miniredis.RunT(t)
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	ctx := context.Background()
+
+	config := MultiLevelConfig{
+		Namespace: "test",
+		L1Size:    100,
+		L1TTL:     time.Minute,
+		L2TTL:     time.Hour,
+	}
+	cache := NewMultiLevelCache[string](client, config)
+
+	loader := func() (string, error) {
+		return "data", nil
+	}
+
+	// 无数据时命中率应为 0
+	stats := cache.GetStats()
+	assert.Equal(t, int64(0), stats["hit_rate"])
+
+	// 第一次 Get - miss
+	cache.Get(ctx, "key1", loader)
+	// 第二次 Get - L1 hit
+	cache.Get(ctx, "key1", loader)
+
+	// 命中率 = 1 / (1+0+1) = 50%
+	stats = cache.GetStats()
+	assert.Equal(t, int64(50), stats["hit_rate"])
+}
+
+// TestMultiLevelCache_NewMultiLevelCache_Compression 测试创建启用压缩的缓存
+func TestMultiLevelCache_NewMultiLevelCache_Compression(t *testing.T) {
+	mr := miniredis.RunT(t)
+	defer mr.Close()
+
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer client.Close()
+
+	config := MultiLevelConfig{
+		Namespace:         "test",
+		L1Size:            100,
+		L1TTL:             time.Minute,
+		L2TTL:             time.Hour,
+		EnableCompression: true,
+	}
+	cache := NewMultiLevelCache[string](client, config)
+	assert.NotNil(t, cache)
+}
+
 // Benchmark测试
 func BenchmarkMultiLevelCache_L1Hit(b *testing.B) {
 	mr := miniredis.RunT(b)

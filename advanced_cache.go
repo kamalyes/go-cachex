@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/kamalyes/go-logger"
@@ -55,7 +56,7 @@ type CacheMetrics struct {
 
 // AdvancedCache 高级缓存包装器
 type AdvancedCache[T any] struct {
-	client  *redis.Client
+	client  redis.UniversalClient
 	config  AdvancedCacheConfig
 	metrics *CacheMetrics
 	queue   *QueueHandler
@@ -65,7 +66,7 @@ type AdvancedCache[T any] struct {
 }
 
 // NewAdvancedCache 创建高级缓存
-func NewAdvancedCache[T any](client *redis.Client, config AdvancedCacheConfig) *AdvancedCache[T] {
+func NewAdvancedCache[T any](client redis.UniversalClient, config AdvancedCacheConfig) *AdvancedCache[T] {
 	config.MinSizeForCompress = mathx.IfNotZero(config.MinSizeForCompress, 1024) // 1KB
 	config.DefaultTTL = mathx.IfNotZero(config.DefaultTTL, time.Hour)
 	config.Namespace = mathx.IfNotEmpty(config.Namespace, "cache")
@@ -89,31 +90,29 @@ func NewAdvancedCache[T any](client *redis.Client, config AdvancedCacheConfig) *
 	cache.queue = NewQueueHandler(client, config.Namespace, queueConfig)
 
 	// 初始化热key管理器
-	hotkeyConfig := HotKeyConfig{
-		DefaultTTL:        time.Hour,
-		RefreshInterval:   time.Minute * 10,
-		EnableAutoRefresh: true,
-		Namespace:         config.Namespace,
-	}
-	cache.hotkey = NewHotKeyManager(client, hotkeyConfig)
+	cache.hotkey = NewHotKeyManager(client,
+		WithHotKeyTTL(time.Hour),
+		WithHotKeyRefreshInterval(time.Minute*10),
+		WithHotKeyAutoRefresh(true),
+		WithHotKeyNamespace(config.Namespace),
+	)
 
 	// 初始化锁管理器
-	lockConfig := LockConfig{
-		TTL:              time.Minute * 5,
-		RetryInterval:    time.Millisecond * 100,
-		MaxRetries:       10,
-		Namespace:        config.Namespace,
-		EnableWatchdog:   true,
-		WatchdogInterval: time.Minute,
-	}
-	cache.lockMgr = NewLockManager(client, lockConfig)
+	cache.lockMgr = NewLockManager(client,
+		WithLockTTL(time.Minute*5),
+		WithLockRetryInterval(time.Millisecond*100),
+		WithLockMaxRetries(10),
+		WithLockNamespace(config.Namespace),
+		WithLockWatchdog(true),
+		WithLockWatchdogInterval(time.Minute),
+	)
 
 	return cache
 }
 
-// getKey 获取完整的键名
+// getKey 获取完整的键名（用 string + 替代 fmt.Sprintf，零分配）
 func (c *AdvancedCache[T]) getKey(key string) string {
-	return fmt.Sprintf("%s:%s", c.config.Namespace, key)
+	return c.config.Namespace + ":" + key
 }
 
 // compress 压缩数据
@@ -137,7 +136,7 @@ func (c *AdvancedCache[T]) compress(data []byte) ([]byte, error) {
 	}
 
 	if c.config.EnableMetrics {
-		c.metrics.Compressions++
+		atomic.AddInt64(&c.metrics.Compressions, 1)
 	}
 
 	return []byte(buf.String()), nil
@@ -163,7 +162,7 @@ func (c *AdvancedCache[T]) decompress(data []byte) ([]byte, error) {
 	}
 
 	if c.config.EnableMetrics {
-		c.metrics.Decompressions++
+		atomic.AddInt64(&c.metrics.Decompressions, 1)
 	}
 
 	return result, nil
@@ -196,8 +195,8 @@ func (c *AdvancedCache[T]) Set(ctx context.Context, key string, value T, ttl ...
 	}
 
 	if c.config.EnableMetrics {
-		c.metrics.Sets++
-		c.metrics.TotalSize += int64(len(compressedData))
+		atomic.AddInt64(&c.metrics.Sets, 1)
+		atomic.AddInt64(&c.metrics.TotalSize, int64(len(compressedData)))
 	}
 
 	return nil
@@ -212,7 +211,7 @@ func (c *AdvancedCache[T]) Get(ctx context.Context, key string) (T, bool, error)
 	if err != nil {
 		if err == redis.Nil {
 			if c.config.EnableMetrics {
-				c.metrics.Misses++
+				atomic.AddInt64(&c.metrics.Misses, 1)
 			}
 			return zero, false, nil
 		}
@@ -232,7 +231,7 @@ func (c *AdvancedCache[T]) Get(ctx context.Context, key string) (T, bool, error)
 	}
 
 	if c.config.EnableMetrics {
-		c.metrics.Hits++
+		atomic.AddInt64(&c.metrics.Hits, 1)
 	}
 
 	return value, true, nil
@@ -246,7 +245,7 @@ func (c *AdvancedCache[T]) GetOrSet(ctx context.Context, key string, fn func() (
 	}
 
 	// 使用分布式锁防止缓存击穿
-	lockKey := fmt.Sprintf("getorset:%s", key)
+	lockKey := "getorset:" + key
 	lock := c.lockMgr.GetLock(lockKey)
 
 	if err := lock.Lock(ctx); err != nil {
@@ -294,7 +293,7 @@ func (c *AdvancedCache[T]) Delete(ctx context.Context, keys ...string) error {
 	}
 
 	if c.config.EnableMetrics {
-		c.metrics.Deletes += int64(len(keys))
+		atomic.AddInt64(&c.metrics.Deletes, int64(len(keys)))
 	}
 
 	return nil
@@ -373,18 +372,32 @@ func (c *AdvancedCache[T]) GetLockManager() *LockManager {
 	return c.lockMgr
 }
 
-// GetMetrics 获取缓存指标
+// GetMetrics 获取缓存指标（返回原子快照，避免数据竞争）
 func (c *AdvancedCache[T]) GetMetrics() *CacheMetrics {
 	if !c.config.EnableMetrics {
 		return nil
 	}
-	return c.metrics
+	return &CacheMetrics{
+		Hits:           atomic.LoadInt64(&c.metrics.Hits),
+		Misses:         atomic.LoadInt64(&c.metrics.Misses),
+		Sets:           atomic.LoadInt64(&c.metrics.Sets),
+		Deletes:        atomic.LoadInt64(&c.metrics.Deletes),
+		Compressions:   atomic.LoadInt64(&c.metrics.Compressions),
+		Decompressions: atomic.LoadInt64(&c.metrics.Decompressions),
+		TotalSize:      atomic.LoadInt64(&c.metrics.TotalSize),
+	}
 }
 
-// ResetMetrics 重置缓存指标
+// ResetMetrics 重置缓存指标（原子写入，避免替换指针导致数据竞争）
 func (c *AdvancedCache[T]) ResetMetrics() {
 	if c.config.EnableMetrics {
-		c.metrics = &CacheMetrics{}
+		atomic.StoreInt64(&c.metrics.Hits, 0)
+		atomic.StoreInt64(&c.metrics.Misses, 0)
+		atomic.StoreInt64(&c.metrics.Sets, 0)
+		atomic.StoreInt64(&c.metrics.Deletes, 0)
+		atomic.StoreInt64(&c.metrics.Compressions, 0)
+		atomic.StoreInt64(&c.metrics.Decompressions, 0)
+		atomic.StoreInt64(&c.metrics.TotalSize, 0)
 	}
 }
 

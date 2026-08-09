@@ -13,11 +13,13 @@ package cachex
 import (
 	"context"
 	"fmt"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestHotKeyCache_BasicOperations(t *testing.T) {
@@ -459,7 +461,7 @@ func TestHotKeyManager(t *testing.T) {
 		Namespace:         "test",
 	}
 
-	manager := NewHotKeyManager(client, config)
+	manager := NewHotKeyManager(client, WithHotKeyTTL(time.Minute*5), WithHotKeyRefreshInterval(time.Minute), WithHotKeyAutoRefresh(false), WithHotKeyNamespace("test"))
 
 	// 创建几个缓存
 	loader1 := &SQLDataLoader[int, string]{
@@ -503,6 +505,534 @@ func TestHotKeyManager(t *testing.T) {
 	manager.StopAll()
 	cache1.Stop()
 	cache2.Stop()
+}
+
+// TestHotKeyCache_CleanupExpired_FIFOEviction 测试 cleanupExpired 的 FIFO 驱逐逻辑
+func TestHotKeyCache_CleanupExpired_FIFOEviction(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	loader := &SQLDataLoader[int, string]{
+		QueryFunc: func(ctx context.Context) (map[int]string, error) {
+			return map[int]string{}, nil
+		},
+	}
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Minute,
+		EnableAutoRefresh: false,
+		Namespace:         "test",
+		MaxLocalCacheSize: 3, // 小容量用于测试驱逐
+	}
+
+	cache := NewHotKeyCache[int, string](client, "test_cleanup_fifo", loader, config)
+	// 立即停止自动启动的 cleanup goroutine（使用 1 分钟 ticker，太慢）
+	cache.Stop()
+
+	// 重置 once 和 stopChan，使用快速 ticker 手动重启 cleanup goroutine
+	cache.once = sync.Once{}
+	cache.stopChan = make(chan struct{})
+	cache.cleanupTicker = time.NewTicker(10 * time.Millisecond)
+	go cache.cleanupExpired()
+
+	// 添加超过 MaxLocalCacheSize 的条目
+	for i := 1; i <= 10; i++ {
+		cache.Set(ctx, i, fmt.Sprintf("value_%d", i))
+	}
+
+	// 等待清理触发
+	time.Sleep(100 * time.Millisecond)
+
+	cache.Stop()
+
+	// 验证本地缓存已被驱逐到不超过 MaxLocalCacheSize
+	cache.mu.RLock()
+	size := len(cache.localCache)
+	cache.mu.RUnlock()
+	assert.LessOrEqual(t, size, config.MaxLocalCacheSize, "清理后缓存大小应不超过 MaxLocalCacheSize")
+}
+
+// TestHotKeyCache_CleanupExpired_StaleEntries 测试 cleanupExpired 跳过陈旧条目（已 Delete 但仍在 accessOrder 中）
+func TestHotKeyCache_CleanupExpired_StaleEntries(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	loader := &SQLDataLoader[int, string]{
+		QueryFunc: func(ctx context.Context) (map[int]string, error) {
+			return map[int]string{}, nil
+		},
+	}
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Minute,
+		EnableAutoRefresh: false,
+		Namespace:         "test",
+		MaxLocalCacheSize: 2, // 极小容量
+	}
+
+	cache := NewHotKeyCache[int, string](client, "test_cleanup_stale", loader, config)
+	// 立即停止自动启动的 cleanup goroutine
+	cache.Stop()
+
+	// 重置并使用快速 ticker 手动重启
+	cache.once = sync.Once{}
+	cache.stopChan = make(chan struct{})
+	cache.cleanupTicker = time.NewTicker(10 * time.Millisecond)
+	go cache.cleanupExpired()
+
+	// 添加条目（5 个，超过 MaxLocalCacheSize=2）
+	for i := 1; i <= 5; i++ {
+		cache.Set(ctx, i, fmt.Sprintf("val_%d", i))
+	}
+
+	// 删除部分键（从 localCache 删除，但 accessOrder 中仍保留旧条目）
+	// 删除后 localCache 有 3 个条目（3,4,5），仍 > MaxLocalCacheSize=2
+	cache.Delete(ctx, 1)
+	cache.Delete(ctx, 2)
+
+	// 等待清理触发，陈旧条目应被跳过并从 accessOrder 移除
+	time.Sleep(150 * time.Millisecond)
+
+	cache.Stop()
+
+	// 验证 accessOrder 已被重建（不包含陈旧条目）
+	cache.mu.RLock()
+	orderLen := len(cache.accessOrder)
+	cache.mu.RUnlock()
+	assert.LessOrEqual(t, orderLen, config.MaxLocalCacheSize, "accessOrder 应已清理陈旧条目")
+}
+
+// TestHotKeyCache_Get_LoadAllError 测试 Get 在 LoadAll 失败时返回错误
+func TestHotKeyCache_Get_LoadAllError(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	loader := &SQLDataLoader[int, string]{
+		QueryFunc: func(ctx context.Context) (map[int]string, error) {
+			return nil, fmt.Errorf("load error")
+		},
+	}
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Minute,
+		EnableAutoRefresh: false,
+		Namespace:         "test",
+	}
+
+	cache := NewHotKeyCache[int, string](client, "test_get_err", loader, config)
+	defer cache.Stop()
+
+	_, _, err := cache.Get(ctx, 1)
+	assert.Error(t, err, "Get 应返回 LoadAll 的错误")
+}
+
+// TestHotKeyCache_LoadAll_UnmarshalError 测试 LoadAll 在 JSON 反序列化失败时回退到数据源
+func TestHotKeyCache_LoadAll_UnmarshalError(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	// 写入损坏的 JSON 数据到 Redis
+	redisKey := "test:test_loadall_unmarshal"
+	client.Set(ctx, redisKey, "invalid_json_data", time.Minute)
+
+	loader := &SQLDataLoader[int, string]{
+		QueryFunc: func(ctx context.Context) (map[int]string, error) {
+			return map[int]string{1: "fallback"}, nil
+		},
+	}
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Minute,
+		EnableAutoRefresh: false,
+		Namespace:         "test",
+	}
+
+	cache := NewHotKeyCache[int, string](client, "test_loadall_unmarshal", loader, config)
+	defer cache.Stop()
+
+	// LoadAll 应回退到数据源
+	data, err := cache.LoadAll(ctx)
+	assert.NoError(t, err)
+	assert.Equal(t, "fallback", data[1])
+}
+
+// TestHotKeyCache_SaveToRedis_MarshalError 测试 SaveToRedis 在序列化失败时返回错误
+func TestHotKeyCache_SaveToRedis_MarshalError(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	loader := &SQLDataLoader[string, chan int]{
+		QueryFunc: func(ctx context.Context) (map[string]chan int, error) {
+			return map[string]chan int{}, nil
+		},
+	}
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Minute,
+		EnableAutoRefresh: false,
+		Namespace:         "test",
+	}
+
+	cache := NewHotKeyCache[string, chan int](client, "test_marshal_err", loader, config)
+	defer cache.Stop()
+
+	// 设置一个无法 JSON 序列化的值（channel 不能被 json.Marshal）
+	err := cache.Set(ctx, "bad", make(chan int))
+	assert.Error(t, err, "序列化失败应返回错误")
+}
+
+// TestHotKeyCache_Refresh_Error 测试 Refresh 在 loader 失败时返回错误
+func TestHotKeyCache_Refresh_Error(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	loader := &SQLDataLoader[int, string]{
+		QueryFunc: func(ctx context.Context) (map[int]string, error) {
+			return nil, fmt.Errorf("refresh error")
+		},
+	}
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Minute,
+		EnableAutoRefresh: false,
+		Namespace:         "test",
+	}
+
+	cache := NewHotKeyCache[int, string](client, "test_refresh_err", loader, config)
+	defer cache.Stop()
+
+	err := cache.Refresh(ctx)
+	assert.Error(t, err, "Refresh 应返回 loader 的错误")
+}
+
+// TestHotKeyCache_Exists_GetAllError 测试 Exists 在 GetAll 失败时返回错误
+func TestHotKeyCache_Exists_GetAllError(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	loader := &SQLDataLoader[int, string]{
+		QueryFunc: func(ctx context.Context) (map[int]string, error) {
+			return nil, fmt.Errorf("exists error")
+		},
+	}
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Minute,
+		EnableAutoRefresh: false,
+		Namespace:         "test",
+	}
+
+	cache := NewHotKeyCache[int, string](client, "test_exists_err", loader, config)
+	defer cache.Stop()
+
+	_, err := cache.Exists(ctx, 1)
+	assert.Error(t, err, "Exists 应返回 GetAll 的错误")
+}
+
+// TestHotKeyCache_Keys_GetAllError 测试 Keys 在 GetAll 失败时返回错误
+func TestHotKeyCache_Keys_GetAllError(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	loader := &SQLDataLoader[int, string]{
+		QueryFunc: func(ctx context.Context) (map[int]string, error) {
+			return nil, fmt.Errorf("keys error")
+		},
+	}
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Minute,
+		EnableAutoRefresh: false,
+		Namespace:         "test",
+	}
+
+	cache := NewHotKeyCache[int, string](client, "test_keys_err", loader, config)
+	defer cache.Stop()
+
+	_, err := cache.Keys(ctx)
+	assert.Error(t, err, "Keys 应返回 GetAll 的错误")
+}
+
+// TestHotKeyCache_Size_GetAllError 测试 Size 在 GetAll 失败时返回错误
+func TestHotKeyCache_Size_GetAllError(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	loader := &SQLDataLoader[int, string]{
+		QueryFunc: func(ctx context.Context) (map[int]string, error) {
+			return nil, fmt.Errorf("size error")
+		},
+	}
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Minute,
+		EnableAutoRefresh: false,
+		Namespace:         "test",
+	}
+
+	cache := NewHotKeyCache[int, string](client, "test_size_err", loader, config)
+	defer cache.Stop()
+
+	_, err := cache.Size(ctx)
+	assert.Error(t, err, "Size 应返回 GetAll 的错误")
+}
+
+// TestHotKeyCache_GetStats_TTLError 测试 GetStats 在 TTL 查询失败时仍返回结果
+func TestHotKeyCache_GetStats_TTLError(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	loader := &SQLDataLoader[int, string]{
+		QueryFunc: func(ctx context.Context) (map[int]string, error) {
+			return map[int]string{1: "test"}, nil
+		},
+	}
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Minute,
+		EnableAutoRefresh: false,
+		Namespace:         "test",
+	}
+
+	cache := NewHotKeyCache[int, string](client, "test_stats_ttl_err", loader, config)
+	defer cache.Stop()
+
+	// 先加载数据
+	cache.GetAll(ctx)
+
+	// 关闭客户端使 TTL 查询失败
+	client.Close()
+
+	// GetStats 应仍返回结果（TTL=0）
+	stats, err := cache.GetStats(ctx)
+	assert.NoError(t, err)
+	assert.NotNil(t, stats)
+	assert.Equal(t, int64(0), stats.TTL, "TTL 查询失败时应返回 0")
+}
+
+// TestHotKeyManager_RegisterAndGet 测试 HotKeyManager 的 Register 和 Get 方法
+func TestHotKeyManager_RegisterAndGet(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Minute,
+		EnableAutoRefresh: false,
+		Namespace:         "test",
+	}
+
+	manager := NewHotKeyManager(client, WithHotKeyTTL(time.Minute*5), WithHotKeyRefreshInterval(time.Minute), WithHotKeyAutoRefresh(false), WithHotKeyNamespace("test"))
+
+	loader := &SQLDataLoader[int, string]{
+		QueryFunc: func(ctx context.Context) (map[int]string, error) {
+			return map[int]string{1: "data"}, nil
+		},
+	}
+
+	cache := NewHotKeyCache[int, string](client, "mgr_cache", loader, config)
+	defer cache.Stop()
+
+	// 测试 Register
+	manager.Register("my_cache", cache)
+
+	// 测试 Get - 存在
+	retrieved, exists := manager.Get("my_cache")
+	assert.True(t, exists, "应能获取到已注册的缓存")
+	assert.NotNil(t, retrieved)
+
+	// 测试 Get - 不存在
+	_, exists = manager.Get("non_existent")
+	assert.False(t, exists, "不应获取到不存在的缓存")
+}
+
+// TestHotKeyManager_RefreshAll_Error 测试 RefreshAll 在某个缓存刷新失败时返回错误
+func TestHotKeyManager_RefreshAll_Error(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Minute,
+		EnableAutoRefresh: false,
+		Namespace:         "test",
+	}
+
+	manager := NewHotKeyManager(client, WithHotKeyTTL(time.Minute*5), WithHotKeyRefreshInterval(time.Minute), WithHotKeyAutoRefresh(false), WithHotKeyNamespace("test"))
+
+	loader := &SQLDataLoader[int, string]{
+		QueryFunc: func(ctx context.Context) (map[int]string, error) {
+			return nil, fmt.Errorf("refresh all error")
+		},
+	}
+
+	cache := NewHotKeyCache[int, string](client, "mgr_refresh_err", loader, config)
+	defer cache.Stop()
+
+	manager.RegisterCache("err_cache", cache)
+
+	err := manager.RefreshAll(ctx)
+	assert.Error(t, err, "RefreshAll 应在某个缓存刷新失败时返回错误")
+}
+
+// TestHotKeyCache_NewHotKeyCache_AutoRefreshEnabled 测试创建启用自动刷新的缓存
+func TestHotKeyCache_NewHotKeyCache_AutoRefreshEnabled(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	loader := &SQLDataLoader[int, string]{
+		QueryFunc: func(ctx context.Context) (map[int]string, error) {
+			return map[int]string{1: "data"}, nil
+		},
+	}
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Minute,
+		EnableAutoRefresh: true,
+		Namespace:         "test",
+	}
+
+	cache := NewHotKeyCache[int, string](client, "test_auto_enabled", loader, config)
+	defer cache.Stop()
+
+	assert.NotNil(t, cache)
+	// 验证自动刷新 goroutine 已启动
+	assert.Equal(t, true, config.EnableAutoRefresh)
+}
+
+// TestHotKeyCache_Set_ExistingKey 测试 Set 对已存在的键不重复追加 accessOrder
+func TestHotKeyCache_Set_ExistingKey(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	loader := &SQLDataLoader[int, string]{
+		QueryFunc: func(ctx context.Context) (map[int]string, error) {
+			return map[int]string{}, nil
+		},
+	}
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Minute,
+		EnableAutoRefresh: false,
+		Namespace:         "test",
+	}
+
+	cache := NewHotKeyCache[int, string](client, "test_set_existing", loader, config)
+	defer cache.Stop()
+
+	// 设置键
+	cache.Set(ctx, 1, "first")
+	cache.Set(ctx, 1, "second") // 重复设置同一键
+
+	// accessOrder 应只有一个条目
+	cache.mu.RLock()
+	orderLen := len(cache.accessOrder)
+	cache.mu.RUnlock()
+	assert.Equal(t, 1, orderLen, "重复设置同一键不应追加 accessOrder")
+}
+
+// TestHotKeyCache_AutoRefresh_RefreshError 测试 autoRefresh 中 Refresh 失败时记录日志但不停止
+func TestHotKeyCache_AutoRefresh_RefreshError(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	var loadCount int64
+	loader := &SQLDataLoader[int, string]{
+		QueryFunc: func(ctx context.Context) (map[int]string, error) {
+			count := atomic.AddInt64(&loadCount, 1)
+			// 第一次加载成功，后续自动刷新失败
+			if count > 1 {
+				return nil, fmt.Errorf("auto refresh error")
+			}
+			return map[int]string{1: "first"}, nil
+		},
+	}
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Millisecond * 200, // 快速刷新以便测试
+		EnableAutoRefresh: true,
+		Namespace:         "test",
+	}
+
+	cache := NewHotKeyCache[int, string](client, "test_autorefresh_refresh_err", loader, config)
+	defer cache.Stop()
+
+	// 等待自动刷新触发并失败（至少两次加载：初始 + 至少一次自动刷新）
+	time.Sleep(time.Millisecond * 600)
+
+	// loadCount 应大于 1，说明自动刷新触发过 Refresh
+	assert.Greater(t, atomic.LoadInt64(&loadCount), int64(1), "autoRefresh 应触发多次 Refresh")
+}
+
+// TestHotKeyCache_NewHotKeyCache_AutoRefreshPanic 测试 autoRefresh 中 loader panic 时 OnPanic 捕获
+func TestHotKeyCache_NewHotKeyCache_AutoRefreshPanic(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	var loadCount int64
+	loader := &SQLDataLoader[int, string]{
+		QueryFunc: func(ctx context.Context) (map[int]string, error) {
+			count := atomic.AddInt64(&loadCount, 1)
+			if count > 1 {
+				panic("loader panic in autoRefresh")
+			}
+			return map[int]string{1: "first"}, nil
+		},
+	}
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Millisecond * 200, // 快速刷新以便测试
+		EnableAutoRefresh: true,
+		Namespace:         "test",
+	}
+
+	// 不应 panic（OnPanic 应捕获 autoRefresh 中的 panic）
+	cache := NewHotKeyCache[int, string](client, "test_autorefresh_panic", loader, config)
+	defer cache.Stop()
+
+	// 等待自动刷新触发 panic
+	time.Sleep(time.Millisecond * 600)
+
+	// 验证 loadCount 大于 1（说明 autoRefresh 触发过）
+	assert.Greater(t, atomic.LoadInt64(&loadCount), int64(1), "autoRefresh 应触发过导致 panic")
 }
 
 // 基准测试
@@ -571,4 +1101,32 @@ func BenchmarkHotKeyCache_Set(b *testing.B) {
 			i++
 		}
 	})
+}
+
+// TestNewHotKeyCache_AutoRefreshOnPanic 测试 NewHotKeyCache 中 autoRefresh 的 OnPanic 回调
+// 通过使用一个会 panic 的 loader 并启用 autoRefresh 来触发 OnPanic
+func TestNewHotKeyCache_AutoRefreshOnPanic(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	// 创建一个会 panic 的 loader（仅在 autoRefresh 调用时 panic）
+	panickingLoader := &SQLDataLoader[int, string]{
+		QueryFunc: func(ctx context.Context) (map[int]string, error) {
+			panic("simulated panic in loader")
+		},
+	}
+
+	config := HotKeyConfig{
+		DefaultTTL:        time.Minute * 5,
+		RefreshInterval:   time.Millisecond * 50, // 快速刷新以尽快触发 panic
+		EnableAutoRefresh: true,
+		Namespace:         "test",
+	}
+
+	cache := NewHotKeyCache[int, string](client, "test_panic_autorefresh", panickingLoader, config)
+	defer cache.Stop()
+
+	// 等待 autoRefresh 触发 panic 并被 OnPanic 捕获
+	// 如果 OnPanic 未生效，测试会因 panic 而失败
+	time.Sleep(time.Millisecond * 200)
 }
