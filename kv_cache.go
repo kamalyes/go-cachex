@@ -776,8 +776,10 @@ func (c *KVCache[K, V]) Refresh(ctx context.Context) error {
 //
 // 适用于启动预热（WarmupAllKV）和高优先级缓存刷新场景
 func (c *KVCache[K, V]) RefreshAndSwap(ctx context.Context) error {
+	// 仅有 BatchLoader 的 KV（如 ModelCache）按需回源，不参与全量原子替换，安静跳过
 	if c.loader == nil {
-		return fmt.Errorf("KVCache %s has no loader", c.name)
+		c.logger.Debugf("KVCache %s has no loader, skip refresh-and-swap", c.name)
+		return nil
 	}
 
 	// 1. 先从数据源加载新数据（此时 Redis 和本地缓存仍持有旧数据，其他请求正常读到旧值）
