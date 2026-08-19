@@ -457,12 +457,16 @@ func (s *Subscriber) start() error {
 }
 
 // messageLoop 消息循环
+// 连接断开导致 Channel() 关闭时自动重连（指数退避），除非显式 Stop 或 PubSub 关闭。
+// 背景：Redis 主从切换/连接被 LB 杀掉/网络中断后，go-redis 会关闭消息通道；
+// 若 messageLoop 直接退出，订阅将永久失活（isActive=false），失活期间发布的
+// 消息全部丢失（PubSub 至多一次投递），且调用方无感知
 func (s *Subscriber) messageLoop() {
 	// loopWg.Done 放在最前（最后执行），确保 pool 关闭和状态更新完成后才通知 Stop 可以返回
 	defer s.loopWg.Done()
 	defer s.pubsub.wg.Done()
 	defer func() {
-		// 标记为非活跃（messageLoop 可能因 channel 关闭或 ctx 取消而自行退出）
+		// 永久退出（Stop/PubSub 关闭）才执行最终清理；重连路径不经过此处
 		syncx.WithLock(&s.mu, func() {
 			s.isActive = false
 		})
@@ -482,8 +486,13 @@ func (s *Subscriber) messageLoop() {
 		select {
 		case msg, ok := <-ch:
 			if !ok {
-				s.pubsub.logger.Info("Subscription channel closed")
-				return
+				// 连接断开：自动重连（收到停止信号时才永久退出）
+				newCh, stopped := s.reconnectLoop()
+				if stopped {
+					return
+				}
+				ch = newCh
+				continue
 			}
 
 			if msg == nil {
@@ -506,6 +515,61 @@ func (s *Subscriber) messageLoop() {
 			s.pubsub.logger.Info("PubSub context cancelled")
 			return
 		}
+	}
+}
+
+// reconnectLoop 自动重连循环：指数退避重建订阅连接，直到成功或收到停止信号
+// 在 messageLoop goroutine 内运行（pubSubConn 的读写仅发生在此 goroutine），
+// 重连期间 isActive 保持 true（订阅者仍在服务，只是链路自愈中）
+// 返回新的消息通道；stopped=true 表示收到 Stop/PubSub 关闭信号，调用方应永久退出
+func (s *Subscriber) reconnectLoop() (ch <-chan *redis.Message, stopped bool) {
+	delay := mathx.IfNotZero(s.config.RetryDelay, 100*time.Millisecond)
+	const maxDelay = 5 * time.Second
+
+	for attempt := 1; ; attempt++ {
+		// 每次重试前检查停止信号（Stop 期间不应继续重连）
+		select {
+		case <-s.stopChan:
+			return nil, true
+		case <-s.pubsub.ctx.Done():
+			return nil, true
+		default:
+		}
+
+		// 关闭残留旧连接后重建订阅（复用 start 的订阅与连通性验证语义）
+		if s.pubSubConn != nil {
+			s.pubSubConn.Close()
+		}
+		if s.isPattern {
+			s.pubSubConn = s.pubsub.client.PSubscribe(s.pubsub.ctx, s.patternKeys...)
+		} else {
+			s.pubSubConn = s.pubsub.client.Subscribe(s.pubsub.ctx, s.channelKeys...)
+		}
+
+		// 连通性验证：SUBSCRIBE 握手成功才算重连完成
+		testCtx, cancel := context.WithTimeout(s.pubsub.ctx, 5*time.Second)
+		_, err := s.pubSubConn.Receive(testCtx)
+		cancel()
+		if err == nil {
+			s.pubsub.logger.Infof("Subscription auto-reconnected (attempt %d) for %s: %v",
+				attempt,
+				mathx.IF(s.isPattern, "patterns", "channels"),
+				mathx.IF(s.isPattern, s.patterns, s.channels))
+			return s.pubSubConn.Channel(), false
+		}
+
+		s.pubSubConn.Close()
+		s.pubsub.logger.Warnf("Subscription reconnect attempt %d failed, retrying in %v: %v",
+			attempt, delay, err)
+
+		select {
+		case <-time.After(delay):
+		case <-s.stopChan:
+			return nil, true
+		case <-s.pubsub.ctx.Done():
+			return nil, true
+		}
+		delay = min(delay*2, maxDelay)
 	}
 }
 

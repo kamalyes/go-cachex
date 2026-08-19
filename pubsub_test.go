@@ -2097,3 +2097,92 @@ func TestMessageLoop_PoolSubmitError(t *testing.T) {
 	subscriber.Stop()
 	assert.False(t, subscriber.IsActive())
 }
+
+// ============================================================================
+// 订阅连接断开自动重连测试（messageLoop 断连自愈）
+// ============================================================================
+
+// TestSubscriberAutoReconnect_AfterConnClosed 订阅连接被杀后自动重连并继续收消息
+// 场景：LB 空闲超时杀连接 / Redis 主从切换导致 go-redis 关闭消息通道
+// 修复前：messageLoop 收到通道关闭信号直接退出，订阅永久失活，
+// 失活期间发布的消息全部丢失（PubSub 至多一次投递）
+func TestSubscriberAutoReconnect_AfterConnClosed(t *testing.T) {
+	pubsub, cleanup := setupPubSub(t, "auto_reconnect_test")
+	defer cleanup()
+
+	ctx := context.Background()
+	received := make(chan string, 16)
+
+	subscriber, err := pubsub.Subscribe([]string{"reconn_ch"}, func(ctx context.Context, channel string, message string) error {
+		select {
+		case received <- message:
+		default:
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	waitForSubscription()
+
+	// 基线：连接正常时消息可达
+	require.NoError(t, pubsub.Publish(ctx, "reconn_ch", "before"))
+	require.Eventually(t, func() bool {
+		select {
+		case m := <-received:
+			return m == "before"
+		default:
+			return false
+		}
+	}, 2*time.Second, 20*time.Millisecond)
+
+	// 模拟订阅连接被杀：关闭底层 PubSub 连接 → go-redis 关闭消息通道 → 触发自动重连
+	subscriber.pubSubConn.Close()
+
+	// 重连期间 isActive 应保持 true（订阅自愈中，而非永久失活）
+	assert.True(t, subscriber.IsActive(), "断连自愈期间订阅应保持活跃状态")
+
+	// 轮询发布直到收到：重连完成前的发布会丢失（PubSub 至多一次），重连后恢复
+	require.Eventually(t, func() bool {
+		_ = pubsub.Publish(ctx, "reconn_ch", "after")
+		select {
+		case m := <-received:
+			return m == "after"
+		case <-time.After(50 * time.Millisecond):
+			return false
+		}
+	}, 5*time.Second, 20*time.Millisecond, "断连后应自动重连并恢复消息接收")
+
+	// 自愈后订阅仍可正常停止（无 goroutine 泄漏）
+	subscriber.Stop()
+	assert.False(t, subscriber.IsActive())
+}
+
+// TestSubscriberAutoReconnect_StopInterruptsBackoff 重连期间 Stop 应迅速返回而非阻塞
+func TestSubscriberAutoReconnect_StopInterruptsBackoff(t *testing.T) {
+	pubsub, cleanup := setupPubSub(t, "reconn_stop_test")
+	defer cleanup()
+
+	subscriber, err := pubsub.Subscribe([]string{"stop_backoff_ch"}, func(ctx context.Context, channel string, message string) error {
+		return nil
+	})
+	require.NoError(t, err)
+
+	waitForSubscription()
+
+	// 杀掉订阅连接，触发自动重连（无论重连成功与否，Stop 都应立即生效）
+	subscriber.pubSubConn.Close()
+
+	done := make(chan struct{})
+	go func() {
+		subscriber.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Stop 及时返回（stopChan 打断重连退避等待）
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop 在重连期间被阻塞超过 2s")
+	}
+	assert.False(t, subscriber.IsActive())
+}
