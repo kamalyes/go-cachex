@@ -23,6 +23,7 @@ package cachex
 import (
 	"context"
 	"errors"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -54,7 +55,9 @@ func NewRedisOptions(addr, password string, db int) *redis.Options {
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
 		// 设置连接池参数
-		PoolSize:        10,
+		// PoolSize 跟随 go-redis 官方默认（10 × GOMAXPROCS），
+		// 硬编码小值会在高并发 Publish 时导致连接池信号量排队（生产 OOM 事故诱因之一）
+		PoolSize:        10 * runtime.GOMAXPROCS(0),
 		MinIdleConns:    5,
 		ConnMaxIdleTime: 30 * time.Minute,
 	}
