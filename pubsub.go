@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -139,6 +140,10 @@ func NewPubSub(client redis.UniversalClient, opts ...PubSubOption) *PubSub {
 		opt(&cfg)
 	}
 
+	// 规范化命名空间：剥离尾部分隔符，避免 getChannelKey 拼接后出现双冒号
+	// （如 namespace 配置为 "wsc:pubsub:" 时，物理频道会变成 "wsc:pubsub::channel"）
+	cfg.Namespace = strings.TrimSuffix(cfg.Namespace, ":")
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &PubSub{
@@ -149,6 +154,13 @@ func NewPubSub(client redis.UniversalClient, opts ...PubSubOption) *PubSub {
 		cancel:      cancel,
 		logger:      mathx.IfEmpty(cfg.Logger, mathx.IfEmpty(globalLogger, NewDefaultCachexLogger())),
 	}
+}
+
+// ResolveChannel 解析逻辑频道对应的物理频道名（含命名空间前缀）
+// 供绕过 Publish/Subscribe 直接使用底层 Client 的场景（如 Pipeline 批量发布）调用，
+// 确保发布与订阅命中同一个物理频道，消除"订阅带前缀、发布不带前缀"的频道错配
+func (p *PubSub) ResolveChannel(channel string) string {
+	return p.getChannelKey(channel)
 }
 
 // getChannelKey 获取带命名空间的频道名
