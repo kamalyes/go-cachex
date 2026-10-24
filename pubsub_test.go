@@ -1625,46 +1625,75 @@ func TestPublish_MarshalFailure(t *testing.T) {
 	assert.Contains(t, err.Error(), "failed to marshal message")
 }
 
-// TestSubscribe_StartFailure 测试 Subscribe 启动失败时清理注册表
+// TestSubscribe_StartFailure 启动握手失败持续退避重试，PubSub 关闭后清理注册表并返回错误
 func TestSubscribe_StartFailure(t *testing.T) {
 	pubsub, cleanup := setupPubSub(t, "start_fail_test")
 	defer cleanup()
 
-	// 关闭 Redis 客户端使 start() 中的 Receive 失败
+	// 关闭 Redis 客户端使 start() 中的握手失败
 	pubsub.client.Close()
 
 	handler := func(ctx context.Context, channel string, message string) error {
 		return nil
 	}
 
-	// 订阅应该失败（连接已关闭）
-	subscriber, err := pubsub.Subscribe([]string{"fail_ch"}, handler)
-	assert.Error(t, err)
-	assert.Nil(t, subscriber)
+	done := make(chan error, 1)
+	go func() {
+		_, err := pubsub.Subscribe([]string{"fail_ch"}, handler)
+		done <- err
+	}()
 
-	// 注册表应该被清理
-	assert.Equal(t, 0, pubsub.GetSubscribers())
+	// 启动窗口内 Subscribe 不得返回失败（退避重试自愈中，而非立即失败）
+	select {
+	case <-done:
+		t.Fatal("Redis 不可达时 Subscribe 不得立即失败，应在启动窗口内退避重试")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// PubSub 关闭是启动重试的退出信号，关闭后返回错误且注册表被清理
+	pubsub.Close()
+	select {
+	case err := <-done:
+		assert.Error(t, err, "PubSub 关闭后 Subscribe 应返回错误")
+	case <-time.After(2 * time.Second):
+		t.Fatal("PubSub 关闭后启动重试循环未退出")
+	}
+	assert.Equal(t, 0, pubsub.GetSubscribers(), "启动失败后注册表应该被清理")
 }
 
-// TestSubscribePattern_StartFailure 测试 SubscribePattern 启动失败时清理注册表
+// TestSubscribePattern_StartFailure 模式订阅启动握手失败持续退避重试，PubSub 关闭后返回错误
 func TestSubscribePattern_StartFailure(t *testing.T) {
 	pubsub, cleanup := setupPubSub(t, "pattern_start_fail_test")
 	defer cleanup()
 
-	// 关闭 Redis 客户端使 start() 中的 Receive 失败
+	// 关闭 Redis 客户端使 start() 中的握手失败
 	pubsub.client.Close()
 
 	handler := func(ctx context.Context, channel string, message string) error {
 		return nil
 	}
 
-	// 模式订阅应该失败（连接已关闭）
-	subscriber, err := pubsub.SubscribePattern([]string{"fail_*"}, handler)
-	assert.Error(t, err)
-	assert.Nil(t, subscriber)
+	done := make(chan error, 1)
+	go func() {
+		_, err := pubsub.SubscribePattern([]string{"fail_*"}, handler)
+		done <- err
+	}()
 
-	// 注册表应该被清理
-	assert.Equal(t, 0, pubsub.GetSubscribers())
+	// 启动窗口内 SubscribePattern 不得返回失败（退避重试自愈中）
+	select {
+	case <-done:
+		t.Fatal("Redis 不可达时 SubscribePattern 不得立即失败，应在启动窗口内退避重试")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	pubsub.Close()
+	select {
+	case err := <-done:
+		assert.Error(t, err, "PubSub 关闭后 SubscribePattern 应返回错误")
+	case <-time.After(2 * time.Second):
+		t.Fatal("PubSub 关闭后模式订阅启动重试循环未退出")
+	}
+	assert.Equal(t, 0, pubsub.GetSubscribers(), "启动失败后注册表应该被清理")
 }
 
 // TestSubscribeJSON_UnmarshalFailure 测试 SubscribeJSON 接收到非 JSON 消息时的错误处理
@@ -1774,7 +1803,7 @@ func TestHandleMessage_DecompressFailure(t *testing.T) {
 	// 可能收到原始数据或为空
 }
 
-// TestResubscribe_StartFailure 测试 Resubscribe 在 start 失败时恢复 isActive 状态
+// TestResubscribe_StartFailure Resubscribe 启动握手失败退避重试，失败后恢复 isActive 状态
 func TestResubscribe_StartFailure(t *testing.T) {
 	pubsub, cleanup := setupPubSub(t, "resub_fail_test")
 	defer cleanup()
@@ -1792,15 +1821,32 @@ func TestResubscribe_StartFailure(t *testing.T) {
 	waitForSubscription()
 	assert.False(t, subscriber.IsActive())
 
-	// 关闭客户端使 Resubscribe 的 start() 失败
+	// 关闭客户端使 Resubscribe 的 start() 握手失败
 	pubsub.client.Close()
 
-	err = subscriber.Resubscribe()
-	assert.Error(t, err)
+	done := make(chan error, 1)
+	go func() {
+		done <- subscriber.Resubscribe()
+	}()
+
+	// 启动窗口内 Resubscribe 不得返回失败（退避重试自愈中）
+	select {
+	case <-done:
+		t.Fatal("Redis 不可达时 Resubscribe 不得立即失败，应在启动窗口内退避重试")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	pubsub.Close()
+	select {
+	case err := <-done:
+		assert.Error(t, err, "PubSub 关闭后 Resubscribe 应返回错误")
+	case <-time.After(2 * time.Second):
+		t.Fatal("PubSub 关闭后 Resubscribe 重试循环未退出")
+	}
 	assert.False(t, subscriber.IsActive(), "start 失败后应该恢复为不活跃状态")
 }
 
-// TestSimpleSubscribe_Error 测试 SimpleSubscribe 订阅失败时关闭 pubsub
+// TestSimpleSubscribe_Error SimpleSubscribe 启动失败走快速失败语义（内部 2s 窗口耗尽）
 func TestSimpleSubscribe_Error(t *testing.T) {
 	client := setupRedisClient(t)
 	defer client.Close()
@@ -1812,13 +1858,14 @@ func TestSimpleSubscribe_Error(t *testing.T) {
 		return nil
 	}
 
+	// SimpleSubscribe 内部 2s 启动窗口耗尽后返回错误并关闭内部 pubsub
 	pubsub, subscriber, err := SimpleSubscribe(client, "simple_err_ch", handler)
 	assert.Error(t, err)
 	assert.Nil(t, pubsub)
 	assert.Nil(t, subscriber)
 }
 
-// TestRequestResponse_SubscribeFailure 测试 RequestResponse 订阅响应频道失败
+// TestRequestResponse_SubscribeFailure RequestResponse 启动握手失败退避重试，PubSub 关闭后返回错误
 func TestRequestResponse_SubscribeFailure(t *testing.T) {
 	pubsub, cleanup := setupPubSub(t, "req_resp_sub_fail_test")
 	defer cleanup()
@@ -1828,8 +1875,26 @@ func TestRequestResponse_SubscribeFailure(t *testing.T) {
 	// 关闭客户端使 Subscribe 失败
 	pubsub.client.Close()
 
-	_, err := pubsub.RequestResponse(ctx, "req_ch", "resp_ch", "test", time.Second)
-	assert.Error(t, err)
+	done := make(chan error, 1)
+	go func() {
+		_, err := pubsub.RequestResponse(ctx, "req_ch", "resp_ch", "test", time.Second)
+		done <- err
+	}()
+
+	// 启动窗口内 RequestResponse 不得立即失败（订阅退避重试自愈中）
+	select {
+	case <-done:
+		t.Fatal("Redis 不可达时 RequestResponse 不得立即失败，应在启动窗口内退避重试")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	pubsub.Close()
+	select {
+	case err := <-done:
+		assert.Error(t, err, "PubSub 关闭后 RequestResponse 应返回错误")
+	case <-time.After(2 * time.Second):
+		t.Fatal("PubSub 关闭后 RequestResponse 启动重试循环未退出")
+	}
 }
 
 // TestRequestResponse_PublishFailure 测试 RequestResponse 发布请求失败
@@ -2104,8 +2169,6 @@ func TestMessageLoop_PoolSubmitError(t *testing.T) {
 
 // TestSubscriberAutoReconnect_AfterConnClosed 订阅连接被杀后自动重连并继续收消息
 // 场景：LB 空闲超时杀连接 / Redis 主从切换导致 go-redis 关闭消息通道
-// 修复前：messageLoop 收到通道关闭信号直接退出，订阅永久失活，
-// 失活期间发布的消息全部丢失（PubSub 至多一次投递）
 func TestSubscriberAutoReconnect_AfterConnClosed(t *testing.T) {
 	pubsub, cleanup := setupPubSub(t, "auto_reconnect_test")
 	defer cleanup()
@@ -2185,4 +2248,91 @@ func TestSubscriberAutoReconnect_StopInterruptsBackoff(t *testing.T) {
 		t.Fatal("Stop 在重连期间被阻塞超过 2s")
 	}
 	assert.False(t, subscriber.IsActive())
+}
+
+// ============================================================================
+// 启动握手重试测试（start 启动窗口自愈）
+// ============================================================================
+
+// flakySubscribeHook 前 remaining 次 SUBSCRIBE 命令失败，模拟 Redis 启动窗口未就绪
+type flakySubscribeHook struct {
+	remaining int32
+}
+
+func (h *flakySubscribeHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *flakySubscribeHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "subscribe" && atomic.AddInt32(&h.remaining, -1) >= 0 {
+			return fmt.Errorf("redis not ready yet")
+		}
+		return next(ctx, cmd)
+	}
+}
+func (h *flakySubscribeHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// TestSubscribe_StartRetryRecoversWhenRedisReady 启动窗口内 Redis 就绪后订阅自愈
+// 场景：Pod 先于 Redis 就绪的滚动发布，前两次握手失败、第三次成功
+func TestSubscribe_StartRetryRecoversWhenRedisReady(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	// 必须在订阅前添加 hook（AddHook 与 Subscribe 的连接 clone 并发会数据竞争）
+	client.AddHook(&flakySubscribeHook{remaining: 2})
+
+	pubsub := NewPubSub(client,
+		WithPubSubNamespace("start_retry_test"),
+		WithPubSubStartRetryWindow(5*time.Second),
+	)
+	defer pubsub.Close()
+
+	ctx := context.Background()
+	received := make(chan string, 16)
+
+	// 经历 2 次握手失败后自愈成功（100ms 退避起步）
+	_, err := pubsub.Subscribe([]string{"boot_ch"}, func(ctx context.Context, channel string, message string) error {
+		select {
+		case received <- message:
+		default:
+		}
+		return nil
+	})
+	require.NoError(t, err, "启动窗口内 Redis 就绪后订阅应自愈成功")
+
+	waitForSubscription()
+
+	// 自愈后的订阅应正常收发
+	require.NoError(t, pubsub.Publish(ctx, "boot_ch", "hello"))
+	require.Eventually(t, func() bool {
+		select {
+		case m := <-received:
+			return m == "hello"
+		default:
+			return false
+		}
+	}, 2*time.Second, 20*time.Millisecond, "自愈后的订阅应正常收到消息")
+}
+
+// TestSubscribe_StartRetryWindowExceeded 启动窗口耗尽后返回最后错误而非无限阻塞
+func TestSubscribe_StartRetryWindowExceeded(t *testing.T) {
+	client := setupRedisClient(t)
+	defer client.Close()
+
+	// 持续不可达：关闭后拨号立即失败
+	client.Close()
+
+	pubsub := NewPubSub(client, WithPubSubStartRetryWindow(300*time.Millisecond))
+	defer pubsub.Close()
+
+	start := time.Now()
+	subscriber, err := pubsub.Subscribe([]string{"never_ready_ch"}, func(ctx context.Context, channel string, message string) error {
+		return nil
+	})
+
+	assert.Error(t, err, "启动窗口耗尽后应返回错误")
+	assert.Nil(t, subscriber)
+	assert.Contains(t, err.Error(), "start retry window")
+	assert.GreaterOrEqual(t, time.Since(start), 300*time.Millisecond, "窗口耗尽前应持续退避重试")
+	assert.Equal(t, 0, pubsub.GetSubscribers(), "失败后注册表应该被清理")
 }

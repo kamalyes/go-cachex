@@ -50,6 +50,7 @@ type PubSubConfig struct {
 	CompressionMinSize int            // 压缩阈值（字节），小于此值不压缩，默认 1KB
 	MaxWorkers         int            // 消息处理 worker 数量，防止 goroutine 泄漏，默认 20
 	WorkerQueueSize    int            // worker 队列大小，默认 100
+	StartRetryWindow   time.Duration  // 启动握手失败重试窗口：窗口内指数退避重试，耗尽返回最后错误；0 表示无限重试（仅 PubSub 关闭可打断），默认 30s
 }
 
 // DefaultPubSubConfig 默认配置
@@ -65,6 +66,7 @@ func DefaultPubSubConfig() PubSubConfig {
 		CompressionMinSize: 1024,             // 默认1KB以上才压缩
 		MaxWorkers:         50,               // 默认 50 个 worker 处理消息
 		WorkerQueueSize:    200,              // 默认队列大小 200
+		StartRetryWindow:   30 * time.Second, // 默认 30s 启动重试窗口，长生命周期服务可显式配 0 无限自愈
 	}
 }
 
@@ -131,6 +133,13 @@ func WithPubSubMaxWorkers(n int) PubSubOption {
 // WithPubSubWorkerQueueSize 设置 worker 队列大小
 func WithPubSubWorkerQueueSize(n int) PubSubOption {
 	return func(c *PubSubConfig) { c.WorkerQueueSize = n }
+}
+
+// WithPubSubStartRetryWindow 设置启动握手失败重试窗口
+// 窗口内指数退避重试，耗尽后 Subscribe/Resubscribe 返回最后错误；
+// 默认 30s，设为 0 表示无限重试，仅 PubSub 关闭可打断——适合长生命周期服务的订阅自愈
+func WithPubSubStartRetryWindow(d time.Duration) PubSubOption {
+	return func(c *PubSubConfig) { c.StartRetryWindow = d }
 }
 
 // NewPubSub 创建发布订阅实例
@@ -424,10 +433,16 @@ type Subscriber struct {
 	loopWg      sync.WaitGroup    // 跟踪 messageLoop goroutine，确保退出后再重置
 }
 
-// start 启动订阅
-func (s *Subscriber) start() error {
-	var err error
+// reconnectMaxDelay 重连退避封顶：与 reconnectLoop 共用同一退避区间
+const reconnectMaxDelay = 5 * time.Second
 
+// dial 建立（或重建）订阅连接并完成握手验证
+// SUBSCRIBE/PSubscribe 握手成功才算连接可用；失败时关闭残留连接，
+// 交由调用方（start/reconnectLoop）退避重试，关闭语义与重建语义同点收敛
+func (s *Subscriber) dial() error {
+	if s.pubSubConn != nil {
+		s.pubSubConn.Close()
+	}
 	if s.isPattern {
 		s.pubSubConn = s.pubsub.client.PSubscribe(s.pubsub.ctx, s.patternKeys...)
 	} else {
@@ -438,10 +453,48 @@ func (s *Subscriber) start() error {
 	testCtx, cancel := context.WithTimeout(s.pubsub.ctx, time.Second*5)
 	defer cancel()
 
-	_, err = s.pubSubConn.Receive(testCtx)
-	if err != nil {
+	if _, err := s.pubSubConn.Receive(testCtx); err != nil {
 		s.pubSubConn.Close()
-		return fmt.Errorf("failed to subscribe: %w", err)
+		return err
+	}
+	return nil
+}
+
+// start 启动订阅
+// 首次握手失败时指数退避重试（与 messageLoop 断线自愈同语义）：
+// 订阅方不应因启动窗口 Redis 尚未就绪而永久失活（长生命周期服务的滚动发布场景），
+// 重试直到握手成功、PubSub 关闭（此时尚未返回 subscriber，调用方无法 Stop，pubsub.ctx 取消是唯一退出信号）或配置的启动窗口耗尽（StartRetryWindow > 0 时）
+func (s *Subscriber) start() error {
+	delay := mathx.IfNotZero(s.config.RetryDelay, 100*time.Millisecond)
+	var deadline time.Time
+	var lastErr error
+
+	for attempt := 1; ; attempt++ {
+		err := s.dial()
+		if err == nil {
+			break
+		}
+		lastErr = err
+
+		if s.config.StartRetryWindow > 0 && deadline.IsZero() {
+			deadline = time.Now().Add(s.config.StartRetryWindow)
+		}
+
+		s.pubsub.logger.Warnf("Initial subscribe attempt %d failed for %s: %v, retrying in %v",
+			attempt,
+			mathx.IF(s.isPattern, "patterns", "channels"),
+			mathx.IF(s.isPattern, s.patterns, s.channels),
+			err, delay)
+
+		select {
+		case <-time.After(delay):
+		case <-s.pubsub.ctx.Done():
+			return fmt.Errorf("pubsub closed before subscription established: %w", lastErr)
+		}
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			return fmt.Errorf("subscribe not established within %v start retry window: %w", s.config.StartRetryWindow, lastErr)
+		}
+		delay = min(delay*2, reconnectMaxDelay)
 	}
 
 	// 创建 Worker 池处理消息，防止 goroutine 无限增长
@@ -536,7 +589,6 @@ func (s *Subscriber) messageLoop() {
 // 返回新的消息通道；stopped=true 表示收到 Stop/PubSub 关闭信号，调用方应永久退出
 func (s *Subscriber) reconnectLoop() (ch <-chan *redis.Message, stopped bool) {
 	delay := mathx.IfNotZero(s.config.RetryDelay, 100*time.Millisecond)
-	const maxDelay = 5 * time.Second
 
 	for attempt := 1; ; attempt++ {
 		// 每次重试前检查停止信号（Stop 期间不应继续重连）
@@ -548,20 +600,8 @@ func (s *Subscriber) reconnectLoop() (ch <-chan *redis.Message, stopped bool) {
 		default:
 		}
 
-		// 关闭残留旧连接后重建订阅（复用 start 的订阅与连通性验证语义）
-		if s.pubSubConn != nil {
-			s.pubSubConn.Close()
-		}
-		if s.isPattern {
-			s.pubSubConn = s.pubsub.client.PSubscribe(s.pubsub.ctx, s.patternKeys...)
-		} else {
-			s.pubSubConn = s.pubsub.client.Subscribe(s.pubsub.ctx, s.channelKeys...)
-		}
-
-		// 连通性验证：SUBSCRIBE 握手成功才算重连完成
-		testCtx, cancel := context.WithTimeout(s.pubsub.ctx, 5*time.Second)
-		_, err := s.pubSubConn.Receive(testCtx)
-		cancel()
+		// 连通性验证：SUBSCRIBE 握手成功才算重连完成（复用 dial，与 start 同语义）
+		err := s.dial()
 		if err == nil {
 			s.pubsub.logger.Infof("Subscription auto-reconnected (attempt %d) for %s: %v",
 				attempt,
@@ -570,7 +610,6 @@ func (s *Subscriber) reconnectLoop() (ch <-chan *redis.Message, stopped bool) {
 			return s.pubSubConn.Channel(), false
 		}
 
-		s.pubSubConn.Close()
 		s.pubsub.logger.Warnf("Subscription reconnect attempt %d failed, retrying in %v: %v",
 			attempt, delay, err)
 
@@ -581,7 +620,7 @@ func (s *Subscriber) reconnectLoop() (ch <-chan *redis.Message, stopped bool) {
 		case <-s.pubsub.ctx.Done():
 			return nil, true
 		}
-		delay = min(delay*2, maxDelay)
+		delay = min(delay*2, reconnectMaxDelay)
 	}
 }
 
@@ -837,14 +876,12 @@ func SimplePublish(client redis.UniversalClient, channel string, message any) er
 	return pubsub.Publish(context.Background(), channel, message)
 }
 
-// SimpleSubscribe 简单订阅消息
-//
-// 警告：此函数创建的 PubSub 实例需要手动管理生命周期
-// 返回 PubSub 实例和 Subscriber，使用完毕后需要调用 pubsub.Close()
-//
+// SimpleSubscribe 简单订阅封装：内部 pubsub 不暴露配置，采用快速失败语义
+// 启动重试窗口收窄为 2s（simple 场景 Redis 未就绪即快速返回错误，与服务级订阅的 30s 默认窗口/0 无限自愈语义区分）
+// 警告：此函数创建的 PubSub 实例需要手动管理生命周期，使用完毕后需要调用 pubsub.Close()；
 // 推荐使用 NewPubSub() + Subscribe() 以便更好地管理生命周期
 func SimpleSubscribe(client redis.UniversalClient, channel string, handler MessageHandler) (*PubSub, *Subscriber, error) {
-	pubsub := NewPubSub(client)
+	pubsub := NewPubSub(client, WithPubSubStartRetryWindow(2*time.Second))
 	subscriber, err := pubsub.Subscribe([]string{channel}, handler)
 	if err != nil {
 		pubsub.Close()
