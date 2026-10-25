@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-11-26 01:10:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-26 01:10:00
+ * @LastEditTime: 2026-10-25 15:08:55
  * @FilePath: \go-cachex\multi_level_cache.go
  * @Description: 多级缓存 - 本地缓存+Redis组合(生产级别)
  *
@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kamalyes/go-toolbox/pkg/mathx"
@@ -40,13 +41,17 @@ type MultiLevelCache[T any] struct {
 	redisClient redis.UniversalClient
 
 	// 统计信息
+	//
+	// 原为 sync.RWMutex 保护的普通 int64：每次 Get/Set 都要取写锁记一次计数，
+	// 一把全局锁串行化了全部操作，使下层 L1 的分片完全失效（分片再多也排在同一把锁后）。
+	// 改为 atomic.Int64 后计数为无锁原子加，与 AdvancedCache.metrics 的既有做法一致。
+	// atomic.Int64 同时自带 64 位对齐保证，无需关心字段排布。
 	stats struct {
-		sync.RWMutex
-		L1Hits int64
-		L2Hits int64
-		Misses int64
-		L1Sets int64
-		L2Sets int64
+		L1Hits atomic.Int64
+		L2Hits atomic.Int64
+		Misses atomic.Int64
+		L1Sets atomic.Int64
+		L2Sets atomic.Int64
 	}
 }
 
@@ -163,59 +168,59 @@ func (m *MultiLevelCache[T]) InvalidateL1(key string) {
 }
 
 // GetStats 获取统计信息
+//
+// 各计数独立原子读，不再持锁快照：返回值是各项的近似同期视图而非严格一致快照
+// （并发写入下 l1_hits 与 misses 可能相差一次计数）。统计用途不需要线性一致性，
+// 而旧实现为此在每次 Get/Set 上加了一把全局锁，代价远超收益。
 func (m *MultiLevelCache[T]) GetStats() map[string]int64 {
-	m.stats.RLock()
-	defer m.stats.RUnlock()
+	l1Hits := m.stats.L1Hits.Load()
+	l2Hits := m.stats.L2Hits.Load()
+	misses := m.stats.Misses.Load()
 
 	return map[string]int64{
-		"l1_hits":  m.stats.L1Hits,
-		"l2_hits":  m.stats.L2Hits,
-		"misses":   m.stats.Misses,
-		"l1_sets":  m.stats.L1Sets,
-		"l2_sets":  m.stats.L2Sets,
-		"hit_rate": m.calculateHitRate(),
+		"l1_hits":  l1Hits,
+		"l2_hits":  l2Hits,
+		"misses":   misses,
+		"l1_sets":  m.stats.L1Sets.Load(),
+		"l2_sets":  m.stats.L2Sets.Load(),
+		"hit_rate": hitRateOf(l1Hits, l2Hits, misses),
 	}
 }
 
 // calculateHitRate 计算命中率(百分比)
 func (m *MultiLevelCache[T]) calculateHitRate() int64 {
-	total := m.stats.L1Hits + m.stats.L2Hits + m.stats.Misses
+	return hitRateOf(m.stats.L1Hits.Load(), m.stats.L2Hits.Load(), m.stats.Misses.Load())
+}
+
+// hitRateOf 由已读取的计数计算命中率百分比
+// 独立成函数，使 GetStats 能复用同一批 Load 结果，避免同一次调用内重复读取出现自相矛盾的比率
+func hitRateOf(l1Hits, l2Hits, misses int64) int64 {
+	total := l1Hits + l2Hits + misses
 	if total == 0 {
 		return 0
 	}
-	hits := m.stats.L1Hits + m.stats.L2Hits
-	return (hits * 100) / total
+	return ((l1Hits + l2Hits) * 100) / total
 }
 
-// 统计记录方法
+// 统计记录方法（无锁原子加，位于每次 Get/Set 的热路径）
 func (m *MultiLevelCache[T]) recordL1Hit() {
-	m.stats.Lock()
-	m.stats.L1Hits++
-	m.stats.Unlock()
+	m.stats.L1Hits.Add(1)
 }
 
 func (m *MultiLevelCache[T]) recordL2Hit() {
-	m.stats.Lock()
-	m.stats.L2Hits++
-	m.stats.Unlock()
+	m.stats.L2Hits.Add(1)
 }
 
 func (m *MultiLevelCache[T]) recordMiss() {
-	m.stats.Lock()
-	m.stats.Misses++
-	m.stats.Unlock()
+	m.stats.Misses.Add(1)
 }
 
 func (m *MultiLevelCache[T]) recordL1Set() {
-	m.stats.Lock()
-	m.stats.L1Sets++
-	m.stats.Unlock()
+	m.stats.L1Sets.Add(1)
 }
 
 func (m *MultiLevelCache[T]) recordL2Set() {
-	m.stats.Lock()
-	m.stats.L2Sets++
-	m.stats.Unlock()
+	m.stats.L2Sets.Add(1)
 }
 
 // Clear 清空所有缓存

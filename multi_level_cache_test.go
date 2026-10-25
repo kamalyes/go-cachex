@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-11-26 01:20:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-26 01:20:00
+ * @LastEditTime: 2026-10-25 15:08:55
  * @FilePath: \go-cachex\multi_level_cache_test.go
  * @Description: 多级缓存测试
  *
@@ -448,9 +448,12 @@ func TestMultiLevelCache_Clear(t *testing.T) {
 	assert.NoError(t, err)
 
 	// 验证 L1 已清空
-	cache.stats.RLock()
-	l1Size := len(cache.l1Cache.shards[0].cache)
-	cache.stats.RUnlock()
+	// 读分片 map 必须持该分片自己的锁：原实现取的是 cache.stats 锁，
+	// 与分片 map 无任何关系（统计锁已随计数原子化移除），属一开始就错配的保护
+	shard := cache.l1Cache.shards[0]
+	shard.mu.RLock()
+	l1Size := len(shard.cache)
+	shard.mu.RUnlock()
 	t.Logf("L1 shard[0] size after clear: %d", l1Size)
 }
 
