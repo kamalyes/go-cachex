@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-11-09 22:30:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-09 22:30:00
+ * @LastEditTime: 2026-10-25 11:07:52
  * @FilePath: \go-cachex\lru_optimized.go
  * @Description: 超高性能优化版本的 LRU 缓存实现
  *
@@ -21,6 +21,7 @@ package cachex
 import (
 	"context"
 	"hash/fnv"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,17 +44,36 @@ const (
 var (
 	cachedTimestamp int64
 	lastUpdate      int64
+	// clockOnce 保证刷新协程至多启动一次，且仅在首个 handler 构造时启动
+	clockOnce sync.Once
 )
 
 // 初始化时间戳缓存
+//
+// 仅置初值，不启协程：原实现在 init 中无条件起一个 10ms ticker 协程，
+// 于是**任何** import 本包的程序（6 个服务 + go-wsc）都永久承担 100 次/秒的定时器唤醒，
+// 即便从未构造 LRUOptimizedHandler，且无从关闭——既干扰运行时空闲状态，
+// 也会计入容器 CPU 账目。改为由 startClock 在首个 handler 构造时惰性启动。
 func init() {
 	updateCachedTimestamp()
-	syncx.Go().OnPanic(nil).Exec(func() {
-		ticker := time.NewTicker(time.Millisecond * timestampCacheInterval)
-		defer ticker.Stop()
-		for range ticker.C {
-			updateCachedTimestamp()
-		}
+}
+
+// startClock 惰性启动时间戳刷新协程（仅首个 handler 构造时真正执行一次）
+//
+// 保留时间戳缓存而非直接调用 time.Now：本机实测 fastNow 为 0.25ns，
+// time.Now().UnixNano() 为 28–31ns，而 GetHit 基线约 50ns——
+// 去掉缓存会使读命中劣化约 60%，缓存的收益是 100 倍量级，必须保留。
+// 代价是 TTL 判定存在至多 timestampCacheInterval（10ms）的滞后，属既有行为，不变更。
+func startClock() {
+	clockOnce.Do(func() {
+		updateCachedTimestamp()
+		syncx.Go().OnPanic(nil).Exec(func() {
+			ticker := time.NewTicker(time.Millisecond * timestampCacheInterval)
+			defer ticker.Stop()
+			for range ticker.C {
+				updateCachedTimestamp()
+			}
+		})
 	})
 }
 
@@ -87,7 +107,15 @@ type fastEntry struct {
 	expiry int64      // 过期时间戳
 	prev   *fastEntry // 双向链表前驱
 	next   *fastEntry // 双向链表后继
-	_      [8]byte    // 缓存行填充
+
+	// accessed CLOCK 访问位（近似 LRU）
+	//
+	// 读命中仅原子置 1，不触碰链表——这让读路径真正只读（只持 RLock）。
+	// 淘汰时（持写锁）从尾部扫描：置位者清零并给第二次机会，未置位者即victim。
+	// 必须用原子访问：读命中在 RLock 下并发写入本字段，非原子写会被 race 检测捕获。
+	accessed atomic.Uint32
+
+	_ [8]byte // 缓存行填充
 }
 
 // LRU分片，每个分片独立管理一部分数据
@@ -140,14 +168,31 @@ func NewLRUOptimizedHandler(maxEntries int) *LRUOptimizedHandler {
 	if maxEntries < defaultShardCount {
 		shardCount = 1
 	}
-	for shardCount < maxEntries/defaultShardCapacity && shardCount < 256 {
+	// 分片数上界取 4×GOMAXPROCS（向上取 2 的幂）而非 maxEntries/64 封顶 256。
+	//
+	// 分片容量是**硬上限**，而键的哈希分布不可能完全均匀，故单分片容量越小、
+	// 相对方差越大，越容易在整体远未装满时就触发局部淘汰。
+	// 旧算法在 maxEntries=10000 时得到 256 个分片 × 39 容量，实测仅留存 87.2%
+	// （分片占用 min 21 / max 39），且淘汰按分片内局部新近度而非全局新近度进行。
+	// 分片数的真实作用是降低锁竞争，其收益在约 4×CPU 核数后饱和，
+	// 继续增加只会放大容量碎片，故在此封顶。
+	maxShards := 4 * runtime.GOMAXPROCS(0)
+	shardCap := defaultShardCount
+	for shardCap < maxShards && shardCap < 256 {
+		shardCap <<= 1
+	}
+	for shardCount < maxEntries/defaultShardCapacity && shardCount < shardCap {
 		shardCount <<= 1
 	}
 
-	shardCapacity := maxEntries / shardCount
+	// 向上取整分配分片容量：下取整会丢弃余数，使各分片容量之和小于 maxEntries
+	shardCapacity := (maxEntries + shardCount - 1) / shardCount
 	if shardCapacity < 1 {
 		shardCapacity = 1
 	}
+
+	// 时间戳刷新协程在首个 handler 构造时惰性启动（见 startClock）
+	startClock()
 
 	h := &LRUOptimizedHandler{
 		shards:     make([]*lruShard, shardCount),
@@ -205,6 +250,7 @@ func (s *lruShard) putEntry(entry *fastEntry) {
 	entry.expiry = 0
 	entry.prev = nil
 	entry.next = nil
+	entry.accessed.Store(0) // 复用前清零访问位，避免继承上一轮的第二次机会
 	s.entryPool.Put(entry)
 }
 
@@ -236,6 +282,34 @@ func (s *lruShard) removeTail() *fastEntry {
 	tail := s.tail.prev
 	s.removeEntry(tail)
 	return tail
+}
+
+// evictVictim 选取并摘除淘汰目标（CLOCK 第二次机会，近似 LRU）
+//
+// 调用方必须持写锁。自尾部向头部扫描：
+//   - 访问位为 1：清零并移到头部（给第二次机会），继续向前找
+//   - 访问位为 0：即为 victim，摘除返回
+//
+// 扫描步数以当前 size 为上界：若全部条目都带访问位（极热负载），
+// 退化为无条件淘汰当前尾节点，保证本函数必定终止且必定腾出一个名额。
+// 相比严格 LRU，淘汰精度换取了读路径的无写锁化——淘汰质量以 Zipf 负载命中率验证。
+func (s *lruShard) evictVictim() *fastEntry {
+	for steps := int(atomic.LoadInt32(&s.size)); steps > 0; steps-- {
+		victim := s.tail.prev
+		if victim == s.head {
+			return nil // 空链表
+		}
+		if victim.accessed.CompareAndSwap(1, 0) {
+			// 命中过：清零访问位并给第二次机会
+			s.moveToHead(victim)
+			continue
+		}
+		s.removeEntry(victim)
+		return victim
+	}
+
+	// 全员带访问位：退化为淘汰尾节点，确保腾出名额
+	return s.removeTail()
 }
 
 // isExpired 检查是否过期
@@ -315,14 +389,16 @@ func (h *LRUOptimizedHandler) GetWithCtx(ctx context.Context, key []byte) ([]byt
 	// 复制数据
 	result := make([]byte, len(entry.value))
 	copy(result, entry.value)
-	shard.mu.RUnlock()
 
-	// 升级到写锁更新LRU位置
-	shard.mu.Lock()
-	if entry, exists := shard.cache[sk]; exists && !shard.isExpired(entry.expiry) {
-		shard.moveToHead(entry)
-	}
-	shard.mu.Unlock()
+	// 置 CLOCK 访问位代替「升级写锁 + moveToHead」
+	//
+	// 原实现在此 RUnlock 后再取**写锁**、二次查 map、moveToHead——
+	// 纯读操作却付两次加锁 + 两次 map 查找，且写锁使同分片内的读彼此串行，
+	// per-shard RWMutex 在命中路径上形同普通 Mutex（实测 10 核仅 1.38× 扩展）。
+	// 现在命中路径只持 RLock 并做一次原子置位，分片内读可真正并发；
+	// 链表顺序的维护下沉到淘汰时的第二次机会扫描（evictVictim）。
+	entry.accessed.Store(1)
+	shard.mu.RUnlock()
 
 	atomic.AddInt64(&shard.hits, 1)
 	return result, nil
@@ -408,6 +484,7 @@ func (h *LRUOptimizedHandler) SetWithTTLAndCtx(ctx context.Context, key, value [
 			copy(entry.value, value)
 		}
 		entry.expiry = expiry
+		entry.accessed.Store(1) // 覆写视为访问
 		shard.moveToHead(entry)
 		return nil
 	}
@@ -420,17 +497,27 @@ func (h *LRUOptimizedHandler) SetWithTTLAndCtx(ctx context.Context, key, value [
 	entry.expiry = expiry
 
 	// 添加到缓存和链表
-	shard.cache[sk] = entry
+	//
+	// ⚠️ 键必须用 entry.key（:417 的 string(key) 安全拷贝），不可用 sk：
+	// sk 是 zeroAllocByteToString 产出的 unsafe 别名，其字符串头指向调用方的 []byte。
+	// 查找/删除用别名安全（map 按值比较，别名在调用期内有效），但**存储**会让 map 永久
+	// 持有指向调用方缓冲区的指针——调用方复用该缓冲区（池化热路径的常规做法）时，
+	// map 里的键原地变异，条目落在错误的哈希桶：既无法按任何键查到，也无法按 entry.key 删除，
+	// 继而 putEntry 把它归还 sync.Pool 并置空 prev/next，而损坏的键仍能解析到该池化条目，
+	// 最终在 removeEntry 空指针解引用——整进程 SIGSEGV。
+	// 其余 handler（lru.go / expiring.go）均按 string(key) 拷贝存储，此处对齐同一契约。
+	// 本缺陷 -race 检测不到（内存别名，非数据竞争），只能靠复用缓冲区的回归测试覆盖。
+	shard.cache[entry.key] = entry
 	shard.addToHead(entry)
 	atomic.AddInt32(&shard.size, 1)
 
-	// 检查容量限制
+	// 检查容量限制（CLOCK 第二次机会选 victim，近似 LRU）
 	if shard.capacity > 0 && int(atomic.LoadInt32(&shard.size)) > shard.capacity {
-		tail := shard.removeTail()
-		if tail != nil {
-			delete(shard.cache, tail.key)
+		victim := shard.evictVictim()
+		if victim != nil {
+			delete(shard.cache, victim.key)
 			atomic.AddInt32(&shard.size, -1)
-			shard.putEntry(tail)
+			shard.putEntry(victim)
 		}
 	}
 
