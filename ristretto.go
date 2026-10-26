@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-11-05 22:55:22
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-06 21:56:05
+ * @LastEditTime: 2026-10-26 15:39:09
  * @FilePath: \go-cachex\ristretto.go
  * @Description: Ristretto 适配器（RistrettoHandler）
  *
@@ -23,6 +23,17 @@ import (
 // RistrettoHandler 是 Ristretto 缓存的实现
 type RistrettoHandler struct {
 	cache *ristretto.Cache[[]byte, []byte]
+	// asyncWrites 为 true 时写入后不调用 cache.Wait()（见 RistrettoConfig.AsyncWrites）
+	asyncWrites bool
+}
+
+// syncAfterWrite 写入后按配置决定是否等待 ristretto 写缓冲落地
+//
+// 收口为单一方法，避免四处写入点的策略漂移
+func (h *RistrettoHandler) syncAfterWrite() {
+	if !h.asyncWrites {
+		h.cache.Wait()
+	}
 }
 
 // Config 用于定制 Ristretto 缓存的配置
@@ -39,6 +50,17 @@ type RistrettoConfig struct {
 	Cost                   func(value []byte) int64           // 计算值的成本
 	IgnoreInternalCost     bool                               // 是否忽略内部存储的成本
 	TtlTickerDurationInSec int64                              // TTL 过期时清理键的时间间隔 (为0时=bucketDurationSecs)
+
+	// AsyncWrites 写入后不等待 ristretto 写缓冲落地（放弃写后立即可读的确定性，换取吞吐）
+	//
+	// ristretto 的设计是写入经通道异步批量落地；默认实现在每次写后调用 cache.Wait()，
+	// 把异步写退化为「同步等待内部协程排空」的往返。实测代价：
+	//   串行 717.8ns → 269.7ns（2.66×）、并行 1099ns → 507.6ns（2.17×）、分配 3 → 1
+	// 且这是 Ristretto 混合负载扩展性为负（0.87×）的根因，尽管它的读扩展性最好。
+	//
+	// 语义取舍：置 true 后 Set 返回不保证随后的 Get 立即可见（ristretto 本身的契约即如此）。
+	// 默认 false，即保持既有「写后同步等待」行为——零值配置与历史调用方行为完全不变。
+	AsyncWrites bool
 }
 
 // NewDefaultRistrettoConfig 创建一个新的ristretto配置实例
@@ -56,6 +78,7 @@ func NewDefaultRistrettoConfig() *RistrettoConfig {
 		Cost:                   nil,     // 不指定成本计算函数
 		IgnoreInternalCost:     false,   // 不忽略内部成本
 		TtlTickerDurationInSec: 1,       // TTL 过期时间间隔（1秒）
+		AsyncWrites:            false,   // 保持写后同步等待（既有行为），需要吞吐时显式置 true
 	}
 }
 
@@ -157,7 +180,7 @@ func NewDefaultRistrettoHandler() (*RistrettoHandler, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &RistrettoHandler{cache: cache}, nil
+	return &RistrettoHandler{cache: cache, asyncWrites: config.AsyncWrites}, nil
 }
 
 // NewRistrettoHandler 创建新的 RistrettoHandler，支持自定义配置
@@ -171,7 +194,7 @@ func NewRistrettoHandler(config *RistrettoConfig) (*RistrettoHandler, error) {
 		return nil, err
 	}
 
-	return &RistrettoHandler{cache: cache}, nil
+	return &RistrettoHandler{cache: cache, asyncWrites: config.AsyncWrites}, nil
 }
 
 // ========== 简化版方法（不带context） ==========
@@ -245,7 +268,7 @@ func (h *RistrettoHandler) SetWithCtx(ctx context.Context, k, v []byte) error {
 	if ok := h.cache.Set(k, v, 1); !ok {
 		return ErrCapacityExceeded
 	}
-	h.cache.Wait()
+	h.syncAfterWrite()
 	return nil
 }
 
@@ -269,7 +292,7 @@ func (h *RistrettoHandler) SetWithTTLAndCtx(ctx context.Context, k, v []byte, tt
 	if !ok {
 		return ErrCapacityExceeded
 	}
-	h.cache.Wait()
+	h.syncAfterWrite()
 	return nil
 }
 
@@ -280,7 +303,7 @@ func (h *RistrettoHandler) DelWithCtx(ctx context.Context, k []byte) error {
 	}
 
 	h.cache.Del(k)
-	h.cache.Wait()
+	h.syncAfterWrite()
 	return nil
 }
 
@@ -351,7 +374,7 @@ func (h *RistrettoHandler) GetOrComputeWithCtx(ctx context.Context, key []byte, 
 	} else {
 		h.cache.SetWithTTL(key, value, 1, ttl)
 	}
-	h.cache.Wait()
+	h.syncAfterWrite()
 
 	// 返回值的拷贝
 	result := make([]byte, len(value))
