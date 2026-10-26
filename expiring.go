@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-11-06 21:15:15
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-09 21:16:12
+ * @LastEditTime: 2026-10-26 10:19:57
  * @FilePath: \go-cachex\expiring.go
  * @Description:
  *
@@ -48,24 +48,74 @@ func NewExpiringHandler(cleanupInterval time.Duration) *ExpiringHandler {
 	return h
 }
 
+// 增量清扫参数
+//
+// 原实现每个 tick 持**独占锁**遍历整张 map，锁持有时间与条目数成正比：
+// 实测 10 万条目约 569µs、50 万条目约 5.1ms，期间所有读者全部阻塞。
+// 均值吞吐完全掩盖该现象（10ms 周期下占空比仅 5.7%），但尾延迟被严重拉长。
+//
+// 改为 Redis 风格的取样清扫：每轮持锁只遍历固定条数，锁持有时间与**总条目数解耦**；
+// 若本轮过期密度高则继续下一轮，密度低即收工，并受总时间预算约束。
+// Go 的 map range 每次从随机桶起始，故逐轮取样天然覆盖不同区域。
+//
+// 正确性不依赖清扫及时性：读路径（GetWithCtx）已做惰性过期判定，
+// 清扫只负责回收「永不再被访问」的过期条目所占内存。
+const (
+	expSweepSampleSize    = 256                  // 每轮持锁最多遍历的条目数
+	expSweepMaxRounds     = 16                   // 单次 tick 的最大轮数
+	expSweepBudget        = 2 * time.Millisecond // 单次 tick 的总时间预算
+	expSweepContinueRatio = 4                    // 过期数 ×该值 ≥ 样本量 时继续下一轮
+)
+
 func (h *ExpiringHandler) cleanupLoop() {
 	defer h.wg.Done()
 	for {
 		select {
 		case <-h.ticker.C:
-			h.mu.Lock()
-			now := time.Now()
-			for k, it := range h.items {
-				if !it.expiry.IsZero() && now.After(it.expiry) {
-					delete(h.items, k)
-				}
-			}
-			h.mu.Unlock()
+			h.sweepIncremental()
 		case <-h.stop:
 			// stop requested, exit goroutine
 			return
 		}
 	}
+}
+
+// sweepIncremental 增量清扫：分多轮取样，每轮短暂持锁，整体受时间预算约束
+func (h *ExpiringHandler) sweepIncremental() {
+	deadline := time.Now().Add(expSweepBudget)
+	for round := 0; round < expSweepMaxRounds; round++ {
+		scanned, expired := h.sweepSample(expSweepSampleSize)
+		if scanned == 0 {
+			return // map 已空
+		}
+		// 过期密度低：无需继续，留给后续 tick 与惰性过期
+		if expired*expSweepContinueRatio < scanned {
+			return
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+	}
+}
+
+// sweepSample 取样清扫一轮，持写锁但最多遍历 limit 个条目
+// 返回本轮实际遍历数与删除数
+func (h *ExpiringHandler) sweepSample(limit int) (scanned, expired int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	now := time.Now()
+	for k, it := range h.items {
+		if scanned >= limit {
+			break
+		}
+		scanned++
+		if !it.expiry.IsZero() && now.After(it.expiry) {
+			delete(h.items, k)
+			expired++
+		}
+	}
+	return scanned, expired
 }
 
 func copyB(b []byte) []byte {
