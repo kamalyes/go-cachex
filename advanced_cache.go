@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-11-19 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-19 00:00:00
+ * @LastEditTime: 2026-10-27 09:53:20
  * @FilePath: \go-cachex\advanced_cache.go
  * @Description: 高级缓存包装器，支持压缩和泛型，集成队列、热key和分布式锁功能
  *
@@ -11,12 +11,14 @@
 package cachex
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -121,8 +123,13 @@ func (c *AdvancedCache[T]) compress(data []byte) ([]byte, error) {
 		return data, nil
 	}
 
-	var buf strings.Builder
-	writer := gzip.NewWriter(&buf)
+	// bytes.Buffer + Bytes() 零拷贝取出；原实现用 strings.Builder 再 []byte(buf.String())，
+	// Builder→string→[]byte 是两次全量拷贝。
+	// gzip.Writer 从池中取（Reset 复用），避免每次调用新建约 300KB 的 deflate 状态。
+	var buf bytes.Buffer
+	writer := gzipWriterPool.Get().(*gzip.Writer)
+	writer.Reset(&buf)
+	defer gzipWriterPool.Put(writer)
 
 	if _, err := writer.Write(data); err != nil {
 		writer.Close()
@@ -139,7 +146,18 @@ func (c *AdvancedCache[T]) compress(data []byte) ([]byte, error) {
 		atomic.AddInt64(&c.metrics.Compressions, 1)
 	}
 
-	return []byte(buf.String()), nil
+	// 必须拷贝：buf 是栈上局部变量，Bytes() 返回其内部切片，
+	// 返回后 buf 可被复用/回收，直接外传会导致数据被覆写
+	out := make([]byte, buf.Len())
+	copy(out, buf.Bytes())
+	return out, nil
+}
+
+// gzipWriterPool 复用 gzip.Writer，规避每次压缩新建 deflate 状态的开销
+var gzipWriterPool = sync.Pool{
+	New: func() any {
+		return gzip.NewWriter(io.Discard)
+	},
 }
 
 // decompress 解压缩数据
@@ -148,7 +166,8 @@ func (c *AdvancedCache[T]) decompress(data []byte) ([]byte, error) {
 		return data, nil
 	}
 
-	reader, err := gzip.NewReader(strings.NewReader(string(data)))
+	// bytes.NewReader 零拷贝包装；原实现 strings.NewReader(string(data)) 会整份拷贝 data
+	reader, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
 		// 可能是未压缩的数据
 		return data, nil
