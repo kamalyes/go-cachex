@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-11-19 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2026-07-01 01:52:29
+ * @LastEditTime: 2026-10-28 09:06:22
  * @FilePath: \go-cachex\kv_cache_test.go
  * @Description: KVCache 通用键值缓存测试，覆盖本地/Redis/PubSub 失效广播/注册表
  *
@@ -1682,8 +1682,10 @@ func TestRefreshAndSwap_EmptyDataClearsRedis(t *testing.T) {
 	assert.Equal(t, int64(0), cnt, "Redis Hash should be deleted when loader returns empty data")
 }
 
-// TestRefreshAndSwap_NoLoaderReturnsError 验证无 loader 时 RefreshAndSwap 返回错误
-func TestRefreshAndSwap_NoLoaderReturnsError(t *testing.T) {
+// TestRefreshAndSwap_NoLoaderSkipsQuietly 验证无 loader 的 KV（如仅 BatchLoader 的 ModelCache）
+// 不参与全量原子替换：安静跳过而非报错——RefreshAndSwapAllKV 遍历全部注册缓存，
+// nil loader 报错会连带打断全局刷新（行为自 ae32cf5 起，见 RefreshAndSwap 注释）
+func TestRefreshAndSwap_NoLoaderSkipsQuietly(t *testing.T) {
 	ctx, cleanup := setupWarmupTest(t)
 	defer cleanup()
 
@@ -1693,8 +1695,7 @@ func TestRefreshAndSwap_NoLoaderReturnsError(t *testing.T) {
 
 	c := MustGetKV[string, string]("swap-no-loader")
 	err := c.RefreshAndSwap(ctx)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no loader")
+	require.NoError(t, err, "无 loader 应安静跳过，不返回错误")
 }
 
 // TestRefreshAndSwapAllKV_PartialFailure 验证 RefreshAndSwapAllKV 部分失败不中断其余缓存

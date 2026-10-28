@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-11-19 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-19 00:00:00
+ * @LastEditTime: 2026-10-28 09:06:22
  * @FilePath: \go-cachex\distributed_lock.go
  * @Description: 分布式锁实现，提供可靠的分布式锁机制
  *
@@ -374,7 +374,13 @@ func (l *DistributedLock) watchdog(ctx context.Context) {
 			// 检查Redis中的锁状态
 			locked, err := l.IsLocked(watchdogCtx)
 			if err != nil {
-				// 发生错误时继续尝试，不立即退出
+				// 客户端已关闭：不可恢复（Close 后永不复活），退出看门狗
+				// 防止测试/停机场景下 IsLocked 永久报错导致看门狗无限自旋（goroutine 泄漏 + 日志刷屏）
+				if errors.Is(err, redis.ErrClosed) {
+					l.logger.WarnContext(watchdogCtx, "watchdog stopped for key %s: redis client closed", l.key)
+					return
+				}
+				// 瞬时错误（网络抖动等）继续尝试，不立即退出
 				l.logger.WarnContext(watchdogCtx, "watchdog failed to check lock status for key %s: %v", l.key, err)
 				continue
 			}

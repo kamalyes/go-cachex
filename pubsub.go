@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-11-19 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-11-19 00:00:00
+ * @LastEditTime: 2026-10-28 09:06:22
  * @FilePath: \go-cachex\pubsub.go
  * @Description: Redis 发布订阅功能封装，提供傻瓜式调用接口
  *
@@ -13,6 +13,7 @@ package cachex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -608,6 +609,13 @@ func (s *Subscriber) reconnectLoop() (ch <-chan *redis.Message, stopped bool) {
 				mathx.IF(s.isPattern, "patterns", "channels"),
 				mathx.IF(s.isPattern, s.patterns, s.channels))
 			return s.pubSubConn.Channel(), false
+		}
+
+		// 客户端已关闭：不可恢复（Close 后永不复活），停止重连
+		// 防止停机/测试关闭 client 后按退避间隔永久重试（goroutine 泄漏 + 日志刷屏）
+		if errors.Is(err, redis.ErrClosed) {
+			s.pubsub.logger.Warnf("Subscription stopped reconnecting (attempt %d): redis client closed", attempt)
+			return nil, true
 		}
 
 		s.pubsub.logger.Warnf("Subscription reconnect attempt %d failed, retrying in %v: %v",
