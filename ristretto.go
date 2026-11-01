@@ -243,7 +243,23 @@ func (h *RistrettoHandler) GetWithCtx(ctx context.Context, k []byte) ([]byte, er
 	if !ok {
 		return nil, ErrNotFound
 	}
-	return v, nil
+
+	// 必须拷贝再返回：原先直接把 ristretto 内部的那块 []byte 交出去，调用方改写它
+	// 就直接污染了缓存内容，而这是个完全合法的动作
+	// 实测：Set 一个值、Get 出来、把返回的切片逐字节改写、再 Get 一次，
+	// 拿到的是被改写后的内容
+	//
+	// 本包其他 handler（LRU / LRUOptimized / Expiring）全部走 copyBytes，
+	// 本文件的 BatchGetWithCtx 也是拷贝的 —— 唯独这里没有，自身就不一致
+	// 副作用：它曾是全库唯一一个 Get 报 0 allocs 的 handler，
+	// 那个数字并不是更快，而是少做了别人都做的事，拿它横向对比是不成立的
+	//
+	// [EN] The value has to be copied out: returning ristretto's own slice let a caller
+	// corrupt the cache by writing to it, which is a perfectly legitimate thing to do with a
+	// returned slice. Every other handler in this package copies, and so does BatchGetWithCtx
+	// in this very file, which made this the only inconsistent path. It was also the only Get
+	// reporting zero allocations, not because it was faster but because it skipped this work
+	return copyBytes(v), nil
 }
 
 // GetTTLWithCtx 获取TTL
@@ -265,7 +281,9 @@ func (h *RistrettoHandler) SetWithCtx(ctx context.Context, k, v []byte) error {
 		return err
 	}
 
-	if ok := h.cache.Set(k, v, 1); !ok {
+	// 同 SetWithTTLAndCtx：存进去的必须是副本，否则调用方复用缓冲区就改掉了缓存
+	// [EN] As in SetWithTTLAndCtx, what goes in must be a copy
+	if ok := h.cache.Set(k, copyBytes(v), 1); !ok {
 		return ErrCapacityExceeded
 	}
 	h.syncAfterWrite()
@@ -278,16 +296,24 @@ func (h *RistrettoHandler) SetWithTTLAndCtx(ctx context.Context, k, v []byte, tt
 		return err
 	}
 
+	// 写入也要拷贝：原先直接把调用方的切片存进去，于是调用方之后复用那块缓冲区
+	// （比如循环里复用一个 buffer）就会把已经写进缓存的值一起改掉
+	// 同样是本包其他 handler 都做、唯独这里没做的事
+	// [EN] The write is copied too: storing the caller's slice meant that reusing that buffer
+	// afterwards, as a loop reusing one buffer naturally does, silently rewrote the value
+	// already in the cache
+	stored := copyBytes(v)
+
 	var ok bool
 	if ttl == -1 {
 		// -1 表示永不过期，在Ristretto中用0表示
-		ok = h.cache.SetWithTTL(k, v, 1, 0)
+		ok = h.cache.SetWithTTL(k, stored, 1, 0)
 	} else if ttl == 0 {
 		// 0 表示立即过期，在Ristretto中用一个很小的正数时间，让它几乎立即过期
-		ok = h.cache.SetWithTTL(k, v, 1, time.Nanosecond)
+		ok = h.cache.SetWithTTL(k, stored, 1, time.Nanosecond)
 	} else {
 		// 正常TTL
-		ok = h.cache.SetWithTTL(k, v, 1, ttl)
+		ok = h.cache.SetWithTTL(k, stored, 1, ttl)
 	}
 	if !ok {
 		return ErrCapacityExceeded
@@ -368,11 +394,13 @@ func (h *RistrettoHandler) GetOrComputeWithCtx(ctx context.Context, key []byte, 
 		return nil, err
 	}
 
-	// 将结果写入缓存
+	// 将结果写入缓存；loader 返回的切片也可能被调用方继续持有，同样要拷贝
+	// [EN] The slice the loader returned may still be held by the caller, so it is copied too
+	cached := copyBytes(value)
 	if ttl <= 0 {
-		h.cache.Set(key, value, 1)
+		h.cache.Set(key, cached, 1)
 	} else {
-		h.cache.SetWithTTL(key, value, 1, ttl)
+		h.cache.SetWithTTL(key, cached, 1, ttl)
 	}
 	h.syncAfterWrite()
 
