@@ -16,6 +16,7 @@ import (
 	"container/list"
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kamalyes/go-toolbox/pkg/mathx"
@@ -30,7 +31,18 @@ type LRUHandler struct {
 	maxEntries int
 	ll         *list.List
 	cache      map[string]*list.Element
-	closed     bool
+	// closed 用原子标志而不是受 mu 保护的 bool
+	//
+	// GetWithCtx 这类入口把它当实参传给校验函数（ValidateBasicOp(key, true, closed)），
+	// 而实参在函数体取锁之前就求值了，于是读发生在锁外，与 Close 的写构成真竞争
+	// 实测 -race 下稳定复现：lru.go:133 的读 对 lru.go:383 的写
+	// 本包的 LRUOptimizedHandler 一直用的就是原子标志，这里对齐它
+	//
+	// [EN] An atomic flag rather than a bool guarded by mu: entry points such as GetWithCtx
+	// pass it by value to the validation helper, and an argument is evaluated before the body
+	// takes any lock, so the read happens outside it and races with Close. The race reproduces
+	// reliably under -race. LRUOptimizedHandler in this package already uses an atomic flag
+	closed int32
 }
 
 type lruEntry struct {
@@ -130,7 +142,7 @@ func (h *LRUHandler) GetOrCompute(key []byte, ttl time.Duration, loader func() (
 
 // GetWithCtx 获取缓存值（支持context）
 func (h *LRUHandler) GetWithCtx(ctx context.Context, key []byte) ([]byte, error) {
-	if err := ValidateBasicOp(key, true, h.closed); err != nil {
+	if err := ValidateBasicOp(key, true, atomic.LoadInt32(&h.closed) != 0); err != nil {
 		return nil, err
 	}
 
@@ -157,7 +169,7 @@ func (h *LRUHandler) GetTTLWithCtx(ctx context.Context, key []byte) (time.Durati
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.closed {
+	if atomic.LoadInt32(&h.closed) != 0 {
 		return 0, ErrClosed
 	}
 	sk := string(key)
@@ -194,7 +206,7 @@ func (h *LRUHandler) SetWithTTLAndCtx(ctx context.Context, key, value []byte, tt
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.closed {
+	if atomic.LoadInt32(&h.closed) != 0 {
 		return ErrClosed
 	}
 	sk := string(key)
@@ -251,7 +263,7 @@ func (h *LRUHandler) DelWithCtx(ctx context.Context, key []byte) error {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.closed {
+	if atomic.LoadInt32(&h.closed) != 0 {
 		return ErrClosed
 	}
 	sk := string(key)
@@ -274,7 +286,7 @@ func (h *LRUHandler) BatchGetWithCtx(ctx context.Context, keys [][]byte) ([][]by
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if h.closed {
+	if atomic.LoadInt32(&h.closed) != 0 {
 		for i := range errors {
 			errors[i] = ErrClosed
 		}
@@ -347,7 +359,7 @@ func (h *LRUHandler) Stats() map[string]interface{} {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if h.closed {
+	if atomic.LoadInt32(&h.closed) != 0 {
 		return map[string]interface{}{
 			"closed":   true,
 			"entries":  0,
@@ -369,7 +381,7 @@ func (h *LRUHandler) Stats() map[string]interface{} {
 		"entries":       h.ll.Len(),
 		"capacity":      h.maxEntries,
 		"expired_items": expiredCount,
-		"closed":        h.closed,
+		"closed":        atomic.LoadInt32(&h.closed) != 0,
 	}
 }
 
@@ -377,10 +389,10 @@ func (h *LRUHandler) Stats() map[string]interface{} {
 func (h *LRUHandler) Close() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.closed {
+	if atomic.LoadInt32(&h.closed) != 0 {
 		return nil
 	}
-	h.closed = true
+	atomic.StoreInt32(&h.closed, 1)
 	h.ll = nil
 	h.cache = make(map[string]*list.Element)
 	return nil

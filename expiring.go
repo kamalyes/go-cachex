@@ -13,6 +13,7 @@ package cachex
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kamalyes/go-toolbox/pkg/mathx"
@@ -26,7 +27,12 @@ type ExpiringHandler struct {
 	items  map[string]expItem
 	ticker *time.Ticker
 	stop   chan struct{}
-	closed bool
+	// closed 用原子标志，理由同 lru.go：校验函数的实参在取锁前求值，
+	// 四个入口（SetWithTTLAndCtx / GetWithCtx / GetTTLWithCtx / DelWithCtx）都在锁外读它
+	// 实测 -race 下稳定复现：expiring.go:188 的读 对 expiring.go:388 的写
+	// [EN] An atomic flag for the same reason as in lru.go: the validation helper's argument
+	// is evaluated before the lock is taken, so four entry points read it unlocked
+	closed int32
 	wg     sync.WaitGroup
 }
 
@@ -162,7 +168,7 @@ func (h *ExpiringHandler) SetWithCtx(ctx context.Context, key, value []byte) err
 
 // SetWithTTLAndCtx 写入值并设置TTL（ttl<=0 表示不过期，支持context）
 func (h *ExpiringHandler) SetWithTTLAndCtx(ctx context.Context, key, value []byte, ttl time.Duration) error {
-	if err := ValidateWriteWithTTLOp(key, value, ttl, true, h.closed); err != nil {
+	if err := ValidateWriteWithTTLOp(key, value, ttl, true, atomic.LoadInt32(&h.closed) != 0); err != nil {
 		return err
 	}
 
@@ -185,7 +191,7 @@ func (h *ExpiringHandler) SetWithTTLAndCtx(ctx context.Context, key, value []byt
 
 // GetWithCtx 读取值，如果不存在或已过期返回ErrNotFound
 func (h *ExpiringHandler) GetWithCtx(ctx context.Context, key []byte) ([]byte, error) {
-	if err := ValidateBasicOp(key, true, h.closed); err != nil {
+	if err := ValidateBasicOp(key, true, atomic.LoadInt32(&h.closed) != 0); err != nil {
 		return nil, err
 	}
 
@@ -212,7 +218,7 @@ func (h *ExpiringHandler) GetWithCtx(ctx context.Context, key []byte) ([]byte, e
 
 // GetTTLWithCtx 返回剩余TTL（0 表示无TTL），找不到返回ErrNotFound
 func (h *ExpiringHandler) GetTTLWithCtx(ctx context.Context, key []byte) (time.Duration, error) {
-	if err := ValidateBasicOp(key, true, h.closed); err != nil {
+	if err := ValidateBasicOp(key, true, atomic.LoadInt32(&h.closed) != 0); err != nil {
 		return 0, err
 	}
 
@@ -230,7 +236,7 @@ func (h *ExpiringHandler) GetTTLWithCtx(ctx context.Context, key []byte) (time.D
 
 // DelWithCtx 删除键
 func (h *ExpiringHandler) DelWithCtx(ctx context.Context, key []byte) error {
-	if err := ValidateBasicOp(key, true, h.closed); err != nil {
+	if err := ValidateBasicOp(key, true, atomic.LoadInt32(&h.closed) != 0); err != nil {
 		return err
 	}
 
@@ -252,7 +258,7 @@ func (h *ExpiringHandler) BatchGetWithCtx(ctx context.Context, keys [][]byte) ([
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	if h.closed {
+	if atomic.LoadInt32(&h.closed) != 0 {
 		for i := range errors {
 			errors[i] = ErrClosed
 		}
@@ -301,7 +307,7 @@ func (h *ExpiringHandler) GetOrComputeWithCtx(ctx context.Context, key []byte, t
 
 	// 首先尝试获取
 	h.mu.RLock()
-	if h.closed {
+	if atomic.LoadInt32(&h.closed) != 0 {
 		h.mu.RUnlock()
 		return nil, ErrClosed
 	}
@@ -353,7 +359,7 @@ func (h *ExpiringHandler) Stats() map[string]interface{} {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	if h.closed {
+	if atomic.LoadInt32(&h.closed) != 0 {
 		return map[string]interface{}{
 			"closed":        true,
 			"entries":       0,
@@ -373,7 +379,7 @@ func (h *ExpiringHandler) Stats() map[string]interface{} {
 	return map[string]interface{}{
 		"entries":       len(h.items),
 		"expired_items": expiredCount,
-		"closed":        h.closed,
+		"closed":        atomic.LoadInt32(&h.closed) != 0,
 		"cache_type":    "expiring",
 	}
 }
@@ -381,11 +387,11 @@ func (h *ExpiringHandler) Stats() map[string]interface{} {
 // Close 停止后台清理并释放资源
 func (h *ExpiringHandler) Close() error {
 	h.mu.Lock()
-	if h.closed {
+	if atomic.LoadInt32(&h.closed) != 0 {
 		h.mu.Unlock()
 		return nil
 	}
-	h.closed = true
+	atomic.StoreInt32(&h.closed, 1)
 	// signal goroutine to stop and stop the ticker
 	close(h.stop)
 	h.ticker.Stop()
