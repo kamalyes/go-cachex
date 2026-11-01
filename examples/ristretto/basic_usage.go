@@ -32,12 +32,12 @@ func basicUsageExample() {
 
 	// 基本的 Set/Get 操作
 	fmt.Println("\n2. Basic Set/Get Operations:")
-	
+
 	// 设置键值对
 	if err := cache.Set([]byte("product:1"), []byte(`{"id": 1, "name": "Laptop", "price": 999.99}`)); err != nil {
 		log.Fatal(err)
 	}
-	
+
 	if err := cache.Set([]byte("product:2"), []byte(`{"id": 2, "name": "Mouse", "price": 29.99}`)); err != nil {
 		log.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func basicUsageExample() {
 
 	// 带 TTL 的操作
 	fmt.Println("\n3. TTL Operations:")
-	
+
 	// 设置带 TTL 的键值对
 	sessionData := []byte(`{"user_id": 123, "expires": "2025-12-31T23:59:59Z"}`)
 	if err := cache.SetWithTTL([]byte("session:abc123"), sessionData, 3*time.Second); err != nil {
@@ -81,7 +81,7 @@ func basicUsageExample() {
 
 	// 更新操作
 	fmt.Println("\n4. Update Operations:")
-	
+
 	// 更新现有键的值
 	updatedProduct := []byte(`{"id": 1, "name": "Gaming Laptop", "price": 1299.99}`)
 	if err := cache.Set([]byte("product:1"), updatedProduct); err != nil {
@@ -95,7 +95,7 @@ func basicUsageExample() {
 
 	// 删除操作
 	fmt.Println("\n5. Delete Operations:")
-	
+
 	// 删除一个存在的键
 	if err := cache.Del([]byte("product:2")); err != nil {
 		log.Fatal(err)
@@ -109,7 +109,7 @@ func basicUsageExample() {
 
 	// 大量数据测试
 	fmt.Println("\n6. Bulk Operations:")
-	
+
 	// 批量设置数据
 	fmt.Println("Setting 1000 items...")
 	start := time.Now()

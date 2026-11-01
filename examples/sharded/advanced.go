@@ -80,8 +80,8 @@ func demonstrateAdaptiveSharding() {
 			cache.Set(key, value)
 		}
 		elapsed := time.Since(start)
-		
-		fmt.Printf("  性能: %d ops 耗时 %v (%.0f ops/sec)\n", 
+
+		fmt.Printf("  性能: %d ops 耗时 %v (%.0f ops/sec)\n",
 			testOps, elapsed, float64(testOps)/elapsed.Seconds())
 
 		cache.Close()
@@ -98,7 +98,7 @@ func demonstrateLoadBalancing() {
 	factory := func() cachex.Handler {
 		return cachex.NewLRUHandler(500)
 	}
-	
+
 	cache := cachex.NewShardedHandler(factory, 8)
 	defer cache.Close()
 
@@ -175,13 +175,13 @@ func demonstrateMonitoring() {
 
 	// 带统计功能的分片处理器
 	type StatsHandler struct {
-		handler     cachex.Handler
-		gets        int64
-		sets        int64
-		deletes     int64
-		hits        int64
-		misses      int64
-		mu          sync.RWMutex
+		handler cachex.Handler
+		gets    int64
+		sets    int64
+		deletes int64
+		hits    int64
+		misses  int64
+		mu      sync.RWMutex
 	}
 
 	// 创建监控缓存（简化版本，只做统计演示）
@@ -191,7 +191,7 @@ func demonstrateMonitoring() {
 	defer cache.Close()
 
 	fmt.Println("执行监控测试...")
-	
+
 	// 并发操作测试
 	var wg sync.WaitGroup
 	const workers = 10
@@ -204,7 +204,7 @@ func demonstrateMonitoring() {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			
+
 			for op := 0; op < operations; op++ {
 				key := []byte(fmt.Sprintf("monitor_key_%d_%d", workerID, op))
 				value := []byte(fmt.Sprintf("monitor_value_%d_%d", workerID, op))
@@ -239,7 +239,7 @@ func demonstrateMonitoring() {
 
 	// 显示统计信息
 	fmt.Printf("\n监控结果 (运行时间: %v):\n", totalTime)
-	
+
 	totalOps := totalSets + totalGets + totalDels
 	misses := totalGets - totalHits
 	hitRate := float64(totalHits) / float64(totalGets) * 100
@@ -248,7 +248,7 @@ func demonstrateMonitoring() {
 	fmt.Printf("总体统计:\n")
 	fmt.Printf("  总操作数: %d\n", totalOps)
 	fmt.Printf("  读操作: %d (命中: %d, 未命中: %d)\n", totalGets, totalHits, misses)
-	fmt.Printf("  写操作: %d\n", totalSets) 
+	fmt.Printf("  写操作: %d\n", totalSets)
 	fmt.Printf("  删除操作: %d\n", totalDels)
 	fmt.Printf("  总命中率: %.1f%%\n", hitRate)
 	fmt.Printf("  吞吐量: %.0f ops/sec\n", throughput)
@@ -276,7 +276,7 @@ func demonstrateFaultIsolation() {
 	for i := 0; i < 100; i++ {
 		key := []byte(fmt.Sprintf("normal_key_%d", i))
 		value := []byte(fmt.Sprintf("normal_value_%d", i))
-		
+
 		if err := cache.Set(key, value); err == nil {
 			if _, err := cache.Get(key); err == nil {
 				successCount++
@@ -288,19 +288,19 @@ func demonstrateFaultIsolation() {
 	// 继续操作，验证故障隔离
 	fmt.Println("\n2) 故障隔离验证")
 	fmt.Println("   注意: 分片缓存的单个分片故障不会影响其他分片")
-	
+
 	partialSuccessCount := 0
 	for i := 100; i < 200; i++ {
 		key := []byte(fmt.Sprintf("fault_test_key_%d", i))
 		value := []byte(fmt.Sprintf("fault_test_value_%d", i))
-		
+
 		if err := cache.Set(key, value); err == nil {
 			if _, err := cache.Get(key); err == nil {
 				partialSuccessCount++
 			}
 		}
 	}
-	
+
 	fmt.Printf("   ✓ 继续操作成功率: %d/100\n", partialSuccessCount)
 	fmt.Println("   ✓ 健康分片继续正常工作")
 	fmt.Println("   ✓ 分片间故障隔离生效")
@@ -308,19 +308,19 @@ func demonstrateFaultIsolation() {
 	// 模拟故障恢复
 	fmt.Println("\n3) 故障恢复")
 	fmt.Println("   分片故障可通过重新创建分片来快速恢复")
-	
+
 	recoveryCount := 0
 	for i := 200; i < 300; i++ {
 		key := []byte(fmt.Sprintf("recovery_key_%d", i))
 		value := []byte(fmt.Sprintf("recovery_value_%d", i))
-		
+
 		if err := cache.Set(key, value); err == nil {
 			if _, err := cache.Get(key); err == nil {
 				recoveryCount++
 			}
 		}
 	}
-	
+
 	fmt.Printf("   ✓ 恢复后操作成功率: %d/100\n", recoveryCount)
 
 	// 总结
@@ -328,7 +328,7 @@ func demonstrateFaultIsolation() {
 	fmt.Printf("  - 正常情况成功率: %.1f%%\n", float64(successCount))
 	fmt.Printf("  - 故障隔离成功率: %.1f%%\n", float64(partialSuccessCount))
 	fmt.Printf("  - 恢复后成功率: %.1f%%\n", float64(recoveryCount))
-	
+
 	fmt.Println("\n优势:")
 	fmt.Println("  ✓ 分片间故障隔离，单点故障不影响整体服务")
 	fmt.Println("  ✓ 部分数据可用性，服务降级而非完全不可用")
@@ -426,15 +426,15 @@ func demonstratePerformanceOptimization() {
 		mixedTime := time.Since(mixedStart)
 
 		results[i] = performanceResult{
-			name:         opt.name,
+			name:           opt.name,
 			writeOpsPerSec: float64(testOperations) / writeTime.Seconds(),
 			readOpsPerSec:  float64(testOperations) / readTime.Seconds(),
 			mixedOpsPerSec: float64(testOperations) / mixedTime.Seconds(),
-			hitRate:       float64(readHits) / float64(testOperations) * 100,
+			hitRate:        float64(readHits) / float64(testOperations) * 100,
 		}
 
 		fmt.Printf("  写入性能: %.0f ops/sec\n", results[i].writeOpsPerSec)
-		fmt.Printf("  读取性能: %.0f ops/sec (命中率: %.1f%%)\n", 
+		fmt.Printf("  读取性能: %.0f ops/sec (命中率: %.1f%%)\n",
 			results[i].readOpsPerSec, results[i].hitRate)
 		fmt.Printf("  混合性能: %.0f ops/sec\n", results[i].mixedOpsPerSec)
 
@@ -444,13 +444,13 @@ func demonstratePerformanceOptimization() {
 
 	// 性能对比总结
 	fmt.Println("性能对比总结:")
-	fmt.Printf("%-15s %-12s %-12s %-12s %-10s\n", 
+	fmt.Printf("%-15s %-12s %-12s %-12s %-10s\n",
 		"配置", "写入(ops/s)", "读取(ops/s)", "混合(ops/s)", "命中率")
 	fmt.Println(repeatString("-", 70))
-	
+
 	for _, result := range results {
 		fmt.Printf("%-15s %-12.0f %-12.0f %-12.0f %-10.1f%%\n",
-			result.name, result.writeOpsPerSec, result.readOpsPerSec, 
+			result.name, result.writeOpsPerSec, result.readOpsPerSec,
 			result.mixedOpsPerSec, result.hitRate)
 	}
 
@@ -570,7 +570,7 @@ func demonstrateHybridSharding() {
 			hotHits++
 		}
 	}
-	fmt.Printf("  热点数据访问成功率: %d/200 (%.1f%%)\n", 
+	fmt.Printf("  热点数据访问成功率: %d/200 (%.1f%%)\n",
 		hotHits, float64(hotHits)/200*100)
 
 	// 冷数据 - 低频访问
@@ -581,7 +581,7 @@ func demonstrateHybridSharding() {
 			coldHits++
 		}
 	}
-	fmt.Printf("  冷数据访问成功率: %d/50 (%.1f%%)\n", 
+	fmt.Printf("  冷数据访问成功率: %d/50 (%.1f%%)\n",
 		coldHits, float64(coldHits)/50*100)
 
 	// 等待临时数据过期
@@ -595,7 +595,7 @@ func demonstrateHybridSharding() {
 			tempHits++
 		}
 	}
-	fmt.Printf("  临时数据剩余: %d/100 (%.1f%%) - 大部分已过期\n", 
+	fmt.Printf("  临时数据剩余: %d/100 (%.1f%%) - 大部分已过期\n",
 		tempHits, float64(tempHits)/100*100)
 
 	// 混合策略优势

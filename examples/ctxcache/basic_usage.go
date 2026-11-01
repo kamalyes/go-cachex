@@ -156,14 +156,14 @@ func demonstrateGetOrCompute() {
 	userLoader := func(ctx context.Context) ([]byte, error) {
 		fmt.Println("  🔄 执行昂贵的数据库查询...")
 		time.Sleep(500 * time.Millisecond) // 模拟慢查询
-		
+
 		// 检查上下文是否被取消
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
 		}
-		
+
 		return []byte(`{"id":456,"name":"Bob","email":"bob@example.com"}`), nil
 	}
 
@@ -225,7 +225,7 @@ func demonstrateContextPassing() {
 		}
 
 		key := []byte("processed:" + userID)
-		
+
 		// 检查是否已处理
 		if value, err := c.Get(ctx, key); err == nil {
 			fmt.Printf("✓ 用户 %s 已处理: %s\n", userID, string(value))
@@ -235,7 +235,7 @@ func demonstrateContextPassing() {
 		// 模拟处理逻辑
 		fmt.Printf("🔄 正在处理用户 %s...\n", userID)
 		time.Sleep(200 * time.Millisecond)
-		
+
 		// 缓存处理结果
 		result := fmt.Sprintf("processed_at_%d", time.Now().Unix())
 		err := c.SetWithTTL(ctx, key, []byte(result), 5*time.Second)
@@ -249,7 +249,7 @@ func demonstrateContextPassing() {
 
 	// 处理多个用户
 	users := []string{"user1", "user2", "user3", "user1", "user2"}
-	
+
 	fmt.Println("处理用户列表:")
 	for _, userID := range users {
 		if err := processUser(ctx, userID); err != nil {

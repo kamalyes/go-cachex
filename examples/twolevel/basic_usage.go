@@ -69,7 +69,7 @@ func demonstrateBasicTwoLevel() {
 	fmt.Println("  2) 读取数据 (L1 命中)")
 	if data, err := twoLevel.Get([]byte("user:1001")); err == nil {
 		fmt.Printf("    ✓ 从缓存读取: %s\n", string(data))
-		
+
 		// 验证 L1 中有数据
 		if _, err := l1.Get([]byte("user:1001")); err == nil {
 			fmt.Printf("    ✓ 数据在 L1 缓存中\n")
@@ -218,12 +218,12 @@ func demonstratePromotion() {
 	// 第三步：通过 TwoLevel 访问被 L1 淘汰的数据
 	fmt.Println("\n步骤3: 访问被L1淘汰的数据 (应该从L2获取并提升到L1)")
 	key := []byte("item_1") // 最早的数据，应该被L1淘汰但L2还有
-	
+
 	fmt.Printf("访问 item_1:\n")
 	if data, err := twoLevel.Get(key); err == nil {
 		fmt.Printf("  ✓ 成功获取数据: %s\n", string(data))
 		fmt.Printf("  ✓ 数据来源: L2 (L1未命中，L2命中)\n")
-		
+
 		// 检查是否已提升到 L1
 		if _, err := l1.Get(key); err == nil {
 			fmt.Printf("  ✓ 数据已自动提升到 L1\n")
@@ -285,7 +285,7 @@ func demonstrateTTLHandling() {
 	fmt.Println("\n2) 立即访问数据")
 	if data, err := twoLevel.Get([]byte("session:abc123")); err == nil {
 		fmt.Printf("  ✓ 成功获取: %s\n", string(data))
-		
+
 		if ttl, err := twoLevel.GetTTL([]byte("session:abc123")); err == nil {
 			fmt.Printf("  ✓ 剩余 TTL: %v\n", ttl)
 		}
@@ -294,10 +294,10 @@ func demonstrateTTLHandling() {
 	// 3. 等待部分时间后再访问
 	fmt.Println("\n3) 等待100ms后访问")
 	time.Sleep(100 * time.Millisecond)
-	
+
 	if data, err := twoLevel.Get([]byte("session:abc123")); err == nil {
 		fmt.Printf("  ✓ 仍可获取: %s\n", string(data))
-		
+
 		if ttl, err := twoLevel.GetTTL([]byte("session:abc123")); err == nil {
 			fmt.Printf("  ✓ 剩余 TTL: %v\n", ttl)
 		}
@@ -308,7 +308,7 @@ func demonstrateTTLHandling() {
 	// 4. 等待完全过期
 	fmt.Println("\n4) 等待完全过期 (再等150ms)")
 	time.Sleep(150 * time.Millisecond)
-	
+
 	if _, err := twoLevel.Get([]byte("session:abc123")); err != nil {
 		fmt.Printf("  ✓ 数据已完全过期: %v\n", err)
 	}
@@ -321,14 +321,14 @@ func demonstrateTTLHandling() {
 	err = l2.SetWithTTL([]byte("promote_test"), []byte("提升测试数据"), 300*time.Millisecond)
 	if err == nil {
 		fmt.Printf("  ✓ 直接在 L2 设置数据，TTL: 300ms\n")
-		
+
 		// 等待一段时间
 		time.Sleep(50 * time.Millisecond)
-		
+
 		// 通过 TwoLevel 访问，会提升到 L1
 		if data, err := twoLevel.Get([]byte("promote_test")); err == nil {
 			fmt.Printf("  ✓ 通过 TwoLevel 获取: %s\n", string(data))
-			
+
 			// 检查L1是否也有了数据和相应的TTL
 			if ttl1, err1 := l1.GetTTL([]byte("promote_test")); err1 == nil {
 				fmt.Printf("  ✓ 提升后 L1 TTL: %v\n", ttl1)
@@ -351,41 +351,41 @@ func demonstrateBackendCombinations() {
 	fmt.Println("--------------")
 
 	combinations := []struct {
-		name string
-		desc string
+		name      string
+		desc      string
 		l1Factory func() cachex.Handler
 		l2Factory func() cachex.Handler
-		useCase string
+		useCase   string
 	}{
 		{
-			name: "LRU + LRU",
-			desc: "两级都使用LRU缓存",
+			name:      "LRU + LRU",
+			desc:      "两级都使用LRU缓存",
 			l1Factory: func() cachex.Handler { return cachex.NewLRUHandler(5) },
 			l2Factory: func() cachex.Handler { return cachex.NewLRUHandler(50) },
-			useCase: "适用于纯内存缓存场景",
+			useCase:   "适用于纯内存缓存场景",
 		},
 		{
-			name: "LRU + Expiring",
-			desc: "L1使用LRU，L2使用自动过期缓存",
+			name:      "LRU + Expiring",
+			desc:      "L1使用LRU，L2使用自动过期缓存",
 			l1Factory: func() cachex.Handler { return cachex.NewLRUHandler(5) },
 			l2Factory: func() cachex.Handler { return cachex.NewExpiringHandler(10 * time.Millisecond) },
-			useCase: "L1保证速度，L2自动清理过期数据",
+			useCase:   "L1保证速度，L2自动清理过期数据",
 		},
 		{
-			name: "Expiring + LRU",
-			desc: "L1使用自动过期，L2使用LRU",
+			name:      "Expiring + LRU",
+			desc:      "L1使用自动过期，L2使用LRU",
 			l1Factory: func() cachex.Handler { return cachex.NewExpiringHandler(10 * time.Millisecond) },
 			l2Factory: func() cachex.Handler { return cachex.NewLRUHandler(50) },
-			useCase: "L1管理短期数据，L2长期存储",
+			useCase:   "L1管理短期数据，L2长期存储",
 		},
 		{
-			name: "LRU + Ristretto",
-			desc: "L1使用LRU，L2使用高性能Ristretto",
+			name:      "LRU + Ristretto",
+			desc:      "L1使用LRU，L2使用高性能Ristretto",
 			l1Factory: func() cachex.Handler { return cachex.NewLRUHandler(5) },
-			l2Factory: func() cachex.Handler { 
+			l2Factory: func() cachex.Handler {
 				rist, _ := cachex.NewRistrettoHandler(&cachex.RistrettoConfig{
 					NumCounters: 100,
-					MaxCost: 10 << 20, // 10MB
+					MaxCost:     10 << 20, // 10MB
 					BufferItems: 6,
 				})
 				return rist
@@ -416,7 +416,7 @@ func demonstrateBackendCombinations() {
 		err := twoLevel.Set(testKey, testValue)
 		if err == nil {
 			fmt.Printf("   ✓ 写入测试通过\n")
-			
+
 			// 读取测试
 			if data, err := twoLevel.Get(testKey); err == nil && string(data) == string(testValue) {
 				fmt.Printf("   ✓ 读取测试通过\n")
@@ -470,9 +470,9 @@ func demonstratePerformanceComparison() {
 	}
 	singleReadTime := time.Since(start)
 
-	fmt.Printf("   写入性能: %v (%d ops/sec)\n", 
+	fmt.Printf("   写入性能: %v (%d ops/sec)\n",
 		singleWriteTime, int(float64(testOperations)/singleWriteTime.Seconds()))
-	fmt.Printf("   读取性能: %v (%d ops/sec, 命中率: %.1f%%)\n", 
+	fmt.Printf("   读取性能: %v (%d ops/sec, 命中率: %.1f%%)\n",
 		singleReadTime, int(float64(testOperations)/singleReadTime.Seconds()),
 		float64(hits)/testOperations*100)
 
@@ -509,9 +509,9 @@ func demonstratePerformanceComparison() {
 	}
 	twoReadThroughTime := time.Since(start)
 
-	fmt.Printf("   写入性能: %v (%d ops/sec)\n", 
+	fmt.Printf("   写入性能: %v (%d ops/sec)\n",
 		twoWriteThroughTime, int(float64(testOperations)/twoWriteThroughTime.Seconds()))
-	fmt.Printf("   读取性能: %v (%d ops/sec, L1命中约:%d, L2命中约:%d)\n", 
+	fmt.Printf("   读取性能: %v (%d ops/sec, L1命中约:%d, L2命中约:%d)\n",
 		twoReadThroughTime, int(float64(testOperations)/twoReadThroughTime.Seconds()),
 		l1Hits, l2Hits)
 
@@ -546,9 +546,9 @@ func demonstratePerformanceComparison() {
 	}
 	twoReadAsyncTime := time.Since(start)
 
-	fmt.Printf("   写入性能: %v (%d ops/sec)\n", 
+	fmt.Printf("   写入性能: %v (%d ops/sec)\n",
 		twoWriteAsyncTime, int(float64(testOperations)/twoWriteAsyncTime.Seconds()))
-	fmt.Printf("   读取性能: %v (%d ops/sec, 命中率: %.1f%%)\n", 
+	fmt.Printf("   读取性能: %v (%d ops/sec, 命中率: %.1f%%)\n",
 		twoReadAsyncTime, int(float64(testOperations)/twoReadAsyncTime.Seconds()),
 		float64(asyncHits)/testOperations*100)
 
@@ -573,4 +573,3 @@ func demonstratePerformanceComparison() {
 
 	fmt.Println()
 }
-

@@ -66,10 +66,10 @@ func demonstrateSingleflight() {
 	expensiveCompute := func(ctx context.Context) ([]byte, error) {
 		count := atomic.AddInt64(&computeCount, 1)
 		fmt.Printf("  🔄 执行昂贵计算 #%d\n", count)
-		
+
 		// 模拟耗时计算
 		time.Sleep(500 * time.Millisecond)
-		
+
 		return []byte(fmt.Sprintf("computed_result_%d", count)), nil
 	}
 
@@ -86,7 +86,7 @@ func demonstrateSingleflight() {
 		go func(id int) {
 			defer wg.Done()
 			atomic.AddInt64(&totalRequests, 1)
-			
+
 			value, err := cache.GetOrCompute(ctx, []byte("expensive_key"), time.Minute, expensiveCompute)
 			if err != nil {
 				fmt.Printf("Worker %d 失败: %v\n", id, err)
@@ -104,7 +104,7 @@ func demonstrateSingleflight() {
 	fmt.Printf("  实际计算次数: %d\n", atomic.LoadInt64(&computeCount))
 	fmt.Printf("  节省计算: %d 次\n", atomic.LoadInt64(&totalRequests)-atomic.LoadInt64(&computeCount))
 	fmt.Printf("  总耗时: %v\n", elapsed)
-	fmt.Printf("  Singleflight 效果: %.1f%%\n", 
+	fmt.Printf("  Singleflight 效果: %.1f%%\n",
 		100.0*(1.0-float64(atomic.LoadInt64(&computeCount))/float64(atomic.LoadInt64(&totalRequests))))
 
 	fmt.Println()
@@ -175,7 +175,7 @@ func demonstrateBusinessScenario() {
 	fmt.Println("-------------------")
 
 	// 创建多层缓存
-	l1Cache := cachex.NewCtxCache(cachex.NewLRUHandler(100))    // L1: 小容量LRU
+	l1Cache := cachex.NewCtxCache(cachex.NewLRUHandler(100))                        // L1: 小容量LRU
 	l2Cache := cachex.NewCtxCache(cachex.NewExpiringHandler(50 * time.Millisecond)) // L2: 过期缓存
 
 	defer l1Cache.Close()
@@ -198,14 +198,14 @@ func demonstrateBusinessScenario() {
 		queries := atomic.AddInt64(&dbQueries, 1)
 		fmt.Printf("  💾 数据库查询 #%d\n", queries)
 		time.Sleep(100 * time.Millisecond) // 模拟DB延迟
-		return []byte(fmt.Sprintf(`{"user_id":123,"name":"User_%d","query_time":%d}`, 
+		return []byte(fmt.Sprintf(`{"user_id":123,"name":"User_%d","query_time":%d}`,
 			queries, time.Now().Unix())), nil
 	}
 
 	// 用户查询方法
 	getUser := func(ctx context.Context, userID string) ([]byte, error) {
 		key := []byte("user:" + userID)
-		
+
 		// 先查 L1 缓存
 		if data, err := service.l1Cache.Get(ctx, key); err == nil {
 			fmt.Printf("  ✅ L1 缓存命中: %s\n", userID)
@@ -227,7 +227,7 @@ func demonstrateBusinessScenario() {
 	ctx := context.Background()
 
 	fmt.Println("执行多次用户查询:")
-	
+
 	// 第一轮查询
 	for i := 0; i < 3; i++ {
 		userID := fmt.Sprintf("user_%d", i%2) // 只查询2个用户，会有重复
@@ -276,19 +276,19 @@ func demonstrateErrorHandling() {
 	unstableLoader := func(ctx context.Context) ([]byte, error) {
 		attempt := atomic.AddInt64(&attempts, 1)
 		fmt.Printf("  🔄 尝试 #%d\n", attempt)
-		
+
 		// 前两次失败，第三次成功
 		if attempt <= 2 {
 			return nil, fmt.Errorf("service_unavailable_attempt_%d", attempt)
 		}
-		
+
 		return []byte(fmt.Sprintf("success_on_attempt_%d", attempt)), nil
 	}
 
 	// 带重试的查询函数
 	queryWithRetry := func(key []byte, maxRetries int) ([]byte, error) {
 		var lastErr error
-		
+
 		for retry := 0; retry < maxRetries; retry++ {
 			if retry > 0 {
 				fmt.Printf("  ⏰ 重试 %d/%d\n", retry, maxRetries-1)
@@ -299,11 +299,11 @@ func demonstrateErrorHandling() {
 			if err == nil {
 				return data, nil
 			}
-			
+
 			lastErr = err
 			fmt.Printf("  ❌ 尝试失败: %v\n", err)
 		}
-		
+
 		return nil, fmt.Errorf("max_retries_exceeded: %v", lastErr)
 	}
 
@@ -385,7 +385,7 @@ func demonstrateMonitoring() {
 
 	// 模拟工作负载
 	fmt.Println("模拟工作负载...")
-	
+
 	loader := func(ctx context.Context) ([]byte, error) {
 		time.Sleep(10 * time.Millisecond)
 		return []byte(fmt.Sprintf("computed_%d", rand.Int())), nil
@@ -394,7 +394,7 @@ func demonstrateMonitoring() {
 	// 随机操作
 	for i := 0; i < 100; i++ {
 		key := []byte(fmt.Sprintf("key_%d", rand.Intn(20))) // 20个可能的键
-		
+
 		switch rand.Intn(3) {
 		case 0: // Get
 			monitoredGet(key)
@@ -420,7 +420,7 @@ func demonstrateMonitoring() {
 	// 性能分析
 	fmt.Println("\n📈 性能分析:")
 	const testOps = 10000
-	
+
 	// 测试 Get 性能
 	for i := 0; i < 50; i++ {
 		cache.Set(ctx, []byte(fmt.Sprintf("perf_key_%d", i)), []byte("test_value"))
@@ -431,7 +431,7 @@ func demonstrateMonitoring() {
 		cache.Get(ctx, []byte(fmt.Sprintf("perf_key_%d", i%50)))
 	}
 	elapsed := time.Since(start)
-	
+
 	fmt.Printf("  %d 次 Get 操作耗时: %v\n", testOps, elapsed)
 	fmt.Printf("  平均延迟: %v\n", elapsed/time.Duration(testOps))
 	fmt.Printf("  吞吐量: %.0f ops/sec\n", float64(testOps)/elapsed.Seconds())

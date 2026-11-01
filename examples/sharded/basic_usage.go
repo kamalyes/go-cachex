@@ -48,7 +48,7 @@ func demonstrateBasicOperations() {
 	factory := func() cachex.Handler {
 		return cachex.NewLRUHandler(100) // 每个分片容量100
 	}
-	
+
 	// 创建 8 个分片
 	cache := cachex.NewShardedHandler(factory, 8)
 	defer cache.Close()
@@ -104,7 +104,7 @@ func demonstrateShardDistribution() {
 
 	// 创建带监控的分片缓存
 	shardCounts := make([]int, 4)
-	
+
 	factory := func() cachex.Handler {
 		return cachex.NewLRUHandler(50)
 	}
@@ -116,7 +116,7 @@ func demonstrateShardDistribution() {
 	for i := 0; i < 100; i++ {
 		key := []byte(fmt.Sprintf("key_%d", i))
 		value := []byte(fmt.Sprintf("value_%d", i))
-		
+
 		err := cache.Set(key, value)
 		if err != nil {
 			fmt.Printf("设置 key_%d 失败: %v\n", i, err)
@@ -168,8 +168,8 @@ func demonstrateConcurrencyComparison() {
 
 	// 测试不同配置下的性能
 	configs := []struct {
-		name   string
-		shards int
+		name     string
+		shards   int
 		capacity int
 	}{
 		{"单分片", 1, 1000},
@@ -183,14 +183,14 @@ func demonstrateConcurrencyComparison() {
 
 	for _, config := range configs {
 		fmt.Printf("\n测试配置: %s (总容量: %d)\n", config.name, config.shards*config.capacity)
-		
+
 		factory := func() cachex.Handler {
 			return cachex.NewLRUHandler(config.capacity)
 		}
 		cache := cachex.NewShardedHandler(factory, config.shards)
 
 		start := time.Now()
-		
+
 		var wg sync.WaitGroup
 		for w := 0; w < workers; w++ {
 			wg.Add(1)
@@ -199,16 +199,16 @@ func demonstrateConcurrencyComparison() {
 				for op := 0; op < operations; op++ {
 					key := []byte(fmt.Sprintf("worker_%d_key_%d", workerID, op))
 					value := []byte(fmt.Sprintf("worker_%d_value_%d", workerID, op))
-					
+
 					// 写入
 					cache.Set(key, value)
-					
+
 					// 读取
 					cache.Get(key)
 				}
 			}(w)
 		}
-		
+
 		wg.Wait()
 		elapsed := time.Since(start)
 		totalOps := workers * operations * 2 // 每次包含写入和读取
@@ -268,7 +268,7 @@ func demonstrateDifferentBackends() {
 		key := []byte(fmt.Sprintf("exp_key_%d", i))
 		value := []byte(fmt.Sprintf("exp_value_%d", i))
 		ttl := time.Duration(i*50+100) * time.Millisecond
-		
+
 		err := expiringCache.SetWithTTL(key, value, ttl)
 		if err != nil {
 			fmt.Printf("  ✗ Expiring设置失败: %v\n", err)
@@ -311,7 +311,7 @@ func demonstrateDifferentBackends() {
 	for i := 0; i < 20; i++ {
 		key := []byte(fmt.Sprintf("mixed_key_%d", i))
 		value := []byte(fmt.Sprintf("mixed_value_%d", i))
-		
+
 		if i%2 == 0 {
 			err := mixedCache.Set(key, value)
 			if err != nil {
@@ -327,7 +327,7 @@ func demonstrateDifferentBackends() {
 	fmt.Println("  ✓ 混合缓存操作完成")
 
 	mixedCache.Close()
-	
+
 	fmt.Printf("\nCPU核心数: %d\n", runtime.NumCPU())
 	fmt.Println("建议分片数: CPU核心数的2-4倍，以平衡并发性和内存开销")
 }

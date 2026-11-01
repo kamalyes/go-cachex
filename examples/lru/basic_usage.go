@@ -28,12 +28,12 @@ func basicUsageExample() {
 
 	// 基本的 Set/Get 操作
 	fmt.Println("\n1. Basic Set/Get Operations:")
-	
+
 	// 设置键值对
 	if err := cache.Set([]byte("user:1"), []byte("Alice")); err != nil {
 		log.Fatal(err)
 	}
-	
+
 	if err := cache.Set([]byte("user:2"), []byte("Bob")); err != nil {
 		log.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func basicUsageExample() {
 
 	// 测试 LRU 驱逐机制
 	fmt.Println("\n2. LRU Eviction Example:")
-	
+
 	// 添加第三个项目
 	cache.Set([]byte("user:3"), []byte("Charlie"))
 	fmt.Println("Added user:3 = Charlie")
@@ -76,7 +76,7 @@ func basicUsageExample() {
 
 	// 带 TTL 的操作
 	fmt.Println("\n3. TTL Operations:")
-	
+
 	// 设置带 TTL 的键值对
 	if err := cache.SetWithTTL([]byte("temp:session"), []byte("temp_data"), 2*time.Second); err != nil {
 		log.Fatal(err)
@@ -103,7 +103,7 @@ func basicUsageExample() {
 
 	// 删除操作
 	fmt.Println("\n4. Delete Operations:")
-	
+
 	// 删除一个存在的键
 	if err := cache.Del([]byte("user:1")); err != nil {
 		log.Fatal(err)

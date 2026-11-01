@@ -30,12 +30,12 @@ func basicUsageExample() {
 
 	// 基本的 Set/Get 操作
 	fmt.Println("\n2. Basic Set/Get Operations:")
-	
+
 	// 设置键值对（无过期时间）
 	if err := cache.Set([]byte("permanent:user:1"), []byte("Alice")); err != nil {
 		log.Fatal(err)
 	}
-	
+
 	if err := cache.Set([]byte("permanent:user:2"), []byte("Bob")); err != nil {
 		log.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func basicUsageExample() {
 
 	// 带 TTL 的操作
 	fmt.Println("\n3. TTL Operations:")
-	
+
 	// 设置带 TTL 的键值对
 	sessionData := []byte(`{"session_id": "abc123", "user_id": 1001, "expires_at": "2025-12-31T23:59:59Z"}`)
 	if err := cache.SetWithTTL([]byte("session:abc123"), sessionData, 2*time.Second); err != nil {
@@ -109,7 +109,7 @@ func basicUsageExample() {
 
 	// 更新操作
 	fmt.Println("\n4. Update Operations:")
-	
+
 	// 更新现有键的值
 	if err := cache.Set([]byte("permanent:user:1"), []byte("Alice Smith")); err != nil {
 		log.Fatal(err)
@@ -122,7 +122,7 @@ func basicUsageExample() {
 
 	// 删除操作
 	fmt.Println("\n5. Delete Operations:")
-	
+
 	// 删除一个存在的键
 	if err := cache.Del([]byte("permanent:user:2")); err != nil {
 		log.Fatal(err)
@@ -136,13 +136,13 @@ func basicUsageExample() {
 
 	// 批量 TTL 操作演示
 	fmt.Println("\n6. Batch TTL Operations Demo:")
-	
+
 	// 批量设置带不同TTL的临时数据
 	tempData := map[string]time.Duration{
-		"temp:1sec":  1 * time.Second,
-		"temp:2sec":  2 * time.Second,
-		"temp:3sec":  3 * time.Second,
-		"temp:5sec":  5 * time.Second,
+		"temp:1sec": 1 * time.Second,
+		"temp:2sec": 2 * time.Second,
+		"temp:3sec": 3 * time.Second,
+		"temp:5sec": 5 * time.Second,
 	}
 
 	fmt.Println("Setting temporary data with different TTLs...")

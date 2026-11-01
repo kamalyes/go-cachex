@@ -1024,8 +1024,8 @@ func TestRedisHandler_BatchGetWithCtx_EmptyKeyInBatch(t *testing.T) {
 	// 批量中包含空 key 和有效 key
 	results, errs := handler.BatchGetWithCtx(context.Background(), [][]byte{
 		[]byte("valid-key"),
-		[]byte{}, // 空 key
-		nil,      // nil key
+		{},  // 空 key
+		nil, // nil key
 		[]byte("nonexistent"),
 	})
 	assert.Len(t, results, 4)
