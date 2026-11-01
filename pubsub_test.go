@@ -58,6 +58,29 @@ func waitForMessage() {
 	time.Sleep(time.Millisecond * 200)
 }
 
+// waitForMessageCount 轮询等到收齐 want 条消息，超时才判红
+//
+// 固定时长的盲等在负载高的 runner 上不够用：消息要过一次 Redis 往返，再经 worker 池
+// 调度才进到收集器，而 CI 机器的调度延迟远大于本地
+// 轮询把「等够了没」交给实际条数判断，既不会因为机器慢而误判，也不会在机器快时白等
+//
+// [EN] A fixed sleep is not enough on a loaded runner: a message makes a Redis round trip and
+// then waits for the worker pool, and scheduling delay in CI far exceeds a local machine.
+// Polling lets the actual count decide when the wait is over, so a slow machine no longer
+// fails and a fast one no longer waits for nothing
+func waitForMessageCount(t *testing.T, mc *messageCollector, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(time.Second * 5)
+	for time.Now().Before(deadline) {
+		if mc.count() >= want {
+			return
+		}
+		time.Sleep(time.Millisecond * 10)
+	}
+	t.Fatalf("等了 5s 只收到 %d/%d 条消息", mc.count(), want)
+}
+
 // messageCollector 消息收集器
 type messageCollector struct {
 	messages map[string][]string
@@ -270,16 +293,25 @@ func TestPubSub_MultipleChannels(t *testing.T) {
 		}
 	}
 
-	waitForMessage()
+	waitForMessageCount(t, collector, len(channels)*3)
 
+	// 按集合比对而不是逐位比对：messageLoop 把每条消息投给 MaxWorkers 个 worker 并发处理，
+	// 收集器里的次序是「处理完成」的次序，实现从来没有承诺单频道有序
+	// 逐位比对等于断言一个不存在的保证，在快机器上碰巧成立，在负载高的 runner 上就判红
+	// 这里要证的是「每个频道收齐且只收到自己的三条」，与到达次序无关
+	//
+	// [EN] Compared as a set rather than position by position: messageLoop hands each message to
+	// a pool of MaxWorkers workers, so the collector holds completion order and the
+	// implementation never promised per-channel ordering. Asserting position by position
+	// asserts a guarantee that does not exist, which happens to hold on a fast machine and goes
+	// red on a loaded runner. What matters here is that each channel receives exactly its own
+	// three messages, in whatever order they arrive
 	for i, channel := range channels {
-		channelMessages := collector.get(channel)
-		assert.Len(t, channelMessages, 3, "频道%s应该有3条消息", channel)
-
-		for j, msg := range channelMessages {
-			expected := fmt.Sprintf("频道%d消息%d", i+1, j+1)
-			assert.Equal(t, expected, msg, "频道%s的消息%d不匹配", channel, j+1)
+		want := make([]string, 0, 3)
+		for j := 1; j <= 3; j++ {
+			want = append(want, fmt.Sprintf("频道%d消息%d", i+1, j))
 		}
+		assert.ElementsMatch(t, want, collector.get(channel), "频道%s应该收齐且只收到自己的三条消息", channel)
 	}
 }
 
