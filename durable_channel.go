@@ -60,13 +60,24 @@ import (
 // - WorkerCount: 消费者数量（PersistSync 模式下自动为 0，其他模式默认 1）
 // - QueryTimeout: 查询操作超时时间（Len/RedisLen，默认 3s）
 type DurableChannelConfig struct {
-	Name               string        // Channel 名称（必填）
-	Namespace          string        // Redis key 命名空间（默认 "dchan"）
-	WorkerID           int64         // 工作节点标识（默认 0，用于分布式场景节点隔离）
-	BufferSize         int           // 内存缓冲区大小（默认 100）
-	PersistenceMode    PersistMode   // 持久化模式（默认 PersistHybrid，决定是否启动消费者）
-	WorkerCount        int           // 消费者 Worker 数量（PersistSync 下自动为 0，其他模式默认 1）
-	PollInterval       time.Duration // Redis 轮询间隔（默认 100ms）
+	Name            string      // Channel 名称（必填）
+	Namespace       string      // Redis key 命名空间（默认 "dchan"）
+	WorkerID        int64       // 工作节点标识（默认 0，用于分布式场景节点隔离）
+	BufferSize      int         // 内存缓冲区大小（默认 100）
+	PersistenceMode PersistMode // 持久化模式（默认 PersistHybrid，决定是否启动消费者）
+	WorkerCount     int         // 消费者 Worker 数量（PersistSync 下自动为 0，其他模式默认 1）
+	// PollInterval 每次 BLPOP 的等待时长，也就是拉取的轮询粒度
+	//
+	// Redis 的 BLPOP 超时是**秒级**的，go-redis 对低于 1s 的值会上调到 1s 并打一行警告
+	// 所以这里配 100ms 实际等 1s，比配置慢十倍，而且只有打开 redis 的日志才看得见
+	// 默认值因此定为 1s —— 与实际行为一致，不再骗人
+	//
+	// [EN] How long each BLPOP waits, which is the polling granularity. Redis expresses that
+	// timeout in whole seconds and go-redis raises anything below one second to one second
+	// with a warning, so a configured 100ms actually waited a second, ten times longer than
+	// asked, visible only with redis logging on. The default is therefore one second, which
+	// is what actually happens
+	PollInterval       time.Duration
 	RecoveryOnStart    bool          // 启动时是否恢复未消费消息（默认 true）
 	TTL                time.Duration // Redis 队列过期时间（默认 24h，0 表示永不过期）
 	EnableCompression  bool          // 是否启用压缩（默认 false，大消息建议启用）
@@ -105,6 +116,33 @@ func (pm PersistMode) String() string {
 	}
 }
 
+// blpopMinTimeout 是 BLPOP 超时的下限
+//
+// Redis 的 BLPOP 超时按秒表达，go-redis 会把低于 1s 的值上调到 1s 并打警告
+// 把这个下限写成常量，是为了让默认值、兜底值与规范函数三处用的是同一个数
+// [EN] The floor for a BLPOP timeout. Redis expresses it in whole seconds and go-redis raises
+// anything smaller, so the constant keeps the default, the fallback and the normaliser in step
+const blpopMinTimeout = time.Second
+
+// blpopTimeout 把配置的轮询间隔规范成 BLPOP 能真正执行的值
+//
+// 低于 1s 的值在 go-redis 那里会被上调，与其让它静默发生，不如在这里显式向上取整，
+// 这样日志里不会刷那行警告，而行为与配置也对得上
+// [EN] Normalises the configured interval into something BLPOP can actually honour. Values
+// below a second are raised by go-redis anyway, so rounding up here keeps that warning out of
+// the log and makes the behaviour match the configuration
+func blpopTimeout(d time.Duration) time.Duration {
+	if d < blpopMinTimeout {
+		return blpopMinTimeout
+	}
+	// 非整秒同样会被 Redis 截断，向上取整到整秒
+	// [EN] A non-whole number of seconds is truncated too, so round up
+	if r := d % time.Second; r != 0 {
+		return d - r + time.Second
+	}
+	return d
+}
+
 // DurableChannel 错误定义
 var (
 	ErrChannelClosed      = fmt.Errorf("channel is closed")
@@ -128,7 +166,7 @@ func DefaultDurableChannelConfig(name string) DurableChannelConfig {
 		BufferSize:         100,
 		PersistenceMode:    PersistHybrid,
 		WorkerCount:        1,
-		PollInterval:       100 * time.Millisecond,
+		PollInterval:       blpopMinTimeout,
 		RecoveryOnStart:    true,
 		TTL:                24 * time.Hour,
 		EnableCompression:  false,
@@ -206,7 +244,7 @@ func NewDurableChannel[T any](client redis.UniversalClient, config DurableChanne
 	// 设置默认值
 	config.Namespace = mathx.IfEmpty(config.Namespace, "dchan")
 	config.BufferSize = mathx.IfLeZero(config.BufferSize, 100)
-	config.PollInterval = mathx.IfLeZero(config.PollInterval, 100*time.Millisecond)
+	config.PollInterval = mathx.IfLeZero(config.PollInterval, blpopMinTimeout)
 	config.TTL = mathx.IfLeZero(config.TTL, 24*time.Hour)
 	config.CompressionMinSize = mathx.IfLeZero(config.CompressionMinSize, 1024)
 	config.QueryTimeout = mathx.IfLeZero(config.QueryTimeout, 3*time.Second)
@@ -468,7 +506,10 @@ func (dc *DurableChannel[T]) pullFromRedis(ctx context.Context) (T, error) {
 	var zero T
 
 	// 使用 BLPOP 阻塞式拉取（传入 ctx 确保可以被取消）
-	result, err := dc.client.BLPop(ctx, dc.config.PollInterval, dc.queueKey).Result()
+	// 用规范后的超时：直接传 PollInterval 时，低于 1s 的值会被 go-redis 上调并刷警告
+	// [EN] The normalised timeout is used; passing PollInterval directly lets go-redis raise a
+	// sub-second value and log a warning for every call
+	result, err := dc.client.BLPop(ctx, blpopTimeout(dc.config.PollInterval), dc.queueKey).Result()
 	if err != nil {
 		if err == redis.Nil {
 			return zero, ErrNoData // 超时，无数据

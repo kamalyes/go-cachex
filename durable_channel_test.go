@@ -748,3 +748,47 @@ func TestDurableChannel_Concurrency(t *testing.T) {
 		assert.Greater(t, errors, int32(0))
 	})
 }
+
+// TestBlpopTimeoutNormalisation BLPOP 超时的秒级粒度规范
+//
+// Redis 的 BLPOP 超时按秒表达，go-redis 对低于 1s 的值会上调到 1s 并对每次调用打一行警告
+// 原先 PollInterval 默认 100ms 又被直接传进 BLPop，于是实际等 1s —— 比配置慢十倍，
+// 而且只有打开 redis 日志才看得见
+//
+// [EN] Redis expresses the BLPOP timeout in whole seconds and go-redis raises anything below
+// one second, logging a warning per call. PollInterval defaulted to 100ms and was passed
+// straight through, so each call actually waited a second, ten times longer than configured
+// and visible only with redis logging enabled
+func TestBlpopTimeoutNormalisation(t *testing.T) {
+	cases := []struct {
+		name string
+		in   time.Duration
+		want time.Duration
+	}{
+		{"亚秒上调到 1s", 100 * time.Millisecond, time.Second},
+		{"1 纳秒也上调到 1s", time.Nanosecond, time.Second},
+		{"正好 1s 不动", time.Second, time.Second},
+		{"整秒不动", 5 * time.Second, 5 * time.Second},
+		{"非整秒向上取整", 1500 * time.Millisecond, 2 * time.Second},
+		{"非整秒向上取整（大值）", 3200 * time.Millisecond, 4 * time.Second},
+		{"零值上调到 1s", 0, time.Second},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := blpopTimeout(tc.in); got != tc.want {
+				t.Errorf("blpopTimeout(%s) = %s，期望 %s", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// 默认配置的轮询间隔必须是 BLPOP 能真正执行的值，否则默认值本身就在骗人
+// [EN] The default interval must be one BLPOP can actually honour, or the default itself lies
+func TestDefaultPollIntervalIsHonoured(t *testing.T) {
+	cfg := DefaultDurableChannelConfig("test-poll-default")
+	if cfg.PollInterval != blpopTimeout(cfg.PollInterval) {
+		t.Errorf("默认 PollInterval 是 %s，而 BLPOP 实际会按 %s 执行",
+			cfg.PollInterval, blpopTimeout(cfg.PollInterval))
+	}
+}
