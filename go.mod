@@ -6,7 +6,7 @@ require (
 	github.com/alicebob/miniredis/v2 v2.35.0
 	github.com/dgraph-io/ristretto/v2 v2.4.0
 	github.com/kamalyes/go-argus v0.5.1
-	github.com/kamalyes/go-logger v0.9.0
+	github.com/kamalyes/go-logger v0.10.0
 	github.com/kamalyes/go-toolbox v0.19.2
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/stretchr/testify v1.12.1
