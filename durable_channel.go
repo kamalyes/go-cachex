@@ -271,9 +271,32 @@ func (dc *DurableChannel[T]) Send(ctx context.Context, data T) error {
 		case dc.memChan <- data:
 			dc.mu.RUnlock()
 			// 使用 WorkerPool 异步持久化（避免无限创建 goroutine）
-			dc.persistPool.SubmitNonBlocking(func() {
-				dc.persistToRedis(ctx, data)
-			})
+			//
+			// 两个返回值都要接起来，原先两处都丢了：
+			//
+			// SubmitNonBlocking 在池队列满时返回错误而不是阻塞，丢掉它就等于
+			// 「内存里有、Redis 里没有」而调用方拿到 nil —— 这条数据只要进程不优雅退出就没了
+			// 池容量与 memChan 同为 BufferSize，所以内存快满时池通常也快满，这不是罕见路径
+			//
+			// persistToRedis 的错误在任务内部，调用方已经拿到 nil 走了，
+			// 这里只能记日志，但不能什么都不做 —— 否则 Redis 持续失败时毫无迹象
+			//
+			// [EN] Both results are now checked; both were dropped. SubmitNonBlocking returns an
+			// error rather than blocking when its queue is full, and dropping that means the
+			// record lives only in memory while the caller is told everything is fine, so it is
+			// lost unless the process exits gracefully. The pool and the channel share the same
+			// capacity, so a nearly full buffer usually means a nearly full pool: not a rare
+			// path. persistToRedis's error happens after the caller has moved on, so it can
+			// only be logged, but logging nothing leaves a persistent Redis failure invisible
+			if err := dc.persistPool.SubmitNonBlocking(func() {
+				if perr := dc.persistToRedis(ctx, data); perr != nil {
+					dc.logger.Warnf("durable channel %s 异步持久化失败，这条数据只在内存里: %v",
+						dc.config.Name, perr)
+				}
+			}); err != nil {
+				dc.logger.Warnf("durable channel %s 持久化池已满或已关闭，这条数据只在内存里: %v",
+					dc.config.Name, err)
+			}
 			return nil
 		case <-dc.ctx.Done():
 			dc.mu.RUnlock()
