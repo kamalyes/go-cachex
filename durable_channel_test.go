@@ -439,16 +439,30 @@ func TestDurableChannel_ContextCancellation(t *testing.T) {
 		assert.Equal(t, 2, ch.MemLen())
 
 		// 测试超时
-		ctxTimeout, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		const ctxTimeout = 100 * time.Millisecond
+
+		// 下界留出时钟精度余量：Windows 的单调时钟粒度最粗到 15.6ms，time.Since 会把一次
+		// 真实等满的 100ms 量成 99.735ms（CI 实测，Go 1.27 / windows-latest）
+		// 卡死在 >= 100ms 等于把时钟分辨率当成代码缺陷
+		// 本测试要证的是「等到 ctx 超时才返回」而不是「立刻返回」，9 成的下界足以区分这两者
+		//
+		// [EN] The lower bound carries a clock-resolution margin: Windows monotonic clock
+		// granularity reaches 15.6ms, so time.Since measured a genuinely full 100ms wait as
+		// 99.735ms in CI, and a hard bound turns clock resolution into a defect. What this
+		// test must prove is that the call waited for the context rather than returning at
+		// once, and a bound at nine tenths separates those two outcomes
+		minWait := ctxTimeout * 9 / 10
+
+		ctxWithTimeout, cancel := context.WithTimeout(context.Background(), ctxTimeout)
 		defer cancel()
 
 		start := time.Now()
-		err := ch.Send(ctxTimeout, createTestMessage("timeout", "Should timeout"))
+		err := ch.Send(ctxWithTimeout, createTestMessage("timeout", "Should timeout"))
 		duration := time.Since(start)
 
 		assert.Error(t, err)
 		assert.ErrorIs(t, err, context.DeadlineExceeded)
-		assert.GreaterOrEqual(t, duration, 100*time.Millisecond)
+		assert.GreaterOrEqual(t, duration, minWait, "应该等到 ctx 超时才返回，实际只等了 %s", duration)
 	})
 
 	t.Run("Worker_ContextCancellation", func(t *testing.T) {
