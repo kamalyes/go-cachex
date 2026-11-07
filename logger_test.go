@@ -13,7 +13,7 @@ package cachex
 import (
 	"testing"
 
-	"github.com/kamalyes/go-logger"
+	"github.com/kamalyes/go-toolbox/pkg/logger"
 	"github.com/stretchr/testify/assert"
 )
 

@@ -13,7 +13,7 @@ package cachex
 import (
 	"time"
 
-	"github.com/kamalyes/go-logger"
+	"github.com/kamalyes/go-toolbox/pkg/logger"
 )
 
 // NewDefaultCachexLogger 创建默认配置的Cachex日志器
