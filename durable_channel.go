@@ -34,7 +34,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/kamalyes/go-logger"
+	"github.com/kamalyes/go-toolbox/pkg/logger"
 	"github.com/kamalyes/go-toolbox/pkg/contextx"
 	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/kamalyes/go-toolbox/pkg/syncx"

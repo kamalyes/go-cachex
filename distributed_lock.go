@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kamalyes/go-logger"
+	"github.com/kamalyes/go-toolbox/pkg/logger"
 	"github.com/kamalyes/go-toolbox/pkg/idgen"
 	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/kamalyes/go-toolbox/pkg/syncx"
