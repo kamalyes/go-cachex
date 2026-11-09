@@ -207,7 +207,7 @@ func (p *PubSub) Publish(ctx context.Context, channel string, message any) error
 			p.logger.Warnf("Failed to compress message: %v, sending uncompressed", err)
 		}
 		data = string(result.Data)
-		p.logger.Debugf(result.String())
+		p.logger.Debugf("%s", result.String())
 	}
 
 	channelKey := p.getChannelKey(channel)
@@ -481,7 +481,7 @@ func (s *Subscriber) start() error {
 			deadline = time.Now().Add(s.config.StartRetryWindow)
 		}
 
-		s.pubsub.logger.Warnf("Initial subscribe attempt %d failed for %s: %v, retrying in %v",
+		s.pubsub.logger.Warnf("Initial subscribe attempt %d failed for %s %v: %v, retrying in %v",
 			attempt,
 			mathx.IF(s.isPattern, "patterns", "channels"),
 			mathx.IF(s.isPattern, s.patterns, s.channels),
